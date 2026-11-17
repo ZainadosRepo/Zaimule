@@ -229,15 +229,9 @@ fn create_save_state(
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
     let info = session.create_save_state(slot, label, now_unix_ms())?;
-    if let Some((slot_info, envelope)) = session.export_save_state_envelope(slot) {
-        if let Ok(path) = state_slot_path(&app, &session.active_game_id, slot_info.slot) {
-            let _ = save_state_slot_atomic(
-                &path,
-                &PersistedSaveState {
-                    info: slot_info,
-                    envelope,
-                },
-            );
+    if let Some(persisted) = session.export_save_state_envelope(slot) {
+        if let Ok(path) = state_slot_path(&app, &session.active_game_id, persisted.info.slot) {
+            let _ = save_state_slot_atomic(&path, &persisted);
         }
     }
     flush_sram_best_effort(&app, &session);
@@ -256,8 +250,8 @@ fn restore_save_state(
         .map_err(|_| "verrou session indisponible".to_string())?;
     let game_id = session.active_game_id.clone();
     if let Ok(path) = state_slot_path(&app, &game_id, slot.clamp(1, 9)) {
-        if let Some(persisted) = load_state_slot_atomic(&path) {
-            session.import_save_state_envelope(game_id, persisted.info, persisted.envelope);
+        if let Ok(Some(persisted)) = load_state_slot_atomic(&path) {
+            session.import_save_state_envelope(game_id, persisted);
         }
     }
     session.restore_save_state(slot)

@@ -21,6 +21,7 @@ use zaimule_core::netplay::{default_netplay_rooms, NetplayRoom};
 use zaimule_core::overrides::{resolve_effective_config, EffectiveGameConfig, GlobalSettings};
 use zaimule_core::patch::{apply_ips_patch, default_mod_layers, ModLayerEntry};
 use zaimule_core::rewind::{rle_compress, rle_decompress, RewindBuffer, SaveStateSlotInfo};
+use zaimule_core::storage::PersistedSaveState;
 
 /// Snapshot of the entire Zaimule station sent to the UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -436,20 +437,28 @@ impl EmulatorSession {
         Ok(info)
     }
 
-    pub fn export_save_state_envelope(&self, slot: u8) -> Option<(SaveStateSlotInfo, Vec<u8>)> {
-        self.save_states_ram
-            .get(&(self.active_game_id.clone(), slot.clamp(1, 9)))
-            .cloned()
+    pub fn export_save_state_envelope(&self, slot: u8) -> Option<PersistedSaveState> {
+        let (info, envelope) = self
+            .save_states_ram
+            .get(&(self.active_game_id.clone(), slot.clamp(1, 9)))?;
+        if envelope.len() < 4 {
+            return None;
+        }
+        let uncompressed_len =
+            u32::from_le_bytes([envelope[0], envelope[1], envelope[2], envelope[3]]) as usize;
+        Some(PersistedSaveState {
+            info: info.clone(),
+            uncompressed_len,
+            compressed_bytes: envelope[4..].to_vec(),
+        })
     }
 
-    pub fn import_save_state_envelope(
-        &mut self,
-        game_id: String,
-        info: SaveStateSlotInfo,
-        envelope: Vec<u8>,
-    ) {
+    pub fn import_save_state_envelope(&mut self, game_id: String, persisted: PersistedSaveState) {
+        let mut envelope = (persisted.uncompressed_len as u32).to_le_bytes().to_vec();
+        envelope.extend_from_slice(&persisted.compressed_bytes);
+        let slot = persisted.info.slot.clamp(1, 9);
         self.save_states_ram
-            .insert((game_id, info.slot.clamp(1, 9)), (info, envelope));
+            .insert((game_id, slot), (persisted.info, envelope));
     }
 
     /// Rewinds the active emulator by `steps_back` snapshots from the circular buffer.
