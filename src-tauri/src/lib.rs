@@ -443,6 +443,36 @@ fn toggle_mod_layer(
 }
 
 #[tauri::command]
+fn export_ips_diff(state: tauri::State<AppState>) -> Result<Vec<u8>, String> {
+    let session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    session.export_active_ips_patch()
+}
+
+#[tauri::command]
+fn export_portable_pack_archive(state: tauri::State<AppState>) -> Result<Vec<u8>, String> {
+    let session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    session.export_portable_pack()
+}
+
+#[tauri::command]
+fn import_portable_pack_archive(
+    state: tauri::State<AppState>,
+    bytes: Vec<u8>,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    session.import_portable_pack(&bytes)
+}
+
+#[tauri::command]
 fn load_settings(app: AppHandle) -> Result<LoadedJson, String> {
     load_json_atomic(&settings_path(&app)?)
 }
@@ -494,6 +524,9 @@ pub fn run() {
             select_game,
             import_rom_file,
             apply_ips_patch_file,
+            export_ips_diff,
+            export_portable_pack_archive,
+            import_portable_pack_archive,
             add_cheat_code,
             toggle_cheat_code,
             scan_ram_byte,

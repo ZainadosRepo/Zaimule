@@ -43,7 +43,7 @@ impl ConsoleKind {
             Self::Gb | Self::Gbc => "zaimule-rust-gb",
             Self::Gba => "zaimule-rust-gba",
             Self::Nes => "zaimule-rust-nes",
-            Self::Snes => "snes9x_libretro",
+            Self::Snes => "zaimule-rust-snes",
             Self::Nds => "melonds_libretro",
             Self::Ps1 => "swanstation_libretro",
             Self::N64 => "mupen64plus_next_libretro",
@@ -55,7 +55,7 @@ impl ConsoleKind {
     pub fn is_native_rust(self) -> bool {
         matches!(
             self,
-            Self::Chip8 | Self::Gb | Self::Gbc | Self::Gba | Self::Nes
+            Self::Chip8 | Self::Gb | Self::Gbc | Self::Gba | Self::Nes | Self::Snes
         )
     }
 
@@ -319,18 +319,18 @@ pub fn default_catalog() -> Vec<GameEntry> {
         },
         GameEntry {
             id: "snes-alttp-fr".into(),
-            title: "The Legend of Zelda : A Link to the Past".into(),
+            title: "The Legend of Zelda : A Link to the Past (Mode 7)".into(),
             console: ConsoleKind::Snes,
-            engine_kind: CoreEngineKind::LibretroAbi,
-            core_id: "snes9x_libretro".into(),
-            region: "EUR · FR".into(),
+            engine_kind: CoreEngineKind::NativeRust,
+            core_id: "zaimule-rust-snes".into(),
+            region: "EUR · FR (65C816 + Mode 7)".into(),
             crc32_hex: "D3974B58".into(),
             size_bytes: 1_048_576,
-            sram_summary: "8 Ko SRAM Atomique".into(),
+            sram_summary: "32 Ko SRAM Atomique + PPU Mode 7".into(),
             playtime_seconds: 67_200,
             favorite: true,
             link_cable_ready: false,
-            embedded_rom_key: Some("nes_chrono_knight".into()),
+            embedded_rom_key: Some("snes_valkyrie_mode7".into()),
             cover_accent: "#14532d".into(),
             cover_symbol: "🛡️".into(),
         },

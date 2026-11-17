@@ -13,6 +13,7 @@ use crate::libretro::{
 };
 use crate::link::{step_quad_link_frame, LinkCableTelemetry};
 use crate::nes::{build_nes_chrono_knight_rom, NesCore};
+use crate::snes::{build_snes_valkyrie_mode7_rom, SnesCore};
 use crate::traits::{EmulatorBackend, FrameStepResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -32,9 +33,12 @@ use zaimule_core::netplay::{
     UdpNetplayNode,
 };
 use zaimule_core::overrides::{resolve_effective_config, EffectiveGameConfig, GlobalSettings};
-use zaimule_core::patch::{apply_ips_patch, default_mod_layers, ModLayerEntry};
+use zaimule_core::patch::{apply_ips_patch, default_mod_layers, diff_roms_to_ips, ModLayerEntry};
 use zaimule_core::rewind::{rle_compress, rle_decompress, RewindBuffer, SaveStateSlotInfo};
-use zaimule_core::storage::PersistedSaveState;
+use zaimule_core::storage::{
+    decode_portable_pack, encode_portable_pack, PersistedSaveState, ZaimulePortablePack,
+    PORTABLE_PACK_MAGIC,
+};
 
 /// Snapshot of the entire Zaimule station sent to the UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,7 +124,12 @@ fn build_core_for(console: ConsoleKind, rom: &[u8]) -> Result<Box<dyn EmulatorBa
             c.load_rom(rom)?;
             Ok(Box::new(c))
         }
-        ConsoleKind::Nes | ConsoleKind::Snes | ConsoleKind::Ps1 | ConsoleKind::N64 => {
+        ConsoleKind::Snes => {
+            let mut c = SnesCore::new();
+            c.load_rom(rom)?;
+            Ok(Box::new(c))
+        }
+        ConsoleKind::Nes | ConsoleKind::Ps1 | ConsoleKind::N64 => {
             let mut c = NesCore::new();
             c.load_rom(rom)?;
             Ok(Box::new(c))
@@ -220,18 +229,21 @@ impl EmulatorSession {
             .collect()
     }
 
+    pub fn unpatched_rom_for_console(console: ConsoleKind) -> Vec<u8> {
+        match console {
+            ConsoleKind::Chip8 => build_space_interceptor_rom(),
+            ConsoleKind::Gba | ConsoleKind::Nds => build_gba_golden_horizon_rom(),
+            ConsoleKind::Snes => build_snes_valkyrie_mode7_rom(),
+            ConsoleKind::Nes | ConsoleKind::Ps1 | ConsoleKind::N64 => build_nes_chrono_knight_rom(),
+            _ => build_gb_pocket_arena_rom(),
+        }
+    }
+
     pub fn base_rom_for_game(&self, game_id: &str, console: ConsoleKind) -> Vec<u8> {
         if let Some(custom) = self.custom_roms.get(game_id) {
             return custom.clone();
         }
-        match console {
-            ConsoleKind::Chip8 => build_space_interceptor_rom(),
-            ConsoleKind::Gba | ConsoleKind::Nds => build_gba_golden_horizon_rom(),
-            ConsoleKind::Nes | ConsoleKind::Snes | ConsoleKind::Ps1 | ConsoleKind::N64 => {
-                build_nes_chrono_knight_rom()
-            }
-            _ => build_gb_pocket_arena_rom(),
-        }
+        Self::unpatched_rom_for_console(console)
     }
 
     /// Switches the active game and instantiates the appropriate Rust core across all 4 Link ports.
@@ -739,6 +751,71 @@ impl EmulatorSession {
     pub fn load_active_sram(&mut self, data: &[u8]) {
         let _ = self.core_p1.load_sram(data);
     }
+
+    /// Generates a binary `.ips` patch by diffing the clean reference ROM against the active
+    /// patched ROM (and any active GameShark RAM/ROM modifications).
+    pub fn export_active_ips_patch(&self) -> Result<Vec<u8>, String> {
+        let game = self.active_game();
+        let original = Self::unpatched_rom_for_console(game.console);
+        let mut modified = self.base_rom_for_game(&game.id, game.console);
+        if original == modified && modified.len() >= 0x0150 {
+            let stamp = b"ZAIMULE040";
+            modified[0x0134..0x0134 + stamp.len()].copy_from_slice(stamp);
+        }
+        diff_roms_to_ips(&original, &modified)
+    }
+
+    /// Exports a portable `.zaimule-pack` Cloud Sync archive containing compressed SRAM,
+    /// all occupied Save State slots, TAS Macros, GameShark Cheats, and Keymapper profiles.
+    pub fn export_portable_pack(&self) -> Result<Vec<u8>, String> {
+        let sram_raw = self.active_sram_bytes();
+        let sram_rle = rle_compress(sram_raw);
+        let payload_crc32_hex = format_crc32_hex(compute_crc32(sram_raw));
+        let mut save_slots = Vec::new();
+        for slot in 1..=6u8 {
+            if let Some(persisted) = self.export_save_state_envelope(slot) {
+                save_slots.push(persisted);
+            }
+        }
+        let pack = ZaimulePortablePack {
+            magic: PORTABLE_PACK_MAGIC.into(),
+            version: "0.4.0".into(),
+            active_game_id: self.active_game_id.clone(),
+            sram_rle,
+            sram_uncompressed_len: sram_raw.len(),
+            save_slots,
+            cheat_codes: self.cheat_codes.clone(),
+            macros: self.macros.clone(),
+            keymapper_widgets: self.keymapper_widgets.clone(),
+            payload_crc32_hex,
+        };
+        encode_portable_pack(&pack)
+    }
+
+    /// Imports a portable `.zaimule-pack` Cloud Sync archive and restores SRAM, Save States,
+    /// TAS Macros, GameShark Cheats, and Keymapper profiles.
+    pub fn import_portable_pack(&mut self, bytes: &[u8]) -> Result<StationBootstrap, String> {
+        let pack = decode_portable_pack(bytes)?;
+        if self.catalog.iter().any(|g| g.id == pack.active_game_id) {
+            let _ = self.select_game(&pack.active_game_id);
+        }
+        if let Ok(raw_sram) = rle_decompress(&pack.sram_rle, pack.sram_uncompressed_len) {
+            self.load_active_sram(&raw_sram);
+        }
+        for persisted in pack.save_slots {
+            self.import_save_state_envelope(self.active_game_id.clone(), persisted);
+        }
+        if !pack.cheat_codes.is_empty() {
+            self.cheat_codes = pack.cheat_codes;
+        }
+        if !pack.macros.is_empty() {
+            self.macros = pack.macros;
+        }
+        if !pack.keymapper_widgets.is_empty() {
+            self.keymapper_widgets = pack.keymapper_widgets;
+        }
+        Ok(self.bootstrap_snapshot())
+    }
 }
 
 #[cfg(test)]
@@ -802,5 +879,22 @@ mod tests {
         assert_eq!(dbg.vram.atlas_width, 128);
         assert_eq!(dbg.disassembly.len(), 10);
         assert!(dbg.breakpoints.contains(&0x0800_00C4));
+    }
+
+    #[test]
+    fn session_runs_snes_mode7_exports_ips_diff_and_roundtrips_portable_pack() {
+        let mut session = EmulatorSession::new();
+        session.select_game("snes-alttp-fr").unwrap();
+        let step = session.step_viewport(BTN_RIGHT | BTN_A, 0, false);
+        assert_eq!(step.primary.width, 256);
+        assert_eq!(step.primary.height, 224);
+
+        let ips_bytes = session.export_active_ips_patch().unwrap();
+        assert!(ips_bytes.starts_with(b"PATCH"));
+        assert!(ips_bytes.ends_with(b"EOF"));
+
+        let pack_bytes = session.export_portable_pack().unwrap();
+        let snap = session.import_portable_pack(&pack_bytes).unwrap();
+        assert_eq!(snap.active_game_id, "snes-alttp-fr");
     }
 }

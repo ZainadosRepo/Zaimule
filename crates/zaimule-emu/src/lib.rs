@@ -1,4 +1,4 @@
-//! Native Rust emulation engines (`Chip8Core`, `GameBoyCore`, `GbaCore`, `NesCore`),
+//! Native Rust emulation engines (`Chip8Core`, `GameBoyCore`, `GbaCore`, `NesCore`, `SnesCore`),
 //! Multi-Instance Virtual Link Cable (`step_dual_link_frame`, `step_quad_link_frame`),
 //! Libretro C-ABI host bridge, BGB/Mesen VRAM/Disassembler debugger, and `EmulatorSession`.
 
@@ -10,4 +10,5 @@ pub mod libretro;
 pub mod link;
 pub mod nes;
 pub mod session;
+pub mod snes;
 pub mod traits;

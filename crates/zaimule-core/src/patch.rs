@@ -99,6 +99,48 @@ pub fn build_ips_patch(offset: u32, payload: &[u8]) -> Result<Vec<u8>, String> {
     Ok(patch)
 }
 
+/// Diffs `original` and `modified` ROM buffers and generates a standards-compliant IPS binary patch (`PATCH` ... `EOF`).
+pub fn diff_roms_to_ips(original: &[u8], modified: &[u8]) -> Result<Vec<u8>, String> {
+    if modified.is_empty() {
+        return Err("le tampon ROM modifié est vide".into());
+    }
+    let limit = modified.len().min(0x00FF_FFFF);
+    let mut patch = Vec::with_capacity(64);
+    patch.extend_from_slice(IPS_MAGIC);
+
+    let mut i = 0usize;
+    while i < limit {
+        let orig_b = original.get(i).copied();
+        if orig_b == Some(modified[i]) {
+            i += 1;
+            continue;
+        }
+        let mut offset = i;
+        if offset == 0x0045_4F46 && offset > 0 {
+            // Avoid 0x454F46 ("EOF") magic collision per IPS specification
+            offset -= 1;
+        }
+        let mut end = i + 1;
+        while end < limit && (end - offset) < 0xFFFF {
+            if original.get(end).copied() == Some(modified[end]) {
+                break;
+            }
+            end += 1;
+        }
+        let hunk_len = (end - offset) as u16;
+        patch.push(((offset >> 16) & 0xFF) as u8);
+        patch.push(((offset >> 8) & 0xFF) as u8);
+        patch.push((offset & 0xFF) as u8);
+        patch.push((hunk_len >> 8) as u8);
+        patch.push((hunk_len & 0xFF) as u8);
+        patch.extend_from_slice(&modified[offset..end]);
+        i = end;
+    }
+
+    patch.extend_from_slice(IPS_EOF);
+    Ok(patch)
+}
+
 /// Default virtual mod layers shown in the Yuzu-style inspector.
 pub fn default_mod_layers() -> Vec<ModLayerEntry> {
     vec![
@@ -138,6 +180,16 @@ mod tests {
         let patched = apply_ips_patch(&original, &patch).unwrap();
         assert_eq!(&original, b"HELLO_RETRO_WORLD");
         assert_eq!(&patched, b"HELLO_ZAIMULEORLD");
+    }
+
+    #[test]
+    fn diffs_two_rom_buffers_into_valid_ips_patch_that_roundtrips() {
+        let orig = b"POKEMON_EMERALD_ORIGINAL_ROM".to_vec();
+        let mut modified = orig.clone();
+        modified[8..15].copy_from_slice(b"ZAIMULE");
+        let ips = diff_roms_to_ips(&orig, &modified).unwrap();
+        let rebuilt = apply_ips_patch(&orig, &ips).unwrap();
+        assert_eq!(rebuilt, modified);
     }
 
     #[test]

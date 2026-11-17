@@ -718,6 +718,41 @@ canvas.game-canvas {
 .screen-container.mode-crt .shader-scanlines { opacity: 1; }
 .screen-container.mode-lcd .shader-lcd { opacity: 1; }
 
+.screen-container.mode-trinitron {
+  border-radius: 18px;
+  box-shadow:
+    inset 0 0 28px rgba(0, 0, 0, 0.78),
+    0 0 22px rgba(245, 186, 66, 0.22);
+  border-color: var(--border-gold);
+}
+.screen-container.mode-trinitron .shader-scanlines {
+  opacity: 0.9;
+}
+.screen-container.mode-trinitron canvas.game-canvas {
+  filter: contrast(1.12) saturate(1.22) brightness(1.05);
+}
+
+.screen-container.mode-dmg canvas.game-canvas {
+  filter: sepia(0.92) hue-rotate(42deg) saturate(1.75) contrast(1.08);
+}
+.screen-container.mode-dmg .shader-lcd {
+  opacity: 0.85;
+}
+
+.app-shell.big-picture .games-grid {
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 20px;
+}
+.app-shell.big-picture .game-card.selected {
+  transform: scale(1.03);
+  border-color: var(--gold-bright);
+  box-shadow: 0 0 0 2px var(--gold-bright), 0 12px 32px rgba(245, 186, 66, 0.35);
+}
+.app-shell.big-picture .screen-container {
+  width: 560px;
+  height: 420px;
+}
+
 .keymapper-overlay {
   position: absolute;
   inset: 0;

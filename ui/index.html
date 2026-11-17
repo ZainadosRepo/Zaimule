@@ -12,7 +12,7 @@
         <div class="brand-group" data-tauri-drag-region>
           <div class="brand-emblem">Z</div>
           <span class="brand-title">ZAIMULE</span>
-          <span class="brand-sub">Rust Multi-Console Station · v0.3.0</span>
+          <span class="brand-sub">Rust Multi-Console Station · v0.4.0</span>
         </div>
 
         <nav class="nav-tabs" role="tablist">
@@ -31,6 +31,9 @@
         </nav>
 
         <div class="titlebar-right">
+          <button class="btn mono" id="btn-big-picture" style="padding:3px 10px; font-size:11px;">
+            🛋️ Big Picture : OFF
+          </button>
           <span class="pill-badge pill-green mono" id="sram-pill">
             <span class="dot-pulse"></span> SRAM Atomique OK
           </span>
@@ -42,7 +45,7 @@
         </div>
       </header>
 
-      <!-- Hidden File Inputs for ROM & IPS Patch Import -->
+      <!-- Hidden File Inputs for ROM, IPS Patch & Portable Cloud Pack Import -->
       <input
         type="file"
         id="rom-file-input"
@@ -53,6 +56,12 @@
         type="file"
         id="ips-file-input"
         accept=".ips"
+        style="display: none;"
+      />
+      <input
+        type="file"
+        id="pack-file-input"
+        accept=".zaimule-pack,.json"
         style="display: none;"
       />
 
@@ -119,6 +128,8 @@
               <div class="toolbar-actions">
                 <button class="btn" id="btn-import-rom">📂 Importer ROM</button>
                 <button class="btn" id="btn-import-ips">🧩 Patcher .IPS</button>
+                <button class="btn" id="btn-export-pack" title="Exporter SRAM + SaveStates + Macros + Cheats (.zaimule-pack)">☁️ Export Pack</button>
+                <button class="btn" id="btn-import-pack" title="Importer une archive portable .zaimule-pack">📥 Import Pack</button>
                 <button class="btn btn-gold" id="btn-launch-selected">▶ Lancer l'Émulation</button>
               </div>
             </div>
@@ -160,8 +171,11 @@
 
             <div class="inspector-section">
               <div class="section-title">
-                <span>🧩 Mods &amp; Patchs IPS en RAM (Yuzu)</span>
-                <button class="btn mono" id="btn-insp-ips" style="padding:2px 6px; font-size:10px;">+ .IPS</button>
+                <span>🧩 Mods &amp; Créateur .IPS (Yuzu)</span>
+                <span style="display:flex; gap:4px;">
+                  <button class="btn mono" id="btn-insp-ips" style="padding:2px 6px; font-size:10px;">+ .IPS</button>
+                  <button class="btn mono" id="btn-export-ips" style="padding:2px 6px; font-size:10px;" title="Générer et exporter un patch .IPS binaire par diff ROM">📤 Créer .IPS</button>
+                </span>
               </div>
               <div id="mods-list"></div>
             </div>

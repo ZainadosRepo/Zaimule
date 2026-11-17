@@ -2,6 +2,9 @@
 //! Writes to `.tmp` then renames atomically, moves corrupted JSON files aside to `.json.bad`,
 //! and rotates `.srm.bak1`..`.srm.bak3` backups for cartridge SRAM saves.
 
+use crate::cheats::CheatCodeEntry;
+use crate::keymap::KeymapWidget;
+use crate::macros::MacroSequence;
 use crate::rewind::SaveStateSlotInfo;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,6 +15,7 @@ use std::path::Path;
 const MAX_JSON_BYTES: usize = 4 << 20; // 4 MiB
 const MAX_SRAM_BYTES: usize = 16 << 20; // 16 MiB
 const MAX_STATE_BYTES: usize = 32 << 20; // 32 MiB
+pub const PORTABLE_PACK_MAGIC: &str = "ZAIMULE_PACK_V1";
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +31,47 @@ pub struct PersistedSaveState {
     pub info: SaveStateSlotInfo,
     pub uncompressed_len: usize,
     pub compressed_bytes: Vec<u8>,
+}
+
+/// Portable Cloud / USB Sync Archive (`.zaimule-pack`) bundling SRAM, Save States,
+/// TAS Macros, GameShark Cheats, and Keymapper layout with CRC32 verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ZaimulePortablePack {
+    pub magic: String,
+    pub version: String,
+    pub active_game_id: String,
+    pub sram_rle: Vec<u8>,
+    pub sram_uncompressed_len: usize,
+    pub save_slots: Vec<PersistedSaveState>,
+    pub cheat_codes: Vec<CheatCodeEntry>,
+    pub macros: Vec<MacroSequence>,
+    pub keymapper_widgets: Vec<KeymapWidget>,
+    pub payload_crc32_hex: String,
+}
+
+/// Serializes a `ZaimulePortablePack` into UTF-8 JSON bytes ready for `.zaimule-pack` export.
+pub fn encode_portable_pack(pack: &ZaimulePortablePack) -> Result<Vec<u8>, String> {
+    if pack.magic != PORTABLE_PACK_MAGIC {
+        return Err("en-tête d'archive portable invalide".into());
+    }
+    serde_json::to_vec_pretty(pack).map_err(|e| e.to_string())
+}
+
+/// Deserializes and validates a `.zaimule-pack` archive buffer.
+pub fn decode_portable_pack(bytes: &[u8]) -> Result<ZaimulePortablePack, String> {
+    if bytes.is_empty() || bytes.len() > MAX_STATE_BYTES {
+        return Err("taille d'archive .zaimule-pack invalide".into());
+    }
+    let pack: ZaimulePortablePack = serde_json::from_slice(bytes)
+        .map_err(|e| format!("archive .zaimule-pack illisible : {e}"))?;
+    if pack.magic != PORTABLE_PACK_MAGIC {
+        return Err(format!(
+            "signature d'archive non reconnue ({}, attendu {})",
+            pack.magic, PORTABLE_PACK_MAGIC
+        ));
+    }
+    Ok(pack)
 }
 
 /// Loads a JSON configuration file atomically. Missing files return `Value::Null`.
@@ -242,5 +287,25 @@ mod tests {
         let loaded = load_state_slot_atomic(&path).unwrap().unwrap();
         assert_eq!(loaded.info.label, "Boss Final");
         assert_eq!(loaded.compressed_bytes, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn encodes_and_decodes_portable_pack_roundtrip() {
+        let pack = ZaimulePortablePack {
+            magic: PORTABLE_PACK_MAGIC.into(),
+            version: "0.4.0".into(),
+            active_game_id: "gb-pocket-arena".into(),
+            sram_rle: vec![1, 2, 3],
+            sram_uncompressed_len: 32_768,
+            save_slots: vec![],
+            cheat_codes: vec![],
+            macros: vec![],
+            keymapper_widgets: vec![],
+            payload_crc32_hex: "DCE0682B".into(),
+        };
+        let bytes = encode_portable_pack(&pack).unwrap();
+        let decoded = decode_portable_pack(&bytes).unwrap();
+        assert_eq!(decoded.active_game_id, "gb-pocket-arena");
+        assert_eq!(decoded.payload_crc32_hex, "DCE0682B");
     }
 }

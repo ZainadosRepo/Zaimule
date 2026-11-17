@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import {
   BTN_A,
   BTN_B,
+  BTN_L,
   BTN_LEFT,
+  BTN_R,
   BTN_RIGHT,
   BTN_START,
   BTN_UP,
@@ -11,7 +13,9 @@ import {
   computeBitmaskFromGamepad,
   shouldFireTurboOnFrame,
   clampWidgetPosition,
-  parseDeepLinkUri
+  parseDeepLinkUri,
+  triggerGamepadRumble,
+  computeBigPictureNavAction
 } from "../../ui/keymapper.js";
 import { sanitizeApuFrequency } from "../../ui/audio.js";
 
@@ -62,4 +66,27 @@ test("parseDeepLinkUri parses zaimule://room/ invitations", () => {
     core: "zaimule-rust-gb"
   });
   assert.equal(parseDeepLinkUri("https://example.com"), null);
+});
+
+test("triggerGamepadRumble invokes W3C dual-rumble actuator safely", () => {
+  let lastEffect = null;
+  const fakePad = {
+    vibrationActuator: {
+      playEffect(type, params) {
+        lastEffect = { type, params };
+      }
+    }
+  };
+  assert.equal(triggerGamepadRumble(fakePad, 90, 0.4, 0.8), true);
+  assert.equal(lastEffect.type, "dual-rumble");
+  assert.equal(lastEffect.params.duration, 90);
+  assert.equal(triggerGamepadRumble(null), false);
+});
+
+test("computeBigPictureNavAction detects rising edges on D-Pad, shoulders, and A", () => {
+  assert.equal(computeBigPictureNavAction(0, BTN_RIGHT), "NEXT_GAME");
+  assert.equal(computeBigPictureNavAction(BTN_RIGHT, BTN_RIGHT), null);
+  assert.equal(computeBigPictureNavAction(0, BTN_L), "PREV_TAB");
+  assert.equal(computeBigPictureNavAction(0, BTN_R), "NEXT_TAB");
+  assert.equal(computeBigPictureNavAction(0, BTN_A), "LAUNCH_GAME");
 });

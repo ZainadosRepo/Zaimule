@@ -100,3 +100,45 @@ export function parseDeepLinkUri(uri) {
     core: params.get("core") || "zaimule-rust-gb"
   };
 }
+
+/**
+ * Triggers dual-rumble haptic feedback on a W3C Gamepad if supported by the controller.
+ */
+export function triggerGamepadRumble(
+  gamepad,
+  durationMs = 60,
+  weakMagnitude = 0.35,
+  strongMagnitude = 0.65
+) {
+  const actuator = gamepad?.vibrationActuator;
+  if (!actuator || typeof actuator.playEffect !== "function") {
+    return false;
+  }
+  try {
+    actuator.playEffect("dual-rumble", {
+      startDelay: 0,
+      duration: Math.max(10, Math.min(1000, Number(durationMs) || 60)),
+      weakMagnitude: Math.max(0, Math.min(1, Number(weakMagnitude) || 0.35)),
+      strongMagnitude: Math.max(0, Math.min(1, Number(strongMagnitude) || 0.65))
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Computes rising-edge Big Picture UI navigation actions from previous and current joypad bitmasks.
+ */
+export function computeBigPictureNavAction(prevMask, nextMask) {
+  const rising = ~prevMask & nextMask;
+  if (rising & BTN_LEFT) return "PREV_GAME";
+  if (rising & BTN_RIGHT) return "NEXT_GAME";
+  if (rising & BTN_UP) return "PREV_ROW";
+  if (rising & BTN_DOWN) return "NEXT_ROW";
+  if (rising & BTN_L) return "PREV_TAB";
+  if (rising & BTN_R) return "NEXT_TAB";
+  if (rising & (BTN_A | BTN_START)) return "LAUNCH_GAME";
+  if (rising & BTN_B) return "BACK_LIBRARY";
+  return null;
+}

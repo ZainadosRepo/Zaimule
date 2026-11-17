@@ -171,7 +171,8 @@ fn decode_lr35902(rom: &[u8], pc: u32) -> (u32, String, String) {
 
 fn decode_mos6502(rom: &[u8], pc: u32) -> (u32, String, String) {
     let idx = if pc >= 0x8000 {
-        16 + ((pc as usize - 0x8000) % rom.len().max(1))
+        let base = if rom.starts_with(b"NES\x1A") { 16 } else { 0 };
+        base + ((pc as usize - 0x8000) % rom.len().max(1))
     } else {
         (pc as usize) % rom.len().max(1)
     };
@@ -181,6 +182,10 @@ fn decode_mos6502(rom: &[u8], pc: u32) -> (u32, String, String) {
     let u16_imm = u16::from_le_bytes([b1, b2]);
 
     match op {
+        0x18 => (1, "18".into(), "CLC".into()),
+        0xFB => (1, "FB".into(), "XCE".into()),
+        0xC2 => (2, format!("C2 {b1:02X}"), format!("REP #${b1:02X}")),
+        0xE2 => (2, format!("E2 {b1:02X}"), format!("SEP #${b1:02X}")),
         0xA9 => (2, format!("A9 {b1:02X}"), format!("LDA #${b1:02X}")),
         0xA2 => (2, format!("A2 {b1:02X}"), format!("LDX #${b1:02X}")),
         0xA0 => (2, format!("A0 {b1:02X}"), format!("LDY #${b1:02X}")),

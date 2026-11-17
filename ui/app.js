@@ -13,7 +13,9 @@ import {
   BTN_B,
   computeBitmaskFromPressedCodes,
   computeBitmaskFromGamepad,
-  clampWidgetPosition
+  clampWidgetPosition,
+  triggerGamepadRumble,
+  computeBigPictureNavAction
 } from "./keymapper.js";
 import { ApuAudioEngine } from "./audio.js";
 import { ViewportRecorder } from "./recorder.js";
@@ -73,15 +75,15 @@ const FALLBACK_CATALOG = [
     coverSymbol: "⚔️"
   },
   {
-    id: "snes-valkyrie-trigger",
-    title: "Valkyrie Trigger: Epoch 1995",
+    id: "snes-alttp-fr",
+    title: "Valkyrie Trigger : Mode 7 Odyssey (SNES)",
     console: "SNES",
-    engineKind: "libretroAbi",
-    coreId: "snes9x_libretro",
-    region: "JPN · Patch FR IPS",
+    engineKind: "nativeRust",
+    coreId: "zaimule-rust-snes",
+    region: "EUR · FR (65C816 + Mode 7 Inclus)",
     crc32Hex: "A2D9107B",
-    sizeBytes: 4194304,
-    sramSummary: "8 Ko SRAM + Patch IPS Actif en RAM",
+    sizeBytes: 32768,
+    sramSummary: "8 Ko LoROM SRAM + PPU Mode 7",
     playtimeSeconds: 68100,
     favorite: true,
     linkCableReady: false,
@@ -307,6 +309,8 @@ let state = {
   quadLinkMode: false,
   debuggerPaused: false,
   stepOnceRequested: false,
+  bigPictureMode: false,
+  prevNavMask: 0,
   speedMult: 1,
   activeMacroId: null,
   recordingMacro: false,
@@ -339,18 +343,78 @@ function getSelectedGame() {
   return state.catalog.find((g) => g.id === state.activeGameId) || state.catalog[0];
 }
 
-function pollGamepadBitmask() {
-  if (typeof navigator === "undefined" || !navigator.getGamepads) return 0;
+function getConnectedGamepad() {
+  if (typeof navigator === "undefined" || !navigator.getGamepads) return null;
   const pads = navigator.getGamepads();
-  if (!pads) return 0;
+  if (!pads) return null;
   for (const pad of pads) {
-    if (pad && pad.connected) {
-      const el = document.getElementById("tel-pad");
-      if (el) el.textContent = `🎮 ${pad.id.slice(0, 18)}`;
-      return computeBitmaskFromGamepad(pad);
-    }
+    if (pad && pad.connected) return pad;
+  }
+  return null;
+}
+
+function pollGamepadBitmask() {
+  const pad = getConnectedGamepad();
+  if (pad) {
+    const el = document.getElementById("tel-pad");
+    if (el) el.textContent = `🎮 ${pad.id.slice(0, 18)}`;
+    return computeBitmaskFromGamepad(pad);
   }
   return 0;
+}
+
+function downloadBinaryFile(bytesArray, fileName, mimeType = "application/octet-stream") {
+  if (typeof document === "undefined" || typeof URL === "undefined") return;
+  const blob = new Blob([new Uint8Array(bytesArray)], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+async function handleBigPictureNavigation(currentMask) {
+  const action = computeBigPictureNavAction(state.prevNavMask, currentMask);
+  state.prevNavMask = currentMask;
+  if (!action || !state.bigPictureMode) return;
+
+  const tabs = ["view-library", "view-emulator", "view-netplay", "view-cores"];
+  const activePane = document.querySelector(".view-pane.active")?.id || "view-library";
+
+  if (action === "PREV_TAB" || action === "NEXT_TAB") {
+    const curIdx = Math.max(0, tabs.indexOf(activePane));
+    const nextIdx =
+      action === "NEXT_TAB"
+        ? (curIdx + 1) % tabs.length
+        : (curIdx - 1 + tabs.length) % tabs.length;
+    switchTab(tabs[nextIdx]);
+    triggerGamepadRumble(getConnectedGamepad(), 45, 0.3, 0.5);
+    return;
+  }
+
+  if (activePane === "view-library") {
+    const idx = state.catalog.findIndex((g) => g.id === state.activeGameId);
+    if (action === "PREV_GAME" || action === "NEXT_GAME" || action === "PREV_ROW" || action === "NEXT_ROW") {
+      const step = action === "PREV_GAME" ? -1 : action === "NEXT_GAME" ? 1 : action === "PREV_ROW" ? -3 : 3;
+      const nextIdx = (Math.max(0, idx) + step + state.catalog.length) % state.catalog.length;
+      const nextGame = state.catalog[nextIdx];
+      if (nextGame) {
+        state.activeGameId = nextGame.id;
+        const boot = await invokeBackend("select_game", { gameId: nextGame.id });
+        if (boot) applyBootstrap(boot);
+        else updateAllViews();
+        triggerGamepadRumble(getConnectedGamepad(), 35, 0.25, 0.4);
+      }
+    } else if (action === "LAUNCH_GAME") {
+      switchTab("view-emulator");
+      triggerGamepadRumble(getConnectedGamepad(), 90, 0.5, 0.85);
+    }
+  } else if (action === "BACK_LIBRARY" && activePane !== "view-emulator") {
+    switchTab("view-library");
+  }
 }
 
 function stepBrowserFallback(maskP1) {
@@ -895,6 +959,16 @@ async function handleImportedFile(file) {
   const bytes = Array.from(new Uint8Array(buf));
   const lower = file.name.toLowerCase();
 
+  if (lower.endsWith(".zaimule-pack") || lower.endsWith(".json")) {
+    const boot = await invokeBackend("import_portable_pack_archive", { bytes });
+    if (boot) {
+      applyBootstrap(boot);
+    }
+    const toast = document.getElementById("save-toast");
+    if (toast) toast.textContent = `☁️ Archive ${file.name} synchronisée !`;
+    return;
+  }
+
   if (lower.endsWith(".ips")) {
     const boot = await invokeBackend("apply_ips_patch_file", {
       patchName: file.name,
@@ -1003,6 +1077,8 @@ async function tickEmulationLoop() {
   state.stepOnceRequested = false;
 
   const buttonsP1 = computeBitmaskFromPressedCodes(pressedKeys) | pollGamepadBitmask();
+  await handleBigPictureNavigation(buttonsP1);
+
   if (state.recordingMacro) {
     state.recordedFrames.push(buttonsP1);
   }
@@ -1032,8 +1108,12 @@ async function tickEmulationLoop() {
 
     if (resp.primary.audioFreqHz) {
       apuAudio.triggerFrameTone(resp.primary.audioFreqHz);
+      if (resp.primary.audioFreqHz >= 1200) {
+        triggerGamepadRumble(getConnectedGamepad(), 55, 0.35, 0.65);
+      }
     }
     if (resp.newlyUnlockedAchievement) {
+      triggerGamepadRumble(getConnectedGamepad(), 140, 0.6, 0.95);
       document.getElementById("save-toast").textContent =
         `🏆 Succès débloqué : ${resp.newlyUnlockedAchievement}`;
       const boot = await invokeBackend("get_station_bootstrap");
@@ -1068,6 +1148,13 @@ function bindEvents() {
     btn.addEventListener("click", () => switchTab(btn.dataset.target));
   });
 
+  document.getElementById("btn-big-picture")?.addEventListener("click", (e) => {
+    state.bigPictureMode = !state.bigPictureMode;
+    document.querySelector(".app-shell")?.classList.toggle("big-picture", state.bigPictureMode);
+    e.currentTarget.textContent = `🛋️ Big Picture : ${state.bigPictureMode ? "ACTIF" : "OFF"}`;
+    triggerGamepadRumble(getConnectedGamepad(), 70, 0.4, 0.7);
+  });
+
   document.querySelectorAll(".console-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       document.querySelectorAll(".console-btn").forEach((b) => b.classList.remove("active"));
@@ -1084,10 +1171,46 @@ function bindEvents() {
 
   const romInput = document.getElementById("rom-file-input");
   const ipsInput = document.getElementById("ips-file-input");
+  const packInput = document.getElementById("pack-file-input");
 
   document.getElementById("btn-import-rom")?.addEventListener("click", () => romInput?.click());
   document.getElementById("btn-import-ips")?.addEventListener("click", () => ipsInput?.click());
   document.getElementById("btn-insp-ips")?.addEventListener("click", () => ipsInput?.click());
+  document.getElementById("btn-import-pack")?.addEventListener("click", () => packInput?.click());
+
+  document.getElementById("btn-export-pack")?.addEventListener("click", async () => {
+    const packBytes =
+      (await invokeBackend("export_portable_pack_archive")) ||
+      Array.from(
+        new TextEncoder().encode(
+          JSON.stringify({
+            magic: "ZAIMULE_PACK_V1",
+            version: "0.4.0",
+            activeGameId: state.activeGameId,
+            cheatCodes: state.cheatCodes,
+            macros: state.macros
+          })
+        )
+      );
+    downloadBinaryFile(packBytes, `${state.activeGameId}-cloud.zaimule-pack`, "application/json");
+    const toast = document.getElementById("save-toast");
+    if (toast) toast.textContent = `☁️ Pack .zaimule-pack exporté (${packBytes.length} o)`;
+  });
+
+  document.getElementById("btn-export-ips")?.addEventListener("click", async () => {
+    const ipsBytes =
+      (await invokeBackend("export_ips_diff")) || [
+        0x50, 0x41, 0x54, 0x43, 0x48, 0x00, 0x01, 0x34, 0x00, 0x04, 0x5a, 0x4d, 0x44, 0x58, 0x45,
+        0x4f, 0x46
+      ];
+    downloadBinaryFile(ipsBytes, `${state.activeGameId}-dx.ips`, "application/octet-stream");
+    state.modLayers.unshift({
+      id: `ips-diff-${Date.now()}`,
+      label: `Création Diff ${state.activeGameId}-dx.ips (${ipsBytes.length} o)`,
+      enabled: true
+    });
+    renderInspector();
+  });
 
   romInput?.addEventListener("change", async (e) => {
     const file = e.target.files?.[0];
@@ -1096,6 +1219,12 @@ function bindEvents() {
   });
 
   ipsInput?.addEventListener("change", async (e) => {
+    const file = e.target.files?.[0];
+    if (file) await handleImportedFile(file);
+    e.target.value = "";
+  });
+
+  packInput?.addEventListener("change", async (e) => {
     const file = e.target.files?.[0];
     if (file) await handleImportedFile(file);
     e.target.value = "";
@@ -1211,9 +1340,11 @@ function bindEvents() {
     }
   });
 
-  const shaders = ["mode-crt", "mode-lcd", "mode-clean"];
+  const shaders = ["mode-crt", "mode-trinitron", "mode-dmg", "mode-lcd", "mode-clean"];
   const shaderLabels = [
     "📺 Shader : CRT Scanlines",
+    "📺 Shader : Trinitron Courbé",
+    "📺 Shader : Game Boy DMG Vert",
     "📺 Shader : Matrice LCD",
     "📺 Shader : Pixel-Perfect"
   ];
@@ -1224,7 +1355,7 @@ function bindEvents() {
     ["screen-1", "screen-2", "screen-3", "screen-4"].forEach((id) => {
       const el = document.getElementById(id);
       if (!el) return;
-      el.classList.remove("mode-crt", "mode-lcd", "mode-clean");
+      el.classList.remove("mode-crt", "mode-trinitron", "mode-dmg", "mode-lcd", "mode-clean");
       el.classList.add(shaders[shaderIdx]);
     });
   });
