@@ -19,6 +19,7 @@ pub struct CpuDebugSnapshot {
     pub serial_sb_hex: String,
     pub serial_sc_hex: String,
     pub cycles: u64,
+    pub score: u32,
 }
 
 /// Output produced by stepping an emulator core for one 60 Hz frame.
@@ -33,6 +34,8 @@ pub struct FrameStepResult {
     pub rgba: Vec<u8>,
     /// Root-mean-square audio level (`0.0..=1.0`) for telemetry meters.
     pub audio_level: f32,
+    /// Active APU tone frequency in Hz (`0` = silence) for real-time WebAudio APU synthesis.
+    pub audio_freq_hz: u16,
     /// Outgoing byte placed on the Serial Link Bus (`0xFF01`/`0xFF02`) during this frame, if any.
     pub serial_out_byte: Option<u8>,
     pub cpu: CpuDebugSnapshot,

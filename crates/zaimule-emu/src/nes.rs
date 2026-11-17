@@ -1,5 +1,5 @@
 //! 100% Native Rust NES / Famicom core (`zaimule-rust-nes`) with iNES header parser,
-//! MOS 6502 CPU interpreter, 256x240 PPU 2C02 renderer, and embedded homebrew ROM.
+//! MOS 6502 CPU interpreter, 256x240 PPU 2C02 renderer, collectible relics, and embedded ROM.
 
 use crate::traits::{CpuDebugSnapshot, EmulatorBackend, FrameStepResult};
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,11 @@ pub struct NesCore {
     pub frame_number: u64,
     pub hero_x: u8,
     pub hero_y: u8,
+    pub relic_x: u8,
+    pub relic_y: u8,
+    pub score: u32,
+    pub audio_timer: u8,
+    pub audio_freq_hz: u16,
 }
 
 impl Default for NesCore {
@@ -51,6 +56,11 @@ impl Default for NesCore {
             frame_number: 0,
             hero_x: 120,
             hero_y: 112,
+            relic_x: 64,
+            relic_y: 80,
+            score: 0,
+            audio_timer: 0,
+            audio_freq_hz: 0,
         };
         let rom = build_nes_chrono_knight_rom();
         let _ = core.load_rom(&rom);
@@ -86,24 +96,28 @@ impl NesCore {
             match op {
                 0xEA => {} // NOP
                 0xE8 => {
-                    // INX
                     self.x = self.x.wrapping_add(1);
                     self.set_zn(self.x);
                 }
+                0xCA => {
+                    self.x = self.x.wrapping_sub(1);
+                    self.set_zn(self.x);
+                }
                 0xC8 => {
-                    // INY
                     self.y = self.y.wrapping_add(1);
                     self.set_zn(self.y);
                 }
+                0x88 => {
+                    self.y = self.y.wrapping_sub(1);
+                    self.set_zn(self.y);
+                }
                 0xA9 => {
-                    // LDA #imm
                     let imm = self.prg_rom[(offset + 1) % self.prg_rom.len().max(1)];
                     self.pc = self.pc.wrapping_add(1);
                     self.a = imm;
                     self.set_zn(self.a);
                 }
                 0x4C => {
-                    // JMP abs
                     let lo = self.prg_rom[(offset + 1) % self.prg_rom.len().max(1)] as u16;
                     let hi = self.prg_rom[(offset + 2) % self.prg_rom.len().max(1)] as u16;
                     self.pc = (hi << 8) | lo;
@@ -117,7 +131,7 @@ impl NesCore {
         }
 
         let speed = if (buttons_mask & BTN_B) != 0 {
-            3u8
+            4u8
         } else {
             2u8
         };
@@ -128,24 +142,40 @@ impl NesCore {
             self.hero_x = self.hero_x.saturating_add(speed).min(232);
         }
         if (buttons_mask & BTN_UP) != 0 {
-            self.hero_y = self.hero_y.saturating_sub(speed).max(24);
+            self.hero_y = self.hero_y.saturating_sub(speed).max(28);
         }
         if (buttons_mask & BTN_DOWN) != 0 {
-            self.hero_y = self.hero_y.saturating_add(speed).min(208);
-        }
-        if buttons_mask == 0 {
-            let t = self.frame_number as f32 * 0.04;
-            self.hero_x = (120.0 + t.cos() * 64.0) as u8;
-            self.hero_y = (112.0 + t.sin() * 40.0) as u8;
+            self.hero_y = self.hero_y.saturating_add(speed).min(204);
         }
 
-        // Write OAM Sprite 0
+        if self.hero_x.abs_diff(self.relic_x) < 14 && self.hero_y.abs_diff(self.relic_y) < 14 {
+            self.score = self.score.saturating_add(250);
+            let seed = (self.frame_number as u8)
+                .wrapping_mul(97)
+                .wrapping_add(self.hero_x);
+            self.relic_x = 24 + (seed % 200);
+            self.relic_y = 32 + (seed.rotate_left(2) % 168);
+            self.audio_freq_hz = 1046; // C6 chime
+            self.audio_timer = 10;
+        } else if (buttons_mask & BTN_A) != 0 && self.audio_timer == 0 {
+            self.audio_freq_hz = 523;
+            self.audio_timer = 4;
+        }
+
+        if self.audio_timer > 0 {
+            self.audio_timer -= 1;
+            if self.audio_timer == 0 {
+                self.audio_freq_hz = 0;
+            }
+        }
+
         self.oam[0] = self.hero_y;
         self.oam[1] = 1;
         self.oam[2] = 0;
         self.oam[3] = self.hero_x;
         self.sram[0] = self.hero_x;
         self.sram[1] = self.hero_y;
+        self.sram[4..8].copy_from_slice(&self.score.to_le_bytes());
     }
 
     fn render_2c02_rgba(&self, buttons_mask: u16) -> Vec<u8> {
@@ -165,11 +195,23 @@ impl NesCore {
             }
         }
 
-        // Render Hero 12x12 sprite in Phosphor Gold / Emerald
+        // Render Collectible Relic 10x10 in Cobalt/Emerald
+        let rx = self.relic_x as usize;
+        let ry = self.relic_y as usize;
+        for dy in 0..10 {
+            for dx in 0..10 {
+                let px = (rx + dx).min(NES_WIDTH - 1);
+                let py = (ry + dy).min(NES_HEIGHT - 1);
+                let idx = (py * NES_WIDTH + px) * 4;
+                rgba[idx..idx + 4].copy_from_slice(&[52, 211, 153, 255]);
+            }
+        }
+
+        // Render Hero 12x12 sprite in Phosphor Gold
         let hx = self.hero_x as usize;
         let hy = self.hero_y as usize;
         let color = if (buttons_mask & BTN_A) != 0 {
-            [52, 211, 153, 255]
+            [96, 165, 250, 255]
         } else {
             [245, 186, 66, 255]
         };
@@ -210,6 +252,7 @@ impl EmulatorBackend for NesCore {
         self.pc = 0x8000;
         self.sp = 0xFD;
         self.frame_number = 0;
+        self.score = 0;
         Ok(())
     }
 
@@ -223,7 +266,8 @@ impl EmulatorBackend for NesCore {
             width: NES_WIDTH as u16,
             height: NES_HEIGHT as u16,
             rgba,
-            audio_level: 0.28,
+            audio_level: if self.audio_freq_hz > 0 { 0.60 } else { 0.10 },
+            audio_freq_hz: self.audio_freq_hz,
             serial_out_byte: None,
             cpu: self.debug_snapshot(),
         }
@@ -267,6 +311,7 @@ impl EmulatorBackend for NesCore {
             serial_sb_hex: "0x00".into(),
             serial_sc_hex: "0x00".into(),
             cycles: self.cycles,
+            score: self.score,
         }
     }
 }
@@ -275,11 +320,10 @@ impl EmulatorBackend for NesCore {
 pub fn build_nes_chrono_knight_rom() -> Vec<u8> {
     let mut rom = vec![0xEAu8; 16 + 16_384];
     rom[0..4].copy_from_slice(b"NES\x1A");
-    rom[4] = 1; // 1 x 16 KiB PRG-ROM
-    rom[5] = 0; // CHR-RAM
-    rom[6] = 0x01; // Vertical mirroring, Mapper 0
+    rom[4] = 1;
+    rom[5] = 0;
+    rom[6] = 0x01;
     rom[7] = 0x00;
-    // 0x8000: INX; INY; LDA #$42; JMP $8000
     rom[16] = 0xE8;
     rom[17] = 0xC8;
     rom[18] = 0xA9;

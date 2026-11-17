@@ -19,7 +19,7 @@ use zaimule_core::keymap::{apply_turbo_mask, default_keymapper_widgets, KeymapWi
 use zaimule_core::macros::{default_macros, MacroSequence};
 use zaimule_core::netplay::{default_netplay_rooms, NetplayRoom};
 use zaimule_core::overrides::{resolve_effective_config, EffectiveGameConfig, GlobalSettings};
-use zaimule_core::patch::{default_mod_layers, ModLayerEntry};
+use zaimule_core::patch::{apply_ips_patch, default_mod_layers, ModLayerEntry};
 use zaimule_core::rewind::{rle_compress, rle_decompress, RewindBuffer, SaveStateSlotInfo};
 
 /// Snapshot of the entire Zaimule station sent to the UI.
@@ -67,6 +67,7 @@ pub struct EmulatorSession {
     pub link_telemetry: LinkCableTelemetry,
     pub rewind_buffer: RewindBuffer,
     pub save_states_ram: HashMap<(String, u8), (SaveStateSlotInfo, Vec<u8>)>,
+    pub custom_roms: HashMap<String, Vec<u8>>,
     pub sram_dirty: bool,
     pub warning: Option<String>,
     core_p1: Box<dyn EmulatorBackend>,
@@ -99,6 +100,7 @@ impl EmulatorSession {
             link_telemetry: LinkCableTelemetry::default(),
             rewind_buffer: RewindBuffer::new(240), // 240 snapshots @ 4Hz = 60s
             save_states_ram: HashMap::new(),
+            custom_roms: HashMap::new(),
             sram_dirty: false,
             warning: None,
             core_p1,
@@ -157,6 +159,19 @@ impl EmulatorSession {
             .collect()
     }
 
+    pub fn base_rom_for_game(&self, game_id: &str, console: ConsoleKind) -> Vec<u8> {
+        if let Some(custom) = self.custom_roms.get(game_id) {
+            return custom.clone();
+        }
+        match console {
+            ConsoleKind::Chip8 => build_space_interceptor_rom(),
+            ConsoleKind::Nes | ConsoleKind::Snes | ConsoleKind::Ps1 | ConsoleKind::N64 => {
+                build_nes_chrono_knight_rom()
+            }
+            _ => build_gb_pocket_arena_rom(),
+        }
+    }
+
     /// Switches the active game and instantiates the appropriate Rust core.
     pub fn select_game(&mut self, game_id: &str) -> Result<StationBootstrap, String> {
         let Some(game) = self.catalog.iter().find(|g| g.id == game_id).cloned() else {
@@ -164,12 +179,12 @@ impl EmulatorSession {
         };
         self.active_game_id = game.id.clone();
         self.rewind_buffer.clear();
+        let rom = self.base_rom_for_game(&game.id, game.console);
 
         let (p1, p2): (Box<dyn EmulatorBackend>, Box<dyn EmulatorBackend>) = match game.console {
             ConsoleKind::Chip8 => {
                 let mut c1 = Chip8Core::new();
                 let mut c2 = Chip8Core::new();
-                let rom = build_space_interceptor_rom();
                 c1.load_rom(&rom)?;
                 c2.load_rom(&rom)?;
                 (Box::new(c1), Box::new(c2))
@@ -177,7 +192,6 @@ impl EmulatorSession {
             ConsoleKind::Nes | ConsoleKind::Snes | ConsoleKind::Ps1 | ConsoleKind::N64 => {
                 let mut c1 = NesCore::new();
                 let mut c2 = NesCore::new();
-                let rom = build_nes_chrono_knight_rom();
                 c1.load_rom(&rom)?;
                 c2.load_rom(&rom)?;
                 (Box::new(c1), Box::new(c2))
@@ -185,7 +199,6 @@ impl EmulatorSession {
             _ => {
                 let mut c1 = GameBoyCore::new();
                 let mut c2 = GameBoyCore::new();
-                let rom = build_gb_pocket_arena_rom();
                 c1.load_rom(&rom)?;
                 c2.load_rom(&rom)?;
                 (Box::new(c1), Box::new(c2))
@@ -211,6 +224,8 @@ impl EmulatorSession {
         let crc = compute_crc32(rom_bytes);
         let crc_hex = format_crc32_hex(crc);
         let id = format!("rom-{}", crc_hex.to_ascii_lowercase());
+
+        self.custom_roms.insert(id.clone(), rom_bytes.to_vec());
 
         if !self.catalog.iter().any(|g| g.id == id) {
             self.catalog.insert(
@@ -239,9 +254,78 @@ impl EmulatorSession {
             );
         }
 
-        self.select_game(&id)?;
-        let _ = self.core_p1.load_rom(rom_bytes);
-        let _ = self.core_p2.load_rom(rom_bytes);
+        self.select_game(&id)
+    }
+
+    /// Applies an IPS binary patch in RAM to the currently active game without touching disk ROMs.
+    pub fn apply_custom_ips_to_active_game(
+        &mut self,
+        patch_name: &str,
+        ips_bytes: &[u8],
+    ) -> Result<StationBootstrap, String> {
+        let game = self.active_game().clone();
+        let base_rom = self.base_rom_for_game(&game.id, game.console);
+        let patched_rom = apply_ips_patch(&base_rom, ips_bytes)?;
+        let new_crc = format_crc32_hex(compute_crc32(&patched_rom));
+
+        self.custom_roms
+            .insert(game.id.clone(), patched_rom.clone());
+        self.core_p1.load_rom(&patched_rom)?;
+        self.core_p2.load_rom(&patched_rom)?;
+
+        let mod_id = format!("ips-{}", new_crc.to_ascii_lowercase());
+        self.mod_layers.retain(|m| m.id != mod_id);
+        self.mod_layers.insert(
+            0,
+            ModLayerEntry {
+                id: mod_id,
+                label: format!("{patch_name} (RAM CRC {new_crc})"),
+                kind: "IPS Patch RAM".into(),
+                enabled: true,
+                description: format!(
+                    "Patch IPS appliqué à la volée sur {} ({} octets).",
+                    game.title,
+                    ips_bytes.len()
+                ),
+            },
+        );
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Saves a newly recorded frame-by-frame TAS macro into the session and activates it.
+    pub fn save_custom_macro(
+        &mut self,
+        name: String,
+        frames: Vec<u16>,
+    ) -> Result<StationBootstrap, String> {
+        if frames.is_empty() {
+            return Err("la séquence macro enregistrée ne contient aucune frame".into());
+        }
+        let clean_name = if name.trim().is_empty() {
+            format!("⚡ Macro Perso ({}f)", frames.len())
+        } else {
+            name.trim().to_string()
+        };
+        let id = format!("macro-custom-{}", self.macros.len() + 1);
+        let mut seq = MacroSequence::new(id.clone(), clean_name, true);
+        for mask in frames {
+            seq.record_frame(mask);
+        }
+        self.macros.insert(0, seq);
+        self.active_macro_id = Some(id);
+        self.macro_start_frame = self.core_p1.debug_snapshot().cycles / 256;
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Updates the BlueStacks-style Visual Keymapper widget positions and turbo settings.
+    pub fn update_keymapper_widgets(
+        &mut self,
+        widgets: Vec<KeymapWidget>,
+    ) -> Result<StationBootstrap, String> {
+        if widgets.is_empty() {
+            return Err("la configuration Keymapper ne peut pas être vide".into());
+        }
+        self.keymapper_widgets = widgets;
         Ok(self.bootstrap_snapshot())
     }
 
@@ -352,6 +436,22 @@ impl EmulatorSession {
         Ok(info)
     }
 
+    pub fn export_save_state_envelope(&self, slot: u8) -> Option<(SaveStateSlotInfo, Vec<u8>)> {
+        self.save_states_ram
+            .get(&(self.active_game_id.clone(), slot.clamp(1, 9)))
+            .cloned()
+    }
+
+    pub fn import_save_state_envelope(
+        &mut self,
+        game_id: String,
+        info: SaveStateSlotInfo,
+        envelope: Vec<u8>,
+    ) {
+        self.save_states_ram
+            .insert((game_id, info.slot.clamp(1, 9)), (info, envelope));
+    }
+
     /// Rewinds the active emulator by `steps_back` snapshots from the circular buffer.
     pub fn rewind(&mut self, steps_back: usize) -> Result<u64, String> {
         let Some((frame, raw_state)) = self.rewind_buffer.rewind_steps(steps_back)? else {
@@ -364,12 +464,17 @@ impl EmulatorSession {
     pub fn active_sram_bytes(&self) -> &[u8] {
         self.core_p1.sram()
     }
+
+    pub fn load_active_sram(&mut self, data: &[u8]) {
+        let _ = self.core_p1.load_sram(data);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zaimule_core::keymap::BTN_RIGHT;
+    use zaimule_core::keymap::{BTN_A, BTN_RIGHT};
+    use zaimule_core::patch::build_ips_patch;
 
     #[test]
     fn session_steps_creates_savestate_and_rewinds_cleanly() {
@@ -385,5 +490,21 @@ mod tests {
         let restored = session.restore_save_state(2).unwrap();
         assert_eq!(restored.label, "Test Boss");
         assert!(session.rewind(1).is_ok());
+    }
+
+    #[test]
+    fn session_applies_ips_patch_and_records_custom_macro() {
+        let mut session = EmulatorSession::new();
+        let patch = build_ips_patch(0x0134, b"ZAIMULE_DX").unwrap();
+        let snap = session
+            .apply_custom_ips_to_active_game("DX Edition.ips", &patch)
+            .unwrap();
+        assert!(snap.mod_layers[0].label.contains("DX Edition.ips"));
+
+        let snap2 = session
+            .save_custom_macro("Combo Plasma".into(), vec![BTN_A, BTN_A, BTN_RIGHT])
+            .unwrap();
+        assert_eq!(snap2.macros[0].name, "Combo Plasma");
+        assert_eq!(snap2.macros[0].total_frames(), 3);
     }
 }

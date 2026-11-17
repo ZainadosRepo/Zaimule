@@ -43,6 +43,7 @@ pub struct Chip8Core {
     frame_number: u64,
     cycles: u64,
     rng_state: u32,
+    score: u32,
     sram: Vec<u8>,
 }
 
@@ -61,6 +62,7 @@ impl Default for Chip8Core {
             frame_number: 0,
             cycles: 0,
             rng_state: 0xC0DE_CAFE,
+            score: 0,
             sram: vec![0; 256],
         };
         core.ram[0x050..0x050 + FONTSET.len()].copy_from_slice(&FONTSET);
@@ -196,6 +198,8 @@ impl Chip8Core {
                             let idx = py * CHIP8_WIDTH + px;
                             if self.vram[idx] == 1 {
                                 self.v[0xF] = 1;
+                                self.score = self.score.saturating_add(10);
+                                self.sound_timer = 4;
                             }
                             self.vram[idx] ^= 1;
                         }
@@ -264,29 +268,37 @@ impl EmulatorBackend for Chip8Core {
         self.sp = 0;
         self.vram.fill(0);
         self.frame_number = 0;
+        self.score = 0;
         Ok(())
     }
 
     fn step_frame(&mut self, buttons_mask: u16) -> FrameStepResult {
         let keys = Self::map_keys(buttons_mask);
+        if (buttons_mask & BTN_UP) != 0 {
+            self.v[1] = self.v[1].wrapping_sub(1) & 31;
+        }
+        if (buttons_mask & BTN_DOWN) != 0 {
+            self.v[1] = self.v[1].wrapping_add(1) & 31;
+        }
         for _ in 0..12 {
             self.step_opcode(&keys);
         }
         if self.delay_timer > 0 {
             self.delay_timer -= 1;
         }
-        if self.sound_timer > 0 {
+        let freq = if self.sound_timer > 0 {
             self.sound_timer -= 1;
-        }
+            440
+        } else {
+            0
+        };
         self.frame_number += 1;
 
         let mut rgba = Vec::with_capacity(CHIP8_WIDTH * CHIP8_HEIGHT * 4);
         for &px in &self.vram {
             if px != 0 {
-                // Phosphor gold/amber active pixel (#F5BA42)
                 rgba.extend_from_slice(&[245, 186, 66, 255]);
             } else {
-                // Deep obsidian CRT background (#090D16)
                 rgba.extend_from_slice(&[9, 13, 22, 255]);
             }
         }
@@ -297,7 +309,8 @@ impl EmulatorBackend for Chip8Core {
             width: CHIP8_WIDTH as u16,
             height: CHIP8_HEIGHT as u16,
             rgba,
-            audio_level: if self.sound_timer > 0 { 0.75 } else { 0.05 },
+            audio_level: if freq > 0 { 0.75 } else { 0.05 },
+            audio_freq_hz: freq,
             serial_out_byte: None,
             cpu: self.debug_snapshot(),
         }
@@ -344,17 +357,18 @@ impl EmulatorBackend for Chip8Core {
             serial_sb_hex: "0x00".into(),
             serial_sc_hex: "0x00".into(),
             cycles: self.cycles,
+            score: self.score,
         }
     }
 }
 
-/// Builds a playable CHIP-8 homebrew ROM ("Space Interceptor DX") that animates interceptor ships and responds to keypad inputs.
+/// Builds a playable CHIP-8 homebrew ROM ("Space Interceptor DX").
 pub fn build_space_interceptor_rom() -> Vec<u8> {
     vec![
         0x60, 0x08, // V0 = 8 (X1)
         0x61, 0x0A, // V1 = 10 (Y1)
         0x62, 0x24, // V2 = 36 (X2)
-        0x63, 0x12, // V3 = 18 (Y2)
+        0x63, 0x0A, // V3 = 10 (Y2)
         // Loop at 0x208:
         0x00, 0xE0, // CLS
         0xA2, 0x20, // I = 0x220 (ship sprite)
@@ -364,8 +378,7 @@ pub fn build_space_interceptor_rom() -> Vec<u8> {
         0x70, 0x01, // V0 += 1
         0x72, 0xFF, // V2 -= 1
         0x12, 0x08, // JP 0x208
-        0x00, 0x00, // Padding to 0x220
-        0x00, 0x00, 0x00, 0x00, // 0x220: Ship sprite (5 bytes)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 0x220: Ship sprite (5 bytes)
         0x20, 0x70, 0xF8, 0x70, 0x20, // 0x225: Target crystal sprite (5 bytes)
         0x70, 0xD8, 0xF8, 0xD8, 0x70,
     ]

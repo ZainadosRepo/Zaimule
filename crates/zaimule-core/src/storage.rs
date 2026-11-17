@@ -1,21 +1,32 @@
-//! Atomic JSON settings and binary SRAM/SaveState persistence (`settings.rs` / `prefs.rs` heritage).
+//! Atomic JSON settings, library catalog, imported ROMs, and binary SRAM/SaveState persistence.
 //! Writes to `.tmp` then renames atomically, moves corrupted JSON files aside to `.json.bad`,
 //! and rotates `.srm.bak1`..`.srm.bak3` backups for cartridge SRAM saves.
 
-use serde::Serialize;
+use crate::rewind::SaveStateSlotInfo;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
-const MAX_JSON_BYTES: usize = 2 << 20; // 2 MiB
+const MAX_JSON_BYTES: usize = 4 << 20; // 4 MiB
 const MAX_SRAM_BYTES: usize = 16 << 20; // 16 MiB
+const MAX_STATE_BYTES: usize = 32 << 20; // 32 MiB
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadedJson {
     pub value: Value,
     pub warning: Option<String>,
+}
+
+/// On-disk envelope for a persisted Save State slot (`slot_N.zst.json`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedSaveState {
+    pub info: SaveStateSlotInfo,
+    pub uncompressed_len: usize,
+    pub compressed_bytes: Vec<u8>,
 }
 
 /// Loads a JSON configuration file atomically. Missing files return `Value::Null`.
@@ -104,6 +115,55 @@ pub fn save_sram_with_rotation(path: &Path, sram_bytes: &[u8]) -> Result<(), Str
     fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Loads binary SRAM bytes if present on disk, or returns `Ok(None)` if not found.
+pub fn load_sram_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Saves a compressed Save State slot atomically to disk (`slot_N.zst.tmp` -> `slot_N.zst`).
+pub fn save_state_slot_atomic(path: &Path, state: &PersistedSaveState) -> Result<(), String> {
+    let encoded = serde_json::to_vec(state).map_err(|e| e.to_string())?;
+    if encoded.len() > MAX_STATE_BYTES {
+        return Err(format!(
+            "Save State trop volumineux ({} octets)",
+            encoded.len()
+        ));
+    }
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let tmp = path.with_extension("zst.tmp");
+    fs::write(&tmp, encoded).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Loads a persisted Save State slot from disk if it exists.
+pub fn load_state_slot_atomic(path: &Path) -> Result<Option<PersistedSaveState>, String> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let parsed: PersistedSaveState = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("Save State illisible ({}) : {e}", path.display()))?;
+            Ok(Some(parsed))
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Saves an imported ROM binary atomically (`<crc32>.rom.tmp` -> `<crc32>.rom`).
+pub fn save_rom_binary_atomic(path: &Path, rom_bytes: &[u8]) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let tmp = path.with_extension("rom.tmp");
+    fs::write(&tmp, rom_bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,7 +211,7 @@ mod tests {
         save_sram_with_rotation(&path, b"SAVE_V2").unwrap();
         save_sram_with_rotation(&path, b"SAVE_V3").unwrap();
 
-        assert_eq!(fs::read(&path).unwrap(), b"SAVE_V3");
+        assert_eq!(load_sram_bytes(&path).unwrap().unwrap(), b"SAVE_V3");
         assert_eq!(
             fs::read(path.with_extension("srm.bak1")).unwrap(),
             b"SAVE_V2"
@@ -160,5 +220,27 @@ mod tests {
             fs::read(path.with_extension("srm.bak2")).unwrap(),
             b"SAVE_V1"
         );
+    }
+
+    #[test]
+    fn persists_and_restores_save_state_slot_on_disk() {
+        let path = temp_path("slot1", "zst");
+        let state = PersistedSaveState {
+            info: SaveStateSlotInfo {
+                slot: 1,
+                occupied: true,
+                frame: 420,
+                timestamp_ms: 1700000000,
+                crc32_hex: "CAFEBABE".into(),
+                compressed_bytes: 4,
+                label: "Boss Final".into(),
+            },
+            uncompressed_len: 16,
+            compressed_bytes: vec![1, 2, 3, 4],
+        };
+        save_state_slot_atomic(&path, &state).unwrap();
+        let loaded = load_state_slot_atomic(&path).unwrap().unwrap();
+        assert_eq!(loaded.info.label, "Boss Final");
+        assert_eq!(loaded.compressed_bytes, vec![1, 2, 3, 4]);
     }
 }

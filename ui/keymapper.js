@@ -1,6 +1,7 @@
 /**
  * Pure ES module for BlueStacks-style Visual Keymapper Overlay,
- * adjustable Turbo/Autofire duty-cycle, and keyboard-to-joypad bitmask mapping.
+ * adjustable Turbo/Autofire duty-cycle, keyboard-to-joypad bitmask mapping,
+ * and W3C Gamepad API standard controller polling.
  */
 
 export const BTN_UP = 1 << 0;
@@ -41,6 +42,31 @@ export function computeBitmaskFromPressedCodes(pressedSet, bindings = DEFAULT_KE
       mask |= bindings[code];
     }
   }
+  return mask;
+}
+
+export function computeBitmaskFromGamepad(gamepad, deadzone = 0.35) {
+  if (!gamepad || !gamepad.buttons) return 0;
+  let mask = 0;
+  const pressed = (idx) => Boolean(gamepad.buttons[idx]?.pressed);
+
+  if (pressed(0) || pressed(2)) mask |= BTN_A;
+  if (pressed(1) || pressed(3)) mask |= BTN_B;
+  if (pressed(4) || pressed(6)) mask |= BTN_L;
+  if (pressed(5) || pressed(7)) mask |= BTN_R;
+  if (pressed(8)) mask |= BTN_SELECT;
+  if (pressed(9)) mask |= BTN_START;
+  if (pressed(12)) mask |= BTN_UP;
+  if (pressed(13)) mask |= BTN_DOWN;
+  if (pressed(14)) mask |= BTN_LEFT;
+  if (pressed(15)) mask |= BTN_RIGHT;
+
+  const axes = gamepad.axes || [];
+  if (Number(axes[0]) < -deadzone) mask |= BTN_LEFT;
+  if (Number(axes[0]) > deadzone) mask |= BTN_RIGHT;
+  if (Number(axes[1]) < -deadzone) mask |= BTN_UP;
+  if (Number(axes[1]) > deadzone) mask |= BTN_DOWN;
+
   return mask;
 }
 

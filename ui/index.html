@@ -42,6 +42,20 @@
         </div>
       </header>
 
+      <!-- Hidden File Inputs for ROM & IPS Patch Import -->
+      <input
+        type="file"
+        id="rom-file-input"
+        accept=".gb,.gbc,.gba,.nes,.sfc,.smc,.nds,.ch8,.rom,.bin"
+        style="display: none;"
+      />
+      <input
+        type="file"
+        id="ips-file-input"
+        accept=".ips"
+        style="display: none;"
+      />
+
       <main class="workspace">
         <!-- ONGLET 1 : BIBLIOTHÈQUE -->
         <section id="view-library" class="view-pane active">
@@ -99,10 +113,12 @@
                   type="text"
                   id="search-input"
                   class="search-input"
-                  placeholder="Rechercher un titre, console, région ou CRC32..."
+                  placeholder="Rechercher un titre, console, région ou CRC32 (ou glissez une ROM ici)..."
                 />
               </div>
               <div class="toolbar-actions">
+                <button class="btn" id="btn-import-rom">📂 Importer ROM</button>
+                <button class="btn" id="btn-import-ips">🧩 Patcher .IPS</button>
                 <button class="btn btn-gold" id="btn-launch-selected">▶ Lancer l'Émulation</button>
               </div>
             </div>
@@ -145,6 +161,7 @@
             <div class="inspector-section">
               <div class="section-title">
                 <span>🧩 Mods &amp; Patchs IPS en RAM (Yuzu)</span>
+                <button class="btn mono" id="btn-insp-ips" style="padding:2px 6px; font-size:10px;">+ .IPS</button>
               </div>
               <div id="mods-list"></div>
             </div>
@@ -164,15 +181,17 @@
           <div class="emu-layout">
             <div class="emu-stage">
               <div class="emu-topbar">
-                <div style="display:flex; align-items:center; gap:10px;">
+                <div style="display:flex; align-items:center; gap:8px;">
                   <span class="pill-badge pill-gold mono" id="active-emu-game">GBC · Pocket Monster Link Arena</span>
                   <span class="pill-badge pill-green mono" id="link-status-pill">Mode 1P Solo</span>
+                  <span class="pill-badge pill-cobalt mono" id="emu-score-pill">🏆 Score : 0</span>
                 </div>
 
-                <div style="display:flex; align-items:center; gap:8px;">
+                <div style="display:flex; align-items:center; gap:6px;">
+                  <button class="btn" id="btn-audio-toggle">🔊 Audio APU : ON</button>
                   <button class="btn" id="btn-shader-cycle">📺 Shader : CRT Scanlines</button>
-                  <button class="btn" id="btn-toggle-keymapper">🎯 Keymapper BlueStacks : OFF</button>
-                  <button class="btn" id="btn-toggle-dual">🔗 Multi-Instance 2P Link : OFF</button>
+                  <button class="btn" id="btn-toggle-keymapper">🎯 Keymapper : OFF</button>
+                  <button class="btn" id="btn-toggle-dual">🔗 Multi-Instance 2P : OFF</button>
                   <button class="btn" id="btn-speed-cycle">⚡ Vitesse : 1.0x</button>
                 </div>
               </div>
@@ -180,8 +199,8 @@
               <div class="emu-screens-wrap" id="screens-wrap">
                 <div class="crt-bezel">
                   <div class="bezel-header">
-                    <span class="mono">INSTANCE #1 (JOUEUR 1 · ZQSD / FLÈCHES + J/K)</span>
-                    <span class="mono" style="color:var(--phosphor-green);" id="p1-reg-readout">PC:0x0100</span>
+                    <span class="mono">INSTANCE #1 (JOUEUR 1 · ZQSD / FLÈCHES + J/K / MANETTE USB)</span>
+                    <span class="mono" style="color:var(--phosphor-green);" id="p1-reg-readout">PC:0x0150</span>
                   </div>
                   <div class="screen-container mode-crt" id="screen-1">
                     <canvas id="canvas-p1" class="game-canvas" width="160" height="144"></canvas>
@@ -207,7 +226,7 @@
               <div class="rewind-bar">
                 <button class="btn" id="btn-rewind-step">⏪ Rembobiner (Backspace)</button>
                 <span class="mono" style="font-size:11px; color:var(--text-muted);" id="rewind-info">
-                  Tampon Rewind 60s Actif
+                  Tampon Rewind 60s Actif · Tir Plasma [J/Espace] · Dash [K/Shift]
                 </span>
                 <span class="mono" id="rewind-readout" style="margin-left:auto; color:var(--gold);">
                   Frame #0
@@ -219,13 +238,13 @@
               <div class="dock-card">
                 <div class="section-title">
                   <span>🎯 Visual Keymapper</span>
-                  <span class="mono">BlueStacks</span>
+                  <span class="mono">Glisser-Déposer</span>
                 </div>
                 <p style="font-size:11.5px; color:var(--text-muted); margin-bottom:10px;">
-                  Superposez les touches clavier/manette, zones tactiles NDS et boutons Turbo (20 Hz).
+                  Activez l'overlay puis glissez les badges sur l'écran pour repositionner vos touches et le Turbo 20 Hz.
                 </p>
                 <button class="btn" style="width:100%; justify-content:center;" id="btn-dock-keymapper">
-                  Afficher / Masquer Keymapper
+                  Afficher / Éditer Keymapper
                 </button>
               </div>
 
@@ -233,6 +252,11 @@
                 <div class="section-title">
                   <span>🤖 Macros TAS Déterministes</span>
                   <span class="mono" id="macro-status">PRÊT</span>
+                </div>
+                <div style="margin-bottom:8px;">
+                  <button class="btn" style="width:100%; justify-content:center;" id="btn-record-macro">
+                    ● Enregistrer Macro Live
+                  </button>
                 </div>
                 <div id="macros-list"></div>
               </div>
@@ -253,12 +277,12 @@
 
               <div class="dock-card">
                 <div class="section-title">
-                  <span>🔬 Registres CPU Temps Réel</span>
+                  <span>🔬 Registres CPU &amp; APU Temps Réel</span>
                 </div>
-                <div class="kv-row mono"><span class="kv-label">PC / SP</span><span id="dbg-pc-sp">0x0100 / 0xFFFE</span></div>
-                <div class="kv-row mono"><span class="kv-label">AF / BC</span><span id="dbg-af-bc">0x11 / 0x0013</span></div>
+                <div class="kv-row mono"><span class="kv-label">PC / SP</span><span id="dbg-pc-sp">0x0150 / 0xFFFE</span></div>
+                <div class="kv-row mono"><span class="kv-label">AF / BC</span><span id="dbg-af-bc">0x11B0 / 0x0013</span></div>
                 <div class="kv-row mono"><span class="kv-label">DE / HL</span><span id="dbg-de-hl">0x00D8 / 0x014D</span></div>
-                <div class="kv-row mono"><span class="kv-label">SIO SB/SC</span><span id="dbg-sio">0x00 / 0x81</span></div>
+                <div class="kv-row mono"><span class="kv-label">SIO / APU</span><span id="dbg-sio">0x00 / 0 Hz</span></div>
               </div>
             </aside>
           </div>
@@ -293,6 +317,10 @@
         </div>
 
         <div class="telemetry-group">
+          <div class="telemetry-item">
+            <span>MANETTE :</span>
+            <span class="telemetry-val" id="tel-pad">Clavier + Gamepad Prêt</span>
+          </div>
           <div class="telemetry-item">
             <span>LINK BUS :</span>
             <span class="telemetry-val" id="tel-link">Solo (0 pkt)</span>
