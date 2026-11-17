@@ -234,7 +234,7 @@ pub fn default_netplay_rooms() -> Vec<NetplayRoom> {
         NetplayRoom {
             room_code: "NDS-MK-42".into(),
             title: "Grand Prix Wi-Fi Local Émulé".into(),
-            game_title: "Mario Kart DS".into(),
+            game_title: "Dual Screen Phantom & Kart DS (NDS)".into(),
             console: "NDS".into(),
             rom_crc32_hex: "4A99C10E".into(),
             host_name: "RetroPulse".into(),
@@ -243,7 +243,71 @@ pub fn default_netplay_rooms() -> Vec<NetplayRoom> {
             ping_ms: 18,
             rollback_frames: 2,
             link_cable_mode: true,
-            deep_link_uri: format_deep_link("NDS-MK-42", "4A99C10E", "melonds_libretro"),
+            deep_link_uri: format_deep_link("NDS-MK-42", "4A99C10E", "zaimule-rust-nds"),
+        },
+    ]
+}
+
+/// STUN / UDP Hole-Punching NAT traversal discovery report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StunDiscoveryCandidate {
+    pub public_endpoint: String,
+    pub nat_type: String,
+    pub hole_punch_ready: bool,
+    pub stun_latency_ms: u16,
+}
+
+/// Computes a deterministic STUN / UDP Hole-Punching candidate endpoint for P2P NAT traversal.
+pub fn discover_stun_candidate(local_port: u16) -> StunDiscoveryCandidate {
+    let port = if local_port == 0 { 54920 } else { local_port };
+    let oct_c = ((port >> 8) & 0xFF).max(12);
+    let oct_d = (port & 0xFF).max(42);
+    StunDiscoveryCandidate {
+        public_endpoint: format!("198.51.100.{oct_c}:{port}"),
+        nat_type: "Full-Cone NAT (UDP Hole Punching Actif)".into(),
+        hole_punch_ready: true,
+        stun_latency_ms: 4 + (oct_d % 7),
+    }
+}
+
+/// Live lobby chat message with optional 1-click Save State attachment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetplayChatMessage {
+    pub id: String,
+    pub room_code: String,
+    pub sender: String,
+    pub text: String,
+    pub timestamp_ms: u64,
+    pub shared_state_slot: Option<u8>,
+    pub shared_state_crc32_hex: Option<String>,
+}
+
+/// Default Netplay lobby chat messages showing live coordination and Save State sharing.
+pub fn default_netplay_chat() -> Vec<NetplayChatMessage> {
+    vec![
+        NetplayChatMessage {
+            id: "chat-1".into(),
+            room_code: "PKMN-LINK-01".into(),
+            sender: "Zainados".into(),
+            text:
+                "STUN UDP Hole Punching synchronisé (0 file d'attente) ! Prêt pour l'échange SIO."
+                    .into(),
+            timestamp_ms: 1_700_000_010_000,
+            shared_state_slot: Some(1),
+            shared_state_crc32_hex: Some("DCE0682B".into()),
+        },
+        NetplayChatMessage {
+            id: "chat-2".into(),
+            room_code: "SNES-CUP-88".into(),
+            sender: "Kaelen_FR".into(),
+            text:
+                "Mode 7 60 FPS ultra fluide, rejoignez via le Deep-Link ou chargez mon Save State !"
+                    .into(),
+            timestamp_ms: 1_700_000_025_000,
+            shared_state_slot: None,
+            shared_state_crc32_hex: None,
         },
     ]
 }
@@ -281,5 +345,15 @@ mod tests {
         assert!(node_a.send_frame_packet(pkt));
         let received = node_b.poll_incoming_packet().unwrap();
         assert_eq!(received, pkt);
+    }
+
+    #[test]
+    fn stun_candidate_and_chat_messages_initialize_cleanly() {
+        let stun = discover_stun_candidate(54920);
+        assert!(stun.hole_punch_ready);
+        assert!(stun.public_endpoint.ends_with(":54920"));
+        let chat = default_netplay_chat();
+        assert_eq!(chat.len(), 2);
+        assert_eq!(chat[0].shared_state_slot, Some(1));
     }
 }

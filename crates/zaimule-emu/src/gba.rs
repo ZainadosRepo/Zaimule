@@ -599,6 +599,12 @@ impl EmulatorBackend for GbaCore {
     fn read_vram_slice(&self) -> &[u8] {
         &self.vram
     }
+
+    fn write_vram_byte(&mut self, offset: usize, val: u8) {
+        if offset < self.vram.len() {
+            self.vram[offset] = val;
+        }
+    }
 }
 
 /// Builds a valid 32 KiB Game Boy Advance ROM image with ARM7TDMI entry branch (`0xEA00002E`),

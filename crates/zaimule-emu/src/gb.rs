@@ -1210,6 +1210,12 @@ impl EmulatorBackend for GameBoyCore {
     fn read_vram_slice(&self) -> &[u8] {
         &self.vram
     }
+
+    fn write_vram_byte(&mut self, offset: usize, val: u8) {
+        if offset < self.vram.len() {
+            self.vram[offset] = val;
+        }
+    }
 }
 
 /// Builds a valid 32 KiB Game Boy Color homebrew ROM image with Nintendo header magic,

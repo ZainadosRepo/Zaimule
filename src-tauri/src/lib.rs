@@ -473,6 +473,49 @@ fn import_portable_pack_archive(
 }
 
 #[tauri::command]
+fn set_nds_stylus(
+    state: tauri::State<AppState>,
+    x: u8,
+    y: u8,
+    pressed: bool,
+) -> Result<(), String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    session.set_nds_stylus(x, y, pressed);
+    Ok(())
+}
+
+#[tauri::command]
+fn paint_vram_atlas_pixel(
+    state: tauri::State<AppState>,
+    atlas_x: u16,
+    atlas_y: u16,
+    color_idx: u8,
+) -> Result<DebuggerPayload, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    Ok(session.paint_vram_atlas_pixel(atlas_x, atlas_y, color_idx))
+}
+
+#[tauri::command]
+fn post_netplay_chat_message(
+    state: tauri::State<AppState>,
+    sender: String,
+    text: String,
+    share_slot: Option<u8>,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    session.post_netplay_chat_message(sender, text, share_slot, now_unix_ms())
+}
+
+#[tauri::command]
 fn load_settings(app: AppHandle) -> Result<LoadedJson, String> {
     load_json_atomic(&settings_path(&app)?)
 }
@@ -527,6 +570,9 @@ pub fn run() {
             export_ips_diff,
             export_portable_pack_archive,
             import_portable_pack_archive,
+            set_nds_stylus,
+            paint_vram_atlas_pixel,
+            post_netplay_chat_message,
             add_cheat_code,
             toggle_cheat_code,
             scan_ram_byte,

@@ -17,7 +17,7 @@ import {
   triggerGamepadRumble,
   computeBigPictureNavAction
 } from "./keymapper.js";
-import { ApuAudioEngine } from "./audio.js";
+import { ApuAudioEngine, synthesizeMultiChannelSamples } from "./audio.js";
 import { ViewportRecorder } from "./recorder.js";
 
 const tauriInvoke = window.__TAURI__?.core?.invoke;
@@ -92,16 +92,16 @@ const FALLBACK_CATALOG = [
   },
   {
     id: "nds-dual-phantom",
-    title: "Dual Screen Phantom Detective",
+    title: "Dual Screen Phantom Detective (NDS)",
     console: "NDS",
-    engineKind: "libretroAbi",
-    coreId: "melonds_libretro",
-    region: "EUR · Multi-5",
+    engineKind: "nativeRust",
+    coreId: "zaimule-rust-nds",
+    region: "EUR · FR (ARM9+ARM7 + Stylet Inclus)",
     crc32Hex: "55E081C2",
-    sizeBytes: 67108864,
-    sramSummary: "512 Ko EEPROM + Stylet Tactile",
+    sizeBytes: 32768,
+    sramSummary: "512 Ko EEPROM + Stylet Tactile Dual-Screen",
     playtimeSeconds: 19200,
-    favorite: false,
+    favorite: true,
     linkCableReady: true,
     coverAccent: "#0c4a6e",
     coverSymbol: "🔍"
@@ -243,10 +243,29 @@ let state = {
       rollbackFrames: 1,
       playersCurrent: 1,
       playersMax: 2,
-      deepLinkUri: "zaimule://room/SNES-CUP-88?crc=A2D9107B&core=snes9x_libretro"
+      deepLinkUri: "zaimule://room/SNES-CUP-88?crc=A2D9107B&core=zaimule-rust-snes"
     }
   ],
   udpLocalPort: 54920,
+  stunCandidate: {
+    publicEndpoint: "198.51.100.42:54920",
+    natType: "Full-Cone UDP (Hole-Punch Ready)",
+    relayFallback: "wss://relay.zaimule.net/zml2"
+  },
+  netplayChat: [
+    {
+      id: "chat-welcome-1",
+      sender: "Zainados",
+      text: "Salon P2P ouvert ! STUN Hole-Punch actif (0 file d'attente).",
+      saveStateCrcHex: null
+    },
+    {
+      id: "chat-state-share",
+      sender: "Kaelen_FR",
+      text: "Cliché d'arène partagé (Boss Final prêt)",
+      saveStateCrcHex: "DCE0682B"
+    }
+  ],
   libretroCores: [
     {
       coreId: "mgba_libretro",
@@ -311,6 +330,8 @@ let state = {
   stepOnceRequested: false,
   bigPictureMode: false,
   prevNavMask: 0,
+  vramPaintColorIdx: 3,
+  stylusPressed: false,
   speedMult: 1,
   activeMacroId: null,
   recordingMacro: false,
@@ -809,6 +830,38 @@ function renderNetplayAndCores() {
   if (portBadge) {
     portBadge.textContent = `UDP ZML2 : 127.0.0.1:${state.udpLocalPort || 54920}`;
   }
+  const stunBadge = document.getElementById("stun-endpoint-badge");
+  if (stunBadge && state.stunCandidate) {
+    stunBadge.textContent = `STUN Hole-Punch : ${state.stunCandidate.publicEndpoint} (${state.stunCandidate.natType})`;
+  }
+
+  const chatList = document.getElementById("netplay-chat-list");
+  if (chatList) {
+    chatList.innerHTML = "";
+    for (const msg of state.netplayChat || []) {
+      const sharedCrc = msg.sharedStateCrc32Hex || msg.saveStateCrcHex;
+      const sharedSlot = msg.sharedStateSlot || 1;
+      const row = document.createElement("div");
+      row.className = "mono";
+      row.style.cssText =
+        "display:flex; align-items:center; justify-content:space-between; font-size:11px; padding:3px 0; border-bottom:1px dashed rgba(255,255,255,0.05);";
+      row.innerHTML = `
+        <span><strong style="color:var(--gold)">[${msg.sender}]</strong> ${msg.text}</span>
+        ${
+          sharedCrc
+            ? `<button class="btn mono" style="padding:1px 6px; font-size:10px; border-color:var(--phosphor-green); color:var(--phosphor-green);">📥 Charger State #${sharedSlot} (${sharedCrc})</button>`
+            : ""
+        }
+      `;
+      if (sharedCrc) {
+        row.querySelector("button")?.addEventListener("click", async () => {
+          await invokeBackend("restore_save_state", { slot: sharedSlot });
+          switchTab("view-emulator");
+        });
+      }
+      chatList.appendChild(row);
+    }
+  }
 
   const netGrid = document.getElementById("netplay-grid");
   if (netGrid) {
@@ -915,6 +968,8 @@ function applyBootstrap(boot) {
   state.macros = boot.macros || state.macros;
   state.netplayRooms = boot.netplayRooms || state.netplayRooms;
   state.udpLocalPort = boot.udpLocalPort || state.udpLocalPort;
+  state.stunCandidate = boot.stunCandidate || state.stunCandidate;
+  state.netplayChat = boot.netplayChat || state.netplayChat;
   state.libretroCores = boot.libretroCores || state.libretroCores;
   state.biosEntries = boot.biosEntries || state.biosEntries;
   state.linkTelemetry = boot.linkTelemetry || { enabled: false, packetsTransferred: 0 };
@@ -951,6 +1006,34 @@ function paintRgbaFrame(canvasId, frame) {
     const imgData = new ImageData(clamped, frame.width, frame.height);
     ctx.putImageData(imgData, 0, 0);
   }
+}
+
+function renderAudioOscilloscope(freqHz, frameNumber) {
+  const osc = document.getElementById("audio-oscilloscope-canvas");
+  if (!osc) return;
+  const ctx = osc.getContext("2d");
+  const w = osc.width;
+  const h = osc.height;
+  ctx.fillStyle = "#070a0f";
+  ctx.fillRect(0, 0, w, h);
+
+  ctx.strokeStyle = "rgba(56, 189, 248, 0.18)";
+  ctx.beginPath();
+  ctx.moveTo(0, h / 2);
+  ctx.lineTo(w, h / 2);
+  ctx.stroke();
+
+  const samples = synthesizeMultiChannelSamples(freqHz || 220, frameNumber, 48);
+  ctx.strokeStyle = freqHz > 0 ? "#4ade80" : "#f0b429";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let i = 0; i < samples.length; i++) {
+    const x = (i / Math.max(1, samples.length - 1)) * w;
+    const y = h / 2 - samples[i] * (h * 0.42);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
 }
 
 async function handleImportedFile(file) {
@@ -1025,10 +1108,6 @@ function renderDebuggerPayload(dbg) {
       height: dbg.vram.atlasHeight || 64,
       rgba: dbg.vram.tileAtlasRgba
     });
-    const badge = document.getElementById("vram-tiles-badge");
-    if (badge) {
-      badge.textContent = `${dbg.vram.activeTilesCount || 6} tiles`;
-    }
   }
   const listEl = document.getElementById("disasm-list");
   if (listEl && Array.isArray(dbg.disassembly)) {
@@ -1106,6 +1185,8 @@ async function tickEmulationLoop() {
       paintRgbaFrame("canvas-p4", resp.primary);
     }
 
+    renderAudioOscilloscope(resp.primary.audioFreqHz || 0, resp.primary.frameNumber);
+
     if (resp.primary.audioFreqHz) {
       apuAudio.triggerFrameTone(resp.primary.audioFreqHz);
       if (resp.primary.audioFreqHz >= 1200) {
@@ -1155,6 +1236,107 @@ function bindEvents() {
     triggerGamepadRumble(getConnectedGamepad(), 70, 0.4, 0.7);
   });
 
+  const colorLabels = ["🎨 #0 Noir", "🎨 #1 Sombre", "🎨 #2 Clair", "🎨 #3 Or"];
+  document.getElementById("btn-vram-color")?.addEventListener("click", (e) => {
+    state.vramPaintColorIdx = (state.vramPaintColorIdx + 3) % 4;
+    e.currentTarget.textContent = colorLabels[state.vramPaintColorIdx];
+  });
+
+  document.getElementById("vram-atlas-canvas")?.addEventListener("click", async (e) => {
+    const canvas = e.currentTarget;
+    const rect = canvas.getBoundingClientRect();
+    const atlasX = Math.max(
+      0,
+      Math.min(127, Math.floor(((e.clientX - rect.left) / Math.max(1, rect.width)) * 128))
+    );
+    const atlasY = Math.max(
+      0,
+      Math.min(63, Math.floor(((e.clientY - rect.top) / Math.max(1, rect.height)) * 64))
+    );
+    const updated = await invokeBackend("paint_vram_atlas_pixel", {
+      atlasX,
+      atlasY,
+      colorIdx: state.vramPaintColorIdx
+    });
+    if (updated) {
+      renderDebuggerPayload(updated);
+    }
+    const toast = document.getElementById("save-toast");
+    if (toast) {
+      toast.textContent = `🎨 Pixel VRAM (${atlasX}, ${atlasY}) peint en couleur #${state.vramPaintColorIdx}`;
+    }
+  });
+
+  const canvasP1 = document.getElementById("canvas-p1");
+  const handleStylusEvent = async (ev, pressed) => {
+    if (!canvasP1) return;
+    const rect = canvasP1.getBoundingClientRect();
+    const normX = Math.max(0, Math.min(1, (ev.clientX - rect.left) / Math.max(1, rect.width)));
+    const normY = Math.max(0, Math.min(1, (ev.clientY - rect.top) / Math.max(1, rect.height)));
+    const x = Math.floor(normX * 255);
+    const fullY = Math.floor(normY * (canvasP1.height || 384));
+    const touchY = canvasP1.height >= 300 ? Math.max(0, fullY - 192) : Math.floor(normY * 191);
+    await invokeBackend("set_nds_stylus", { x, y: Math.min(191, touchY), pressed });
+  };
+
+  canvasP1?.addEventListener("mousedown", async (e) => {
+    state.stylusPressed = true;
+    await handleStylusEvent(e, true);
+  });
+  canvasP1?.addEventListener("mousemove", async (e) => {
+    if (!state.stylusPressed) return;
+    await handleStylusEvent(e, true);
+  });
+  window.addEventListener("mouseup", async (e) => {
+    if (!state.stylusPressed) return;
+    state.stylusPressed = false;
+    await handleStylusEvent(e, false);
+  });
+
+  document.getElementById("btn-send-chat")?.addEventListener("click", async () => {
+    const inp = document.getElementById("netplay-chat-input");
+    const text = inp?.value?.trim();
+    if (!text) return;
+    const boot = await invokeBackend("post_netplay_chat_message", {
+      sender: "Zainados",
+      text,
+      shareSlot1State: false
+    });
+    if (boot) {
+      applyBootstrap(boot);
+    } else {
+      state.netplayChat.unshift({
+        id: `chat-${Date.now()}`,
+        sender: "Zainados",
+        text,
+        saveStateCrcHex: null
+      });
+      renderNetplayAndCores();
+    }
+    inp.value = "";
+  });
+
+  document.getElementById("btn-share-state-chat")?.addEventListener("click", async () => {
+    const g = getSelectedGame();
+    const text = `Cliché Save State Slot #1 (${g.title}) prêt pour synchronisation P2P !`;
+    const boot = await invokeBackend("post_netplay_chat_message", {
+      sender: "Zainados",
+      text,
+      shareSlot1State: true
+    });
+    if (boot) {
+      applyBootstrap(boot);
+    } else {
+      state.netplayChat.unshift({
+        id: `chat-state-${Date.now()}`,
+        sender: "Zainados",
+        text,
+        saveStateCrcHex: g.crc32Hex
+      });
+      renderNetplayAndCores();
+    }
+  });
+
   document.querySelectorAll(".console-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       document.querySelectorAll(".console-btn").forEach((b) => b.classList.remove("active"));
@@ -1185,7 +1367,7 @@ function bindEvents() {
         new TextEncoder().encode(
           JSON.stringify({
             magic: "ZAIMULE_PACK_V1",
-            version: "0.4.0",
+            version: "0.5.0",
             activeGameId: state.activeGameId,
             cheatCodes: state.cheatCodes,
             macros: state.macros

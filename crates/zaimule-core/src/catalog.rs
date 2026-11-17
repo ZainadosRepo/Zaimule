@@ -44,7 +44,7 @@ impl ConsoleKind {
             Self::Gba => "zaimule-rust-gba",
             Self::Nes => "zaimule-rust-nes",
             Self::Snes => "zaimule-rust-snes",
-            Self::Nds => "melonds_libretro",
+            Self::Nds => "zaimule-rust-nds",
             Self::Ps1 => "swanstation_libretro",
             Self::N64 => "mupen64plus_next_libretro",
             Self::Psp => "ppsspp_libretro",
@@ -55,7 +55,7 @@ impl ConsoleKind {
     pub fn is_native_rust(self) -> bool {
         matches!(
             self,
-            Self::Chip8 | Self::Gb | Self::Gbc | Self::Gba | Self::Nes | Self::Snes
+            Self::Chip8 | Self::Gb | Self::Gbc | Self::Gba | Self::Nes | Self::Snes | Self::Nds
         )
     }
 
@@ -336,20 +336,20 @@ pub fn default_catalog() -> Vec<GameEntry> {
         },
         GameEntry {
             id: "nds-mariokart".into(),
-            title: "Mario Kart DS".into(),
+            title: "Dual Screen Phantom & Kart DS (NDS)".into(),
             console: ConsoleKind::Nds,
-            engine_kind: CoreEngineKind::LibretroAbi,
-            core_id: "melonds_libretro".into(),
-            region: "EUR · Multi5".into(),
+            engine_kind: CoreEngineKind::NativeRust,
+            core_id: "zaimule-rust-nds".into(),
+            region: "EUR · Multi5 (ARM9+ARM7 + Stylet Tactile)".into(),
             crc32_hex: "4A99C10E".into(),
             size_bytes: 33_554_432,
-            sram_summary: "256 Ko EEPROM + Écran Tactile".into(),
+            sram_summary: "256 Ko EEPROM + Écran Tactile 256x384".into(),
             playtime_seconds: 57_000,
-            favorite: false,
+            favorite: true,
             link_cable_ready: true,
-            embedded_rom_key: Some("gb_pocket_arena".into()),
-            cover_accent: "#7f1d1d".into(),
-            cover_symbol: "🏎️".into(),
+            embedded_rom_key: Some("nds_dual_phantom".into()),
+            cover_accent: "#0c4a6e".into(),
+            cover_symbol: "🖊️".into(),
         },
         GameEntry {
             id: "ps1-ff7-fr".into(),

@@ -59,4 +59,6 @@ pub trait EmulatorBackend: Send {
     fn read_vram_slice(&self) -> &[u8] {
         &[]
     }
+    fn write_vram_byte(&mut self, _offset: usize, _val: u8) {}
+    fn set_touch_stylus(&mut self, _x: u8, _y: u8, _pressed: bool) {}
 }

@@ -4,7 +4,9 @@
 //! and Dual-Instance + UDP Rollback Link Cable synchronization.
 
 use crate::chip8::{build_space_interceptor_rom, Chip8Core};
-use crate::debugger::{build_vram_inspector_snapshot, disassemble_window, DebuggerPayload};
+use crate::debugger::{
+    build_vram_inspector_snapshot, compute_2bpp_pixel_mutation, disassemble_window, DebuggerPayload,
+};
 use crate::gb::{build_gb_pocket_arena_rom, GameBoyCore};
 use crate::gba::{build_gba_golden_horizon_rom, GbaCore};
 use crate::libretro::{
@@ -12,6 +14,7 @@ use crate::libretro::{
     LibretroCoreDescriptor,
 };
 use crate::link::{step_quad_link_frame, LinkCableTelemetry};
+use crate::nds::{build_nds_dual_phantom_rom, NdsCore};
 use crate::nes::{build_nes_chrono_knight_rom, NesCore};
 use crate::snes::{build_snes_valkyrie_mode7_rom, SnesCore};
 use crate::traits::{EmulatorBackend, FrameStepResult};
@@ -29,7 +32,8 @@ use zaimule_core::cheats::{
 use zaimule_core::keymap::{apply_turbo_mask, default_keymapper_widgets, KeymapWidget};
 use zaimule_core::macros::{default_macros, MacroSequence};
 use zaimule_core::netplay::{
-    default_netplay_rooms, format_deep_link, parse_deep_link, NetplayRoom, NetplayWirePacket,
+    default_netplay_chat, default_netplay_rooms, discover_stun_candidate, format_deep_link,
+    parse_deep_link, NetplayChatMessage, NetplayRoom, NetplayWirePacket, StunDiscoveryCandidate,
     UdpNetplayNode,
 };
 use zaimule_core::overrides::{resolve_effective_config, EffectiveGameConfig, GlobalSettings};
@@ -54,6 +58,8 @@ pub struct StationBootstrap {
     pub keymapper_widgets: Vec<KeymapWidget>,
     pub macros: Vec<MacroSequence>,
     pub netplay_rooms: Vec<NetplayRoom>,
+    pub netplay_chat: Vec<NetplayChatMessage>,
+    pub stun_candidate: StunDiscoveryCandidate,
     pub udp_local_port: u16,
     pub udp_peer_addr: Option<String>,
     pub libretro_cores: Vec<LibretroCoreDescriptor>,
@@ -91,6 +97,7 @@ pub struct EmulatorSession {
     pub active_macro_id: Option<String>,
     pub macro_start_frame: u64,
     pub netplay_rooms: Vec<NetplayRoom>,
+    pub netplay_chat: Vec<NetplayChatMessage>,
     pub udp_node: UdpNetplayNode,
     pub libretro_cores: Vec<LibretroCoreDescriptor>,
     pub link_telemetry: LinkCableTelemetry,
@@ -119,8 +126,13 @@ fn build_core_for(console: ConsoleKind, rom: &[u8]) -> Result<Box<dyn EmulatorBa
             c.load_rom(rom)?;
             Ok(Box::new(c))
         }
-        ConsoleKind::Gba | ConsoleKind::Nds => {
+        ConsoleKind::Gba => {
             let mut c = GbaCore::new();
+            c.load_rom(rom)?;
+            Ok(Box::new(c))
+        }
+        ConsoleKind::Nds => {
+            let mut c = NdsCore::new();
             c.load_rom(rom)?;
             Ok(Box::new(c))
         }
@@ -159,6 +171,7 @@ impl EmulatorSession {
             active_macro_id: None,
             macro_start_frame: 0,
             netplay_rooms: default_netplay_rooms(),
+            netplay_chat: default_netplay_chat(),
             udp_node: UdpNetplayNode::bind_ephemeral(),
             libretro_cores: default_libretro_cores(),
             link_telemetry: LinkCableTelemetry::default(),
@@ -198,6 +211,8 @@ impl EmulatorSession {
             keymapper_widgets: self.keymapper_widgets.clone(),
             macros: self.macros.clone(),
             netplay_rooms: self.netplay_rooms.clone(),
+            netplay_chat: self.netplay_chat.clone(),
+            stun_candidate: discover_stun_candidate(self.udp_node.local_port),
             udp_local_port: self.udp_node.local_port,
             udp_peer_addr: self.udp_node.peer_addr.clone(),
             libretro_cores: self.libretro_cores.clone(),
@@ -232,7 +247,8 @@ impl EmulatorSession {
     pub fn unpatched_rom_for_console(console: ConsoleKind) -> Vec<u8> {
         match console {
             ConsoleKind::Chip8 => build_space_interceptor_rom(),
-            ConsoleKind::Gba | ConsoleKind::Nds => build_gba_golden_horizon_rom(),
+            ConsoleKind::Gba => build_gba_golden_horizon_rom(),
+            ConsoleKind::Nds => build_nds_dual_phantom_rom(),
             ConsoleKind::Snes => build_snes_valkyrie_mode7_rom(),
             ConsoleKind::Nes | ConsoleKind::Ps1 | ConsoleKind::N64 => build_nes_chrono_knight_rom(),
             _ => build_gb_pocket_arena_rom(),
@@ -816,6 +832,80 @@ impl EmulatorSession {
         }
         Ok(self.bootstrap_snapshot())
     }
+
+    /// Updates the Nintendo DS interactive Stylus touchscreen coordinates (`x`, `y` in `0..256`, `0..192`).
+    pub fn set_nds_stylus(&mut self, x: u8, y: u8, pressed: bool) {
+        self.core_p1.set_touch_stylus(x, y, pressed);
+    }
+
+    /// Paints a pixel in the live 2bpp VRAM Tile Atlas (`0..128`, `0..64`) for the ROM Hacking Studio,
+    /// mirrors the edit into the active custom ROM buffer for `.IPS` export, and returns the updated `DebuggerPayload`.
+    pub fn paint_vram_atlas_pixel(
+        &mut self,
+        atlas_x: u16,
+        atlas_y: u16,
+        color_idx: u8,
+    ) -> DebuggerPayload {
+        if let Some(edits) =
+            compute_2bpp_pixel_mutation(self.core_p1.read_vram_slice(), atlas_x, atlas_y, color_idx)
+        {
+            for (addr, val) in edits {
+                self.core_p1.write_vram_byte(addr, val);
+            }
+            let game = self.active_game().clone();
+            let mut rom = self.base_rom_for_game(&game.id, game.console);
+            for (addr, val) in edits {
+                let rom_off = (0x0200 + addr) % rom.len().max(1);
+                if rom_off < rom.len() {
+                    rom[rom_off] = val;
+                }
+            }
+            self.custom_roms.insert(game.id, rom);
+        }
+        self.inspect_vram_and_disassembly()
+    }
+
+    /// Posts a live Netplay lobby chat message with an optional 1-click Save State attachment.
+    pub fn post_netplay_chat_message(
+        &mut self,
+        sender: String,
+        text: String,
+        share_slot: Option<u8>,
+        now_ms: u64,
+    ) -> Result<StationBootstrap, String> {
+        let clean_text = text.trim();
+        if clean_text.is_empty() {
+            return Err("le message du salon ne peut pas être vide".into());
+        }
+        let room_code = self
+            .netplay_rooms
+            .first()
+            .map(|r| r.room_code.clone())
+            .unwrap_or_else(|| "PKMN-LINK-01".into());
+        let shared_state_crc32_hex = share_slot.and_then(|slot| {
+            self.save_states_ram
+                .get(&(self.active_game_id.clone(), slot))
+                .map(|(info, _)| info.crc32_hex.clone())
+                .or_else(|| Some(self.active_game().crc32_hex.clone()))
+        });
+        self.netplay_chat.insert(
+            0,
+            NetplayChatMessage {
+                id: format!("chat-{}", self.netplay_chat.len() + 1),
+                room_code,
+                sender: if sender.trim().is_empty() {
+                    "Zainados".into()
+                } else {
+                    sender.trim().to_string()
+                },
+                text: clean_text.to_string(),
+                timestamp_ms: now_ms,
+                shared_state_slot: share_slot,
+                shared_state_crc32_hex,
+            },
+        );
+        Ok(self.bootstrap_snapshot())
+    }
 }
 
 #[cfg(test)]
@@ -896,5 +986,33 @@ mod tests {
         let pack_bytes = session.export_portable_pack().unwrap();
         let snap = session.import_portable_pack(&pack_bytes).unwrap();
         assert_eq!(snap.active_game_id, "snes-alttp-fr");
+    }
+
+    #[test]
+    fn session_runs_nds_stylus_paints_vram_and_posts_netplay_chat() {
+        let mut session = EmulatorSession::new();
+        session.select_game("nds-mariokart").unwrap();
+        session.set_nds_stylus(164, 78, true);
+        let step = session.step_viewport(BTN_RIGHT, 0, false);
+        assert_eq!(step.primary.width, 256);
+        assert_eq!(step.primary.height, 384);
+        assert!(step.primary.cpu.score >= 35);
+
+        let dbg = session.paint_vram_atlas_pixel(2, 2, 3);
+        assert_eq!(dbg.vram.atlas_width, 128);
+
+        let ips = session.export_active_ips_patch().unwrap();
+        assert!(ips.starts_with(b"PATCH"));
+
+        let boot = session
+            .post_netplay_chat_message(
+                "Zainados".into(),
+                "Save State Boss prêt !".into(),
+                Some(1),
+                999,
+            )
+            .unwrap();
+        assert_eq!(boot.netplay_chat[0].text, "Save State Boss prêt !");
+        assert!(boot.stun_candidate.hole_punch_ready);
     }
 }

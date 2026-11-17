@@ -17,7 +17,7 @@ import {
   triggerGamepadRumble,
   computeBigPictureNavAction
 } from "../../ui/keymapper.js";
-import { sanitizeApuFrequency } from "../../ui/audio.js";
+import { sanitizeApuFrequency, synthesizeMultiChannelSamples } from "../../ui/audio.js";
 
 test("computeBitmaskFromPressedCodes maps keyboard codes to joypad bitmask", () => {
   const pressed = new Set(["ArrowRight", "KeyJ", "KeyK"]);
@@ -89,4 +89,11 @@ test("computeBigPictureNavAction detects rising edges on D-Pad, shoulders, and A
   assert.equal(computeBigPictureNavAction(0, BTN_L), "PREV_TAB");
   assert.equal(computeBigPictureNavAction(0, BTN_R), "NEXT_TAB");
   assert.equal(computeBigPictureNavAction(0, BTN_A), "LAUNCH_GAME");
+});
+
+test("synthesizeMultiChannelSamples produces normalized 4-channel APU + SPC700 waveform", () => {
+  const samples = synthesizeMultiChannelSamples(880, 12, 64);
+  assert.equal(samples.length, 64);
+  assert.ok(samples.every((s) => s >= -1.0 && s <= 1.0));
+  assert.ok(samples.some((s) => Math.abs(s) > 0.2));
 });

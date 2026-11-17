@@ -328,6 +328,41 @@ pub fn build_vram_inspector_snapshot(vram: &[u8]) -> VramInspectorSnapshot {
     }
 }
 
+/// Computes the two `2bpp` planar bitplane byte mutations `[(lo_addr, lo_byte), (hi_addr, hi_byte)]`
+/// required to paint pixel `(atlas_x, atlas_y)` (`0..128`, `0..64`) with `color_idx` (`0..=3`).
+pub fn compute_2bpp_pixel_mutation(
+    vram: &[u8],
+    atlas_x: u16,
+    atlas_y: u16,
+    color_idx: u8,
+) -> Option<[(usize, u8); 2]> {
+    if atlas_x >= 128 || atlas_y >= 64 {
+        return None;
+    }
+    let tile_col = (atlas_x / 8) as usize;
+    let tile_row = (atlas_y / 8) as usize;
+    let fine_x = (atlas_x % 8) as usize;
+    let fine_y = (atlas_y % 8) as usize;
+
+    let tile_idx = tile_row * 16 + tile_col;
+    let lo_addr = tile_idx * 16 + fine_y * 2;
+    let hi_addr = lo_addr + 1;
+    if hi_addr >= vram.len() {
+        return None;
+    }
+
+    let bit_mask = 1u8 << (7 - fine_x);
+    let mut lo = vram[lo_addr] & !bit_mask;
+    let mut hi = vram[hi_addr] & !bit_mask;
+    if (color_idx & 1) != 0 {
+        lo |= bit_mask;
+    }
+    if (color_idx & 2) != 0 {
+        hi |= bit_mask;
+    }
+    Some([(lo_addr, lo), (hi_addr, hi)])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +394,16 @@ mod tests {
         assert_eq!(snap.atlas_height, 64);
         assert_eq!(snap.tile_atlas_rgba.len(), 128 * 64 * 4);
         assert_eq!(snap.active_tiles_count, 1);
+    }
+
+    #[test]
+    fn vram_pixel_mutation_updates_2bpp_bitplanes_accurately() {
+        let mut vram = vec![0u8; 2048];
+        let edits = compute_2bpp_pixel_mutation(&vram, 0, 0, 3).unwrap();
+        for (addr, val) in edits {
+            vram[addr] = val;
+        }
+        assert_eq!(vram[0], 0x80);
+        assert_eq!(vram[1], 0x80);
     }
 }
