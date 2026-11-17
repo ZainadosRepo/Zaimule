@@ -12,7 +12,6 @@ use zaimule_core::rewind::SaveStateSlotInfo;
 use zaimule_core::storage::{
     load_json_atomic, load_sram_bytes, load_state_slot_atomic, save_json_atomic,
     save_rom_binary_atomic, save_sram_with_rotation, save_state_slot_atomic, LoadedJson,
-    PersistedSaveState,
 };
 use zaimule_emu::session::{EmulatorSession, StationBootstrap, ViewportStepResponse};
 
@@ -65,18 +64,14 @@ fn flush_sram_best_effort(app: &AppHandle, session: &EmulatorSession) {
 
 fn preload_disk_assets_for_game(app: &AppHandle, session: &mut EmulatorSession, game_id: &str) {
     if let Ok(path) = sram_path(app, game_id) {
-        if let Some(sram) = load_sram_bytes(&path) {
+        if let Ok(Some(sram)) = load_sram_bytes(&path) {
             session.load_active_sram(&sram);
         }
     }
     for slot in 1..=6u8 {
         if let Ok(path) = state_slot_path(app, game_id, slot) {
-            if let Some(persisted) = load_state_slot_atomic(&path) {
-                session.import_save_state_envelope(
-                    game_id.to_string(),
-                    persisted.info,
-                    persisted.envelope,
-                );
+            if let Ok(Some(persisted)) = load_state_slot_atomic(&path) {
+                session.import_save_state_envelope(game_id.to_string(), persisted);
             }
         }
     }
