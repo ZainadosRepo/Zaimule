@@ -245,12 +245,24 @@ impl GameBoyCore {
             0x0000..=0x1FFF => {
                 self.ram_enabled = (val & 0x0F) == 0x0A;
             }
-            0x2000..=0x3FFF => {
-                let bank = (val & 0x7F) as usize;
-                self.rom_bank = bank.max(1);
+            0x2000..=0x2FFF => {
+                let is_mbc5 = matches!(self.rom.get(0x0147).copied(), Some(0x19..=0x1E));
+                if is_mbc5 {
+                    self.rom_bank = (self.rom_bank & 0x100) | (val as usize);
+                } else {
+                    self.rom_bank = ((val & 0x7F) as usize).max(1);
+                }
+            }
+            0x3000..=0x3FFF => {
+                let is_mbc5 = matches!(self.rom.get(0x0147).copied(), Some(0x19..=0x1E));
+                if is_mbc5 {
+                    self.rom_bank = (self.rom_bank & 0xFF) | (((val & 0x01) as usize) << 8);
+                } else {
+                    self.rom_bank = ((val & 0x7F) as usize).max(1);
+                }
             }
             0x4000..=0x5FFF => {
-                self.ram_bank = (val & 0x03) as usize;
+                self.ram_bank = (val & 0x0F) as usize;
             }
             0x6000..=0x7FFF => {}
             0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize] = val,
@@ -955,21 +967,29 @@ impl GameBoyCore {
         }
         let scx = self.io[0x43] as usize;
         let scy = self.io[0x42] as usize;
+        let wy = self.io[0x4A] as usize;
+        let wx = (self.io[0x4B] as usize).saturating_sub(7);
+        let win_enabled = (lcdc & 0x20) != 0;
         let bgp = self.io[0x47];
         let bg_map_base = if (lcdc & 0x08) != 0 { 0x1C00 } else { 0x1800 };
+        let win_map_base = if (lcdc & 0x40) != 0 { 0x1C00 } else { 0x1800 };
         let unsigned_tiles = (lcdc & 0x10) != 0;
 
         for y in 0..GB_HEIGHT {
             let bg_y = (y + scy) & 0xFF;
-            let tile_row = bg_y / 8;
-            let fine_y = bg_y % 8;
-
             for x in 0..GB_WIDTH {
-                let bg_x = (x + scx) & 0xFF;
-                let tile_col = bg_x / 8;
-                let fine_x = bg_x % 8;
+                let in_win = win_enabled && y >= wy && x >= wx;
+                let (map_base, eff_y, eff_x) = if in_win {
+                    (win_map_base, y - wy, x - wx)
+                } else {
+                    (bg_map_base, bg_y, (x + scx) & 0xFF)
+                };
+                let tile_row = (eff_y / 8) & 31;
+                let fine_y = eff_y % 8;
+                let tile_col = (eff_x / 8) & 31;
+                let fine_x = eff_x % 8;
 
-                let map_addr = bg_map_base + tile_row * 32 + tile_col;
+                let map_addr = map_base + tile_row * 32 + tile_col;
                 let raw_id = self.vram[map_addr];
                 let tile_addr = if unsigned_tiles {
                     (raw_id as usize) * 16 + fine_y * 2
@@ -1169,6 +1189,22 @@ impl EmulatorBackend for GameBoyCore {
             cycles: self.cycles,
             score: self.score,
         }
+    }
+
+    fn apply_ram_cheat(&mut self, addr: u16, val: u8) {
+        self.write_byte(addr, val);
+        if addr == 0xA004 && self.score < (val as u32) {
+            self.score = val as u32;
+        }
+        if addr == 0xC104 && val != 0 && !self.shot_active {
+            self.shot_active = true;
+            self.shot_x = self.player_x;
+            self.shot_y = self.player_y.saturating_sub(4);
+        }
+    }
+
+    fn read_ram_slice(&self) -> &[u8] {
+        &self.wram
     }
 }
 

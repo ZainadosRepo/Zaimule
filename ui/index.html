@@ -12,7 +12,7 @@
         <div class="brand-group" data-tauri-drag-region>
           <div class="brand-emblem">Z</div>
           <span class="brand-title">ZAIMULE</span>
-          <span class="brand-sub">Rust Multi-Console Station · v0.1.0</span>
+          <span class="brand-sub">Rust Multi-Console Station · v0.2.0</span>
         </div>
 
         <nav class="nav-tabs" role="tablist">
@@ -168,6 +168,30 @@
 
             <div class="inspector-section">
               <div class="section-title">
+                <span>🦈 Codes GameShark &amp; Scanner RAM</span>
+              </div>
+              <div style="display:flex; gap:4px; margin-bottom:6px;">
+                <input
+                  type="text"
+                  id="cheat-input"
+                  class="search-input mono"
+                  placeholder="Ex: 016404A0 ou C104:01"
+                  style="background:var(--bg-elevated); padding:4px 8px; border-radius:4px; border:1px solid var(--border-subtle); font-size:11px;"
+                />
+                <button class="btn mono" id="btn-add-cheat" style="padding:4px 8px;">+ Code</button>
+              </div>
+              <div id="cheats-list"></div>
+            </div>
+
+            <div class="inspector-section">
+              <div class="section-title">
+                <span>🏆 Succès Rétro (RetroAchievements)</span>
+              </div>
+              <div id="achievements-list"></div>
+            </div>
+
+            <div class="inspector-section">
+              <div class="section-title">
                 <span>💾 Save States Atomiques (.zst)</span>
                 <span class="mono">F5 / F8</span>
               </div>
@@ -277,20 +301,43 @@
 
               <div class="dock-card">
                 <div class="section-title">
-                  <span>🔬 Registres CPU &amp; APU Temps Réel</span>
+                  <span>🔬 Registres CPU &amp; Scanner RAM</span>
                 </div>
                 <div class="kv-row mono"><span class="kv-label">PC / SP</span><span id="dbg-pc-sp">0x0150 / 0xFFFE</span></div>
                 <div class="kv-row mono"><span class="kv-label">AF / BC</span><span id="dbg-af-bc">0x11B0 / 0x0013</span></div>
                 <div class="kv-row mono"><span class="kv-label">DE / HL</span><span id="dbg-de-hl">0x00D8 / 0x014D</span></div>
                 <div class="kv-row mono"><span class="kv-label">SIO / APU</span><span id="dbg-sio">0x00 / 0 Hz</span></div>
+                <div style="display:flex; gap:4px; margin-top:6px;">
+                  <input
+                    type="text"
+                    id="ram-scan-input"
+                    class="search-input mono"
+                    placeholder="Octet RAM (ex: 48)"
+                    style="background:var(--bg-elevated); padding:3px 6px; border-radius:4px; border:1px solid var(--border-subtle); font-size:11px;"
+                  />
+                  <button class="btn mono" id="btn-scan-ram" style="padding:3px 8px; font-size:11px;">🔍 Scan</button>
+                </div>
+                <div id="ram-scan-results" class="mono" style="margin-top:4px; font-size:10px; color:var(--cobalt);"></div>
               </div>
             </aside>
           </div>
         </section>
 
         <!-- ONGLET 3 : SALONS NETPLAY & CÂBLE LINK -->
-        <section id="view-netplay" class="view-pane">
-          <div class="page-grid" id="netplay-grid"></div>
+        <section id="view-netplay" class="view-pane" style="flex-direction:column; width:100%;">
+          <div style="padding:14px 20px; border-bottom:1px solid var(--border-subtle); display:flex; align-items:center; gap:10px; flex-wrap:wrap; background:var(--bg-panel);">
+            <span class="pill-badge pill-green mono" id="udp-port-badge">UDP ZML2 Socket : Actif</span>
+            <input
+              type="text"
+              id="deeplink-input"
+              class="search-input mono"
+              placeholder="Coller un lien zaimule://room/PKMN-LINK-01?crc=DCE0682B..."
+              style="max-width:360px; background:var(--bg-elevated); padding:6px 10px; border-radius:6px; border:1px solid var(--border-subtle);"
+            />
+            <button class="btn" id="btn-join-deeplink">🔗 Rejoindre Deep-Link</button>
+            <button class="btn btn-gold" id="btn-create-room">+ Créer Salon P2P &amp; Câble Link</button>
+          </div>
+          <div class="page-grid" id="netplay-grid" style="flex:1;"></div>
         </section>
 
         <!-- ONGLET 4 : CŒURS RUST, LIBRETRO & BIOS -->

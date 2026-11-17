@@ -52,4 +52,8 @@ pub trait EmulatorBackend: Send {
     fn load_sram(&mut self, data: &[u8]) -> Result<(), String>;
     fn exchange_serial_byte(&mut self, incoming: u8) -> u8;
     fn debug_snapshot(&self) -> CpuDebugSnapshot;
+    fn apply_ram_cheat(&mut self, _addr: u16, _val: u8) {}
+    fn read_ram_slice(&self) -> &[u8] {
+        &[]
+    }
 }

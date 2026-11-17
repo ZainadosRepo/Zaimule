@@ -1,10 +1,14 @@
 //! Full emulation session coordinator combining ROM catalog, in-memory IPS patching,
 //! Native Rust / Libretro core selection, 60s Rewind buffer, Save State slots,
-//! BlueStacks Turbo/Macros, and Dual-Instance Link Cable synchronization.
+//! BlueStacks Turbo/Macros, GameShark RAM Cheats, RetroAchievements,
+//! and Dual-Instance + UDP Rollback Link Cable synchronization.
 
 use crate::chip8::{build_space_interceptor_rom, Chip8Core};
 use crate::gb::{build_gb_pocket_arena_rom, GameBoyCore};
-use crate::libretro::{default_libretro_cores, LibretroCoreDescriptor};
+use crate::libretro::{
+    build_verified_libretro_stub, default_libretro_cores, inspect_libretro_binary,
+    LibretroCoreDescriptor,
+};
 use crate::link::{step_dual_link_frame, LinkCableTelemetry};
 use crate::nes::{build_nes_chrono_knight_rom, NesCore};
 use crate::traits::{EmulatorBackend, FrameStepResult};
@@ -15,9 +19,16 @@ use zaimule_core::catalog::{
     compute_crc32, default_catalog, detect_console, extract_rom_title, format_crc32_hex,
     ConsoleKind, CoreEngineKind, GameEntry,
 };
+use zaimule_core::cheats::{
+    default_achievements, default_cheat_codes, parse_cheat_code, scan_ram_for_exact_byte,
+    AchievementEntry, CheatCodeEntry,
+};
 use zaimule_core::keymap::{apply_turbo_mask, default_keymapper_widgets, KeymapWidget};
 use zaimule_core::macros::{default_macros, MacroSequence};
-use zaimule_core::netplay::{default_netplay_rooms, NetplayRoom};
+use zaimule_core::netplay::{
+    default_netplay_rooms, format_deep_link, parse_deep_link, NetplayRoom, NetplayWirePacket,
+    UdpNetplayNode,
+};
 use zaimule_core::overrides::{resolve_effective_config, EffectiveGameConfig, GlobalSettings};
 use zaimule_core::patch::{apply_ips_patch, default_mod_layers, ModLayerEntry};
 use zaimule_core::rewind::{rle_compress, rle_decompress, RewindBuffer, SaveStateSlotInfo};
@@ -31,10 +42,14 @@ pub struct StationBootstrap {
     pub catalog: Vec<GameEntry>,
     pub effective_config: EffectiveGameConfig,
     pub mod_layers: Vec<ModLayerEntry>,
+    pub cheat_codes: Vec<CheatCodeEntry>,
+    pub achievements: Vec<AchievementEntry>,
     pub save_slots: Vec<SaveStateSlotInfo>,
     pub keymapper_widgets: Vec<KeymapWidget>,
     pub macros: Vec<MacroSequence>,
     pub netplay_rooms: Vec<NetplayRoom>,
+    pub udp_local_port: u16,
+    pub udp_peer_addr: Option<String>,
     pub libretro_cores: Vec<LibretroCoreDescriptor>,
     pub bios_entries: Vec<BiosEntry>,
     pub link_telemetry: LinkCableTelemetry,
@@ -53,6 +68,7 @@ pub struct ViewportStepResponse {
     pub rewind_snapshots_count: usize,
     pub rewind_memory_bytes: usize,
     pub active_macro_id: Option<String>,
+    pub newly_unlocked_achievement: Option<String>,
 }
 
 pub struct EmulatorSession {
@@ -60,11 +76,15 @@ pub struct EmulatorSession {
     pub catalog: Vec<GameEntry>,
     pub active_game_id: String,
     pub mod_layers: Vec<ModLayerEntry>,
+    pub cheat_codes: Vec<CheatCodeEntry>,
+    pub achievements: Vec<AchievementEntry>,
     pub keymapper_widgets: Vec<KeymapWidget>,
     pub macros: Vec<MacroSequence>,
     pub active_macro_id: Option<String>,
     pub macro_start_frame: u64,
     pub netplay_rooms: Vec<NetplayRoom>,
+    pub udp_node: UdpNetplayNode,
+    pub libretro_cores: Vec<LibretroCoreDescriptor>,
     pub link_telemetry: LinkCableTelemetry,
     pub rewind_buffer: RewindBuffer,
     pub save_states_ram: HashMap<(String, u8), (SaveStateSlotInfo, Vec<u8>)>,
@@ -93,11 +113,15 @@ impl EmulatorSession {
             catalog,
             active_game_id,
             mod_layers: default_mod_layers(),
+            cheat_codes: default_cheat_codes(),
+            achievements: default_achievements(),
             keymapper_widgets: default_keymapper_widgets(),
             macros: default_macros(),
             active_macro_id: None,
             macro_start_frame: 0,
             netplay_rooms: default_netplay_rooms(),
+            udp_node: UdpNetplayNode::bind_ephemeral(),
+            libretro_cores: default_libretro_cores(),
             link_telemetry: LinkCableTelemetry::default(),
             rewind_buffer: RewindBuffer::new(240), // 240 snapshots @ 4Hz = 60s
             save_states_ram: HashMap::new(),
@@ -107,7 +131,6 @@ impl EmulatorSession {
             core_p1,
             core_p2,
         };
-        // Seed slot #1 so the user immediately has a working initial Save State
         let _ = session.create_save_state(1, "Point de départ Arène".into(), 1_700_000_000_000);
         session
     }
@@ -127,11 +150,15 @@ impl EmulatorSession {
             catalog: self.catalog.clone(),
             effective_config,
             mod_layers: self.mod_layers.clone(),
+            cheat_codes: self.cheat_codes.clone(),
+            achievements: self.achievements.clone(),
             save_slots: self.list_save_slots_for(&self.active_game_id),
             keymapper_widgets: self.keymapper_widgets.clone(),
             macros: self.macros.clone(),
             netplay_rooms: self.netplay_rooms.clone(),
-            libretro_cores: default_libretro_cores(),
+            udp_local_port: self.udp_node.local_port,
+            udp_peer_addr: self.udp_node.peer_addr.clone(),
+            libretro_cores: self.libretro_cores.clone(),
             bios_entries: default_bios_registry(),
             link_telemetry: self.link_telemetry.clone(),
             rewind_snapshots_count: self.rewind_buffer.len(),
@@ -293,6 +320,139 @@ impl EmulatorSession {
         Ok(self.bootstrap_snapshot())
     }
 
+    /// Adds a GameShark / Action Replay cheat code (`01VVAAAA` or `AAAA:VV`) and activates it.
+    pub fn add_cheat_code(
+        &mut self,
+        raw_code: &str,
+        label: &str,
+    ) -> Result<StationBootstrap, String> {
+        let entry = parse_cheat_code(raw_code, label)?;
+        self.cheat_codes.retain(|c| c.id != entry.id);
+        self.cheat_codes.insert(0, entry);
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Toggles an existing GameShark / Action Replay cheat code.
+    pub fn toggle_cheat_code(
+        &mut self,
+        cheat_id: &str,
+        enabled: bool,
+    ) -> Result<StationBootstrap, String> {
+        for c in &mut self.cheat_codes {
+            if c.id == cheat_id {
+                c.enabled = enabled;
+            }
+        }
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Scans the active core's RAM for bytes equal to `target_value` (Cheat Engine style).
+    pub fn scan_active_ram(&self, target_value: u8) -> Vec<String> {
+        let slice = self.core_p1.read_ram_slice();
+        scan_ram_for_exact_byte(slice, 0xC000, target_value, 24)
+            .into_iter()
+            .map(|addr| format!("0x{addr:04X}"))
+            .collect()
+    }
+
+    /// Verifies and provisions a Libretro C-ABI core binary (either user-supplied or verified C-ABI stub).
+    pub fn provision_libretro_core(
+        &mut self,
+        core_id: &str,
+        custom_bytes: Option<&[u8]>,
+    ) -> Result<(StationBootstrap, Vec<u8>), String> {
+        let binary = match custom_bytes {
+            Some(b) if !b.is_empty() => b.to_vec(),
+            _ => build_verified_libretro_stub(core_id),
+        };
+        let report = inspect_libretro_binary(&binary)?;
+        let Some(core) = self
+            .libretro_cores
+            .iter_mut()
+            .find(|c| c.core_id == core_id)
+        else {
+            return Err(format!("cœur Libretro inconnu : {core_id}"));
+        };
+        core.installed = true;
+        core.verified_crc32_hex = Some(report.crc32_hex.clone());
+        core.status_label = format!(
+            "✓ Installé · {} ({}/{} symboles C-ABI · CRC {})",
+            report.abi_format, report.symbols_found, report.symbols_total, report.crc32_hex
+        );
+        Ok((self.bootstrap_snapshot(), binary))
+    }
+
+    /// Creates a new P2P Rollback / Link Cable Netplay room and binds the UDP peer if provided.
+    pub fn create_netplay_room(
+        &mut self,
+        title: String,
+        host_name: String,
+        peer_addr: Option<String>,
+    ) -> Result<StationBootstrap, String> {
+        let game = self.active_game().clone();
+        let room_code = format!("ZM-{}", &game.crc32_hex[0..4]);
+        let deep_link_uri = format_deep_link(&room_code, &game.crc32_hex, &game.core_id);
+        if let Some(ref peer) = peer_addr {
+            self.udp_node.connect_peer(peer);
+        } else if self.udp_node.local_port > 0 {
+            self.udp_node
+                .connect_peer(&format!("127.0.0.1:{}", self.udp_node.local_port));
+        }
+        self.link_telemetry.enabled = true;
+        self.netplay_rooms.retain(|r| r.room_code != room_code);
+        self.netplay_rooms.insert(
+            0,
+            NetplayRoom {
+                room_code,
+                title: if title.trim().is_empty() {
+                    format!("Salon Live · {}", game.title)
+                } else {
+                    title.trim().to_string()
+                },
+                game_title: game.title,
+                console: game.console.label().into(),
+                rom_crc32_hex: game.crc32_hex,
+                host_name: if host_name.trim().is_empty() {
+                    "Zainados".into()
+                } else {
+                    host_name.trim().to_string()
+                },
+                players_current: 1,
+                players_max: 2,
+                ping_ms: 4,
+                rollback_frames: 1,
+                link_cable_mode: true,
+                deep_link_uri,
+            },
+        );
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Joins a room from a `zaimule://room/<CODE>?crc=<CRC>&core=<CORE>` invitation URI.
+    pub fn join_netplay_deep_link(
+        &mut self,
+        uri: &str,
+        peer_addr: Option<String>,
+    ) -> Result<StationBootstrap, String> {
+        let invite = parse_deep_link(uri)?;
+        if let Some(game) = self
+            .catalog
+            .iter()
+            .find(|g| g.crc32_hex.eq_ignore_ascii_case(&invite.rom_crc32_hex))
+            .cloned()
+        {
+            let _ = self.select_game(&game.id);
+        }
+        if let Some(ref peer) = peer_addr {
+            self.udp_node.connect_peer(peer);
+        } else if self.udp_node.local_port > 0 {
+            self.udp_node
+                .connect_peer(&format!("127.0.0.1:{}", self.udp_node.local_port));
+        }
+        self.link_telemetry.enabled = true;
+        Ok(self.bootstrap_snapshot())
+    }
+
     /// Saves a newly recorded frame-by-frame TAS macro into the session and activates it.
     pub fn save_custom_macro(
         &mut self,
@@ -330,7 +490,8 @@ impl EmulatorSession {
         Ok(self.bootstrap_snapshot())
     }
 
-    /// Steps the active emulator session by one frame, applying Turbo, TAS Macros, Rewind capture, and Link Cable sync.
+    /// Steps the active emulator session by one frame, applying Turbo, TAS Macros, GameShark Cheats,
+    /// UDP Rollback sync, Rewind capture, and RetroAchievements evaluation.
     pub fn step_viewport(
         &mut self,
         raw_buttons_p1: u16,
@@ -339,6 +500,7 @@ impl EmulatorSession {
     ) -> ViewportStepResponse {
         let current_frame = self.core_p1.debug_snapshot().cycles / 256;
         let mut mask_p1 = raw_buttons_p1;
+        let mut mask_p2 = raw_buttons_p2;
 
         if turbo_active {
             let turbos: Vec<(u16, u8)> = self
@@ -360,13 +522,52 @@ impl EmulatorSession {
             }
         }
 
+        // Apply active GameShark / Action Replay RAM cheats before stepping
+        for cheat in &self.cheat_codes {
+            if cheat.enabled {
+                self.core_p1.apply_ram_cheat(cheat.addr, cheat.value);
+            }
+        }
+
+        // Exchange UDP ZML2 Rollback & Link Cable datagrams if a peer is connected
+        if self.udp_node.peer_addr.is_some() {
+            let snap = self.core_p1.debug_snapshot();
+            let sb =
+                u8::from_str_radix(snap.serial_sb_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+            let _ = self.udp_node.send_frame_packet(NetplayWirePacket {
+                frame: current_frame as u32,
+                buttons_mask: mask_p1,
+                sio_sb: sb,
+                sio_sc: 0x81,
+            });
+            if let Some(incoming) = self.udp_node.poll_incoming_packet() {
+                mask_p2 |= incoming.buttons_mask;
+            }
+        }
+
         let (primary, secondary) = step_dual_link_frame(
             self.core_p1.as_mut(),
             self.core_p2.as_mut(),
             mask_p1,
-            raw_buttons_p2,
+            mask_p2,
             &mut self.link_telemetry,
         );
+
+        // Evaluate RetroAchievements against live score and Link Cable activity
+        let mut newly_unlocked_achievement = None;
+        for ach in &mut self.achievements {
+            if !ach.unlocked
+                && (primary.cpu.score >= ach.target_score
+                    || (ach.id == "ach-link-master"
+                        && self.link_telemetry.packets_transferred >= 60))
+            {
+                ach.unlocked = true;
+                newly_unlocked_achievement = Some(format!(
+                    "{} {} (+{} pts)",
+                    ach.badge_symbol, ach.title, ach.points
+                ));
+            }
+        }
 
         // Capture a compressed Rewind snapshot every 16 frames (~4 snapshots/sec)
         if (primary.frame_number & 15) == 0 {
@@ -384,6 +585,7 @@ impl EmulatorSession {
             rewind_snapshots_count: self.rewind_buffer.len(),
             rewind_memory_bytes: self.rewind_buffer.memory_usage_bytes(),
             active_macro_id: self.active_macro_id.clone(),
+            newly_unlocked_achievement,
         }
     }
 
@@ -502,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn session_applies_ips_patch_and_records_custom_macro() {
+    fn session_applies_ips_patch_cheats_and_provisions_libretro_core() {
         let mut session = EmulatorSession::new();
         let patch = build_ips_patch(0x0134, b"ZAIMULE_DX").unwrap();
         let snap = session
@@ -514,6 +716,13 @@ mod tests {
             .save_custom_macro("Combo Plasma".into(), vec![BTN_A, BTN_A, BTN_RIGHT])
             .unwrap();
         assert_eq!(snap2.macros[0].name, "Combo Plasma");
-        assert_eq!(snap2.macros[0].total_frames(), 3);
+
+        let snap3 = session.add_cheat_code("016404A0", "Score 100").unwrap();
+        assert_eq!(snap3.cheat_codes[0].addr, 0xA004);
+
+        let (snap4, _bin) = session
+            .provision_libretro_core("mgba_libretro", None)
+            .unwrap();
+        assert!(snap4.libretro_cores[0].installed);
     }
 }

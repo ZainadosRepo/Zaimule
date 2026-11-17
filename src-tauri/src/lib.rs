@@ -56,6 +56,12 @@ fn rom_archive_path(app: &AppHandle, game_id: &str) -> Result<PathBuf, String> {
         .join(format!("{game_id}.rom")))
 }
 
+fn core_binary_path(app: &AppHandle, core_id: &str) -> Result<PathBuf, String> {
+    Ok(config_root(app)?
+        .join("cores")
+        .join(format!("{core_id}.bin")))
+}
+
 fn flush_sram_best_effort(app: &AppHandle, session: &EmulatorSession) {
     if let Ok(path) = sram_path(app, &session.active_game_id) {
         let _ = save_sram_with_rotation(&path, session.active_sram_bytes());
@@ -133,6 +139,86 @@ fn apply_ips_patch_file(
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
     session.apply_custom_ips_to_active_game(&patch_name, &patch_bytes)
+}
+
+#[tauri::command]
+fn add_cheat_code(
+    state: tauri::State<AppState>,
+    raw_code: String,
+    label: String,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    session.add_cheat_code(&raw_code, &label)
+}
+
+#[tauri::command]
+fn toggle_cheat_code(
+    state: tauri::State<AppState>,
+    cheat_id: String,
+    enabled: bool,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    session.toggle_cheat_code(&cheat_id, enabled)
+}
+
+#[tauri::command]
+fn scan_ram_byte(state: tauri::State<AppState>, target_value: u8) -> Result<Vec<String>, String> {
+    let session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    Ok(session.scan_active_ram(target_value))
+}
+
+#[tauri::command]
+fn provision_libretro_core(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    core_id: String,
+    custom_bytes: Option<Vec<u8>>,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let (snap, binary) = session.provision_libretro_core(&core_id, custom_bytes.as_deref())?;
+    if let Ok(path) = core_binary_path(&app, &core_id) {
+        let _ = save_rom_binary_atomic(&path, &binary);
+    }
+    Ok(snap)
+}
+
+#[tauri::command]
+fn create_netplay_room(
+    state: tauri::State<AppState>,
+    title: String,
+    host_name: String,
+    peer_addr: Option<String>,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    session.create_netplay_room(title, host_name, peer_addr)
+}
+
+#[tauri::command]
+fn join_netplay_deep_link(
+    state: tauri::State<AppState>,
+    uri: String,
+    peer_addr: Option<String>,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    session.join_netplay_deep_link(&uri, peer_addr)
 }
 
 #[tauri::command]
@@ -374,6 +460,12 @@ pub fn run() {
             select_game,
             import_rom_file,
             apply_ips_patch_file,
+            add_cheat_code,
+            toggle_cheat_code,
+            scan_ram_byte,
+            provision_libretro_core,
+            create_netplay_room,
+            join_netplay_deep_link,
             save_recorded_macro,
             save_keymapper_layout,
             step_viewport,

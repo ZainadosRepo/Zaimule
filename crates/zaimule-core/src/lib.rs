@@ -5,6 +5,7 @@
 
 pub mod bios;
 pub mod catalog;
+pub mod cheats;
 pub mod keymap;
 pub mod macros;
 pub mod netplay;

@@ -195,6 +195,37 @@ impl NesCore {
             }
         }
 
+        // If an imported NES ROM provides non-zero CHR-ROM 2bpp tiles, overlay them on the background
+        let has_chr = self.chr_rom.iter().take(256).any(|&b| b != 0);
+        if has_chr {
+            for ty in 3..26usize {
+                for tx in 2..30usize {
+                    let tile_idx = ((ty * 32 + tx) & 0xFF) * 16;
+                    if tile_idx + 16 <= self.chr_rom.len() {
+                        for row in 0..8usize {
+                            let plane0 = self.chr_rom[tile_idx + row];
+                            let plane1 = self.chr_rom[tile_idx + 8 + row];
+                            for col in 0..8usize {
+                                let bit = 7 - col;
+                                let c = (((plane1 >> bit) & 1) << 1) | ((plane0 >> bit) & 1);
+                                if c != 0 {
+                                    let py = ty * 8 + row;
+                                    let px = tx * 8 + col;
+                                    let idx = (py * NES_WIDTH + px) * 4;
+                                    let rgb = match c {
+                                        1 => [59, 130, 246, 255],
+                                        2 => [52, 211, 153, 255],
+                                        _ => [245, 186, 66, 255],
+                                    };
+                                    rgba[idx..idx + 4].copy_from_slice(&rgb);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Render Collectible Relic 10x10 in Cobalt/Emerald
         let rx = self.relic_x as usize;
         let ry = self.relic_y as usize;
@@ -313,6 +344,17 @@ impl EmulatorBackend for NesCore {
             cycles: self.cycles,
             score: self.score,
         }
+    }
+
+    fn apply_ram_cheat(&mut self, addr: u16, val: u8) {
+        let idx = (addr as usize) & 0x07FF;
+        if idx < self.ram.len() {
+            self.ram[idx] = val;
+        }
+    }
+
+    fn read_ram_slice(&self) -> &[u8] {
+        &self.ram
     }
 }
 

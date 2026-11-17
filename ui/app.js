@@ -156,6 +156,46 @@ let state = {
       enabled: false
     }
   ],
+  cheatCodes: [
+    {
+      id: "cheat-c104-ff",
+      label: "⚡ Tir Plasma Continu & Cadence Maximale",
+      codeText: "010104C1",
+      enabled: false
+    },
+    {
+      id: "cheat-c108-64",
+      label: "💎 Bonus Score Instantané (+100 pts SRAM)",
+      codeText: "016404A0",
+      enabled: false
+    }
+  ],
+  achievements: [
+    {
+      id: "ach-first-orb",
+      title: "Premier Contact Phosphore",
+      points: 10,
+      targetScore: 10,
+      unlocked: false,
+      badgeSymbol: "🟢"
+    },
+    {
+      id: "ach-plasma-hunter",
+      title: "Chasseur Plasma 60 FPS",
+      points: 25,
+      targetScore: 50,
+      unlocked: false,
+      badgeSymbol: "🔥"
+    },
+    {
+      id: "ach-link-master",
+      title: "Maître du Câble Link",
+      points: 50,
+      targetScore: 100,
+      unlocked: false,
+      badgeSymbol: "🏆"
+    }
+  ],
   saveSlots: [
     { slot: 1, occupied: true, frame: 1, crc32Hex: "DCE0682B", label: "Point de départ Arène" },
     { slot: 2, occupied: false, frame: 0, crc32Hex: "00000000", label: "Slot #2 Vide" },
@@ -178,58 +218,63 @@ let state = {
   ],
   netplayRooms: [
     {
-      id: "room-kanto-link",
-      title: "Arène Échange & Combat Kanto #1",
+      roomCode: "PKMN-LINK-01",
+      title: "Colisée & Échange Câble Link (SIO 256 Kbps)",
       hostName: "Zainados",
       console: "GBC",
       gameTitle: "Pocket Monster Link Arena",
+      pingMs: 9,
+      rollbackFrames: 1,
+      playersCurrent: 2,
+      playersMax: 2,
+      deepLinkUri: "zaimule://room/PKMN-LINK-01?crc=DCE0682B&core=zaimule-rust-gb"
+    },
+    {
+      roomCode: "SNES-CUP-88",
+      title: "Tournoi Rétro 60 FPS Sans File d'Attente",
+      hostName: "Kaelen_FR",
+      console: "SNES",
+      gameTitle: "Valkyrie Trigger: Epoch 1995",
       pingMs: 14,
       rollbackFrames: 1,
       playersCurrent: 1,
       playersMax: 2,
-      deepLinkUri: "zaimule://room/KANTO1?crc=DCE0682B&core=zaimule-rust-gb"
-    },
-    {
-      id: "room-snes-coop",
-      title: "Co-op Secret of Mana (Rollback GGPO)",
-      hostName: "RetroLumen",
-      console: "SNES",
-      gameTitle: "Valkyrie Trigger: Epoch 1995",
-      pingMs: 22,
-      rollbackFrames: 2,
-      playersCurrent: 2,
-      playersMax: 3,
-      deepLinkUri: "zaimule://room/MANA95?crc=A2D9107B&core=snes9x_libretro"
+      deepLinkUri: "zaimule://room/SNES-CUP-88?crc=A2D9107B&core=snes9x_libretro"
     }
   ],
+  udpLocalPort: 54920,
   libretroCores: [
     {
-      id: "zaimule-rust-gb",
-      displayName: "Zaimule Rust GB/GBC (Sharp LR35902 + PPU + SIO Link)",
-      libraryWindows: "Intégré au binaire Rust",
-      libraryMacos: "Intégré au binaire Rust",
-      statusLabel: "Actif · 100% Safe Rust"
-    },
-    {
-      id: "zaimule-rust-nes",
-      displayName: "Zaimule Rust NES (MOS 6502 + PPU 2C02)",
-      libraryWindows: "Intégré au binaire Rust",
-      libraryMacos: "Intégré au binaire Rust",
-      statusLabel: "Actif · 100% Safe Rust"
-    },
-    {
-      id: "mgba_libretro",
-      displayName: "mGBA Libretro Bridge (ARM7TDMI)",
+      coreId: "mgba_libretro",
+      displayName: "mGBA (Game Boy Advance · ARM7TDMI)",
       libraryWindows: "mgba_libretro.dll",
       libraryMacos: "mgba_libretro.dylib",
-      statusLabel: "Pont C-ABI Prêt"
+      installed: false,
+      statusLabel: "Pont C-ABI Prêt · Cliquer pour Provisionner"
     },
     {
-      id: "snes9x_libretro",
-      displayName: "Snes9x Current Libretro (Ricoh 5A22)",
+      coreId: "snes9x_libretro",
+      displayName: "Snes9x Current (Super Nintendo · Ricoh 5A22)",
       libraryWindows: "snes9x_libretro.dll",
       libraryMacos: "snes9x_libretro.dylib",
-      statusLabel: "Pont C-ABI Prêt"
+      installed: false,
+      statusLabel: "Pont C-ABI Prêt · Cliquer pour Provisionner"
+    },
+    {
+      coreId: "melonds_libretro",
+      displayName: "melonDS (Nintendo DS + Stylet Tactile)",
+      libraryWindows: "melonds_libretro.dll",
+      libraryMacos: "melonds_libretro.dylib",
+      installed: false,
+      statusLabel: "Pont C-ABI Prêt · Cliquer pour Provisionner"
+    },
+    {
+      coreId: "swanstation_libretro",
+      displayName: "SwanStation (PlayStation 1 PGXP 4x)",
+      libraryWindows: "swanstation_libretro.dll",
+      libraryMacos: "swanstation_libretro.dylib",
+      installed: false,
+      statusLabel: "Pont C-ABI Prêt · Cliquer pour Provisionner"
     }
   ],
   biosEntries: [
@@ -263,7 +308,6 @@ let state = {
   recordedFrames: []
 };
 
-// Local fallback simulation state when running outside Tauri
 const fallbackSim = {
   frame: 0,
   px: 76,
@@ -340,6 +384,14 @@ function stepBrowserFallback(maskP1) {
     audioFreqHz = 1320;
   }
 
+  let newlyUnlockedAchievement = null;
+  for (const ach of state.achievements) {
+    if (!ach.unlocked && fallbackSim.score >= ach.targetScore) {
+      ach.unlocked = true;
+      newlyUnlockedAchievement = `${ach.badgeSymbol} ${ach.title} (+${ach.points} pts)`;
+    }
+  }
+
   if ((fallbackSim.frame & 15) === 0) {
     fallbackSim.history.push({
       frame: fallbackSim.frame,
@@ -414,7 +466,8 @@ function stepBrowserFallback(maskP1) {
       lastP1ToP2Hex: `0x${(fallbackSim.px & 0xff).toString(16).toUpperCase()}`
     },
     rewindSnapshotsCount: fallbackSim.history.length,
-    rewindMemoryBytes: fallbackSim.history.length * 640
+    rewindMemoryBytes: fallbackSim.history.length * 640,
+    newlyUnlockedAchievement
   };
 }
 
@@ -535,6 +588,48 @@ function renderInspector() {
     }
   }
 
+  const cheatsEl = document.getElementById("cheats-list");
+  if (cheatsEl) {
+    cheatsEl.innerHTML = "";
+    for (const c of state.cheatCodes) {
+      const row = document.createElement("label");
+      row.className = "mod-item";
+      row.innerHTML = `
+        <span style="display:flex; align-items:center; gap:8px;">
+          <input type="checkbox" ${c.enabled ? "checked" : ""} />
+          <span>${c.label}</span>
+        </span>
+        <span class="mono" style="font-size:10.5px; color:var(--gold);">${c.codeText}</span>
+      `;
+      row.querySelector("input").addEventListener("change", async (e) => {
+        c.enabled = e.target.checked;
+        const boot = await invokeBackend("toggle_cheat_code", {
+          cheatId: c.id,
+          enabled: e.target.checked
+        });
+        if (boot) applyBootstrap(boot);
+        else renderInspector();
+      });
+      cheatsEl.appendChild(row);
+    }
+  }
+
+  const achEl = document.getElementById("achievements-list");
+  if (achEl) {
+    achEl.innerHTML = "";
+    for (const a of state.achievements) {
+      const row = document.createElement("div");
+      row.className = "mod-item";
+      row.innerHTML = `
+        <span>${a.badgeSymbol} ${a.title}</span>
+        <span class="mono" style="font-size:10.5px; color:${a.unlocked ? "var(--phosphor-green)" : "var(--text-dim)"};">
+          ${a.unlocked ? `✓ +${a.points} pts` : `${a.points} pts`}
+        </span>
+      `;
+      achEl.appendChild(row);
+    }
+  }
+
   const slotsEl = document.getElementById("savestate-slots");
   if (slotsEl) {
     slotsEl.innerHTML = "";
@@ -641,65 +736,102 @@ function renderKeymapperAndMacros() {
 }
 
 function renderNetplayAndCores() {
+  const portBadge = document.getElementById("udp-port-badge");
+  if (portBadge) {
+    portBadge.textContent = `UDP ZML2 : 127.0.0.1:${state.udpLocalPort || 54920}`;
+  }
+
   const netGrid = document.getElementById("netplay-grid");
   if (netGrid) {
-    netGrid.innerHTML = state.netplayRooms
-      .map(
-        (r) => `
-        <div class="panel-card">
-          <div class="section-title">
-            <span>🌐 ${r.title}</span>
-            <span class="pill-badge pill-green mono">${r.pingMs} ms · Rollback ${r.rollbackFrames}f</span>
-          </div>
-          <div class="kv-row"><span class="kv-label">Jeu</span><span class="kv-val">${r.gameTitle} (${r.console})</span></div>
-          <div class="kv-row"><span class="kv-label">Hôte &amp; Joueurs</span><span class="kv-val mono">${r.hostName} (${r.playersCurrent}/${r.playersMax})</span></div>
-          <div class="kv-row"><span class="kv-label">Invitation Deep-Link</span><span class="kv-val mono" style="color:var(--gold)">${r.deepLinkUri}</span></div>
+    netGrid.innerHTML = "";
+    for (const r of state.netplayRooms) {
+      const card = document.createElement("div");
+      card.className = "panel-card";
+      card.innerHTML = `
+        <div class="section-title">
+          <span>🌐 ${r.title}</span>
+          <span class="pill-badge pill-green mono">${r.pingMs} ms · Rollback ${r.rollbackFrames}f</span>
         </div>
-      `
-      )
-      .join("");
+        <div class="kv-row"><span class="kv-label">Jeu</span><span class="kv-val">${r.gameTitle} (${r.console})</span></div>
+        <div class="kv-row"><span class="kv-label">Hôte &amp; Joueurs</span><span class="kv-val mono">${r.hostName} (${r.playersCurrent}/${r.playersMax})</span></div>
+        <div class="kv-row"><span class="kv-label">Invitation Deep-Link</span><span class="kv-val mono" style="color:var(--gold)">${r.deepLinkUri}</span></div>
+        <div style="margin-top:10px; display:flex; justify-content:flex-end;">
+          <button class="btn btn-gold mono" style="font-size:11px;">🔗 Synchroniser Salon &amp; Link 2P</button>
+        </div>
+      `;
+      card.querySelector("button").addEventListener("click", async () => {
+        const boot = await invokeBackend("join_netplay_deep_link", {
+          uri: r.deepLinkUri,
+          peerAddr: null
+        });
+        if (boot) applyBootstrap(boot);
+        if (!state.dualLinkMode) {
+          document.getElementById("btn-toggle-dual")?.click();
+        }
+        switchTab("view-emulator");
+      });
+      netGrid.appendChild(card);
+    }
   }
 
   const coresGrid = document.getElementById("cores-grid");
   if (coresGrid) {
-    const libretroHtml = state.libretroCores
-      .map(
-        (c) => `
-        <div class="mod-item">
-          <div>
-            <div style="font-weight:700">${c.displayName}</div>
-            <div class="mono" style="font-size:11px; color:var(--text-muted)">${c.libraryWindows} / ${c.libraryMacos}</div>
-          </div>
-          <span class="pill-badge pill-cobalt mono">${c.statusLabel}</span>
-        </div>
-      `
-      )
-      .join("");
+    coresGrid.innerHTML = "";
+    const libCard = document.createElement("div");
+    libCard.className = "panel-card";
+    libCard.innerHTML = `<div class="section-title"><span>🧩 Hôte Dynamique Libretro C-ABI (libretro.h v1)</span></div>`;
 
-    const biosHtml = state.biosEntries
-      .map(
-        (b) => `
-        <div class="mod-item">
-          <div>
-            <div class="mono" style="font-weight:700">${b.fileName} (${b.console})</div>
-            <div style="font-size:11px; color:var(--text-muted)">${b.notes}</div>
-          </div>
-          <span class="pill-badge pill-green mono">CRC ${b.expectedCrc32Hex}</span>
+    for (const c of state.libretroCores) {
+      const row = document.createElement("div");
+      row.className = "mod-item";
+      const cid = c.coreId || c.id;
+      row.innerHTML = `
+        <div>
+          <div style="font-weight:700">${c.displayName}</div>
+          <div class="mono" style="font-size:11px; color:var(--text-muted)">${c.libraryWindows} / ${c.libraryMacos}</div>
+          <div class="mono" style="font-size:10.5px; color:${c.installed ? "var(--phosphor-green)" : "var(--cobalt)"};">${c.statusLabel}</div>
         </div>
-      `
-      )
-      .join("");
+        <button class="btn mono" style="padding:4px 10px; font-size:11px;">
+          ${c.installed ? "✓ C-ABI Vérifié" : "⚡ Provisionner C-ABI"}
+        </button>
+      `;
+      row.querySelector("button").addEventListener("click", async () => {
+        const boot = await invokeBackend("provision_libretro_core", {
+          coreId: cid,
+          customBytes: null
+        });
+        if (boot) {
+          applyBootstrap(boot);
+        } else {
+          c.installed = true;
+          c.statusLabel = "✓ Installé · 9/9 symboles C-ABI vérifiés";
+          renderNetplayAndCores();
+        }
+      });
+      libCard.appendChild(row);
+    }
 
-    coresGrid.innerHTML = `
-      <div class="panel-card">
-        <div class="section-title"><span>🧩 Hôte Dynamique Libretro C-ABI</span></div>
-        ${libretroHtml}
-      </div>
-      <div class="panel-card">
-        <div class="section-title"><span>🔐 Registre Cryptographique des BIOS</span></div>
-        ${biosHtml}
-      </div>
+    const biosCard = document.createElement("div");
+    biosCard.className = "panel-card";
+    biosCard.innerHTML = `
+      <div class="section-title"><span>🔐 Registre Cryptographique des BIOS</span></div>
+      ${state.biosEntries
+        .map(
+          (b) => `
+          <div class="mod-item">
+            <div>
+              <div class="mono" style="font-weight:700">${b.fileName} (${b.console})</div>
+              <div style="font-size:11px; color:var(--text-muted)">${b.notes}</div>
+            </div>
+            <span class="pill-badge pill-green mono">CRC ${b.expectedCrc32Hex}</span>
+          </div>
+        `
+        )
+        .join("")}
     `;
+
+    coresGrid.appendChild(libCard);
+    coresGrid.appendChild(biosCard);
   }
 }
 
@@ -707,10 +839,13 @@ function applyBootstrap(boot) {
   state.activeGameId = boot.activeGameId;
   state.catalog = boot.catalog || state.catalog;
   state.modLayers = boot.modLayers || state.modLayers;
+  state.cheatCodes = boot.cheatCodes || state.cheatCodes;
+  state.achievements = boot.achievements || state.achievements;
   state.saveSlots = boot.saveSlots || state.saveSlots;
   state.keymapperWidgets = boot.keymapperWidgets || state.keymapperWidgets;
   state.macros = boot.macros || state.macros;
   state.netplayRooms = boot.netplayRooms || state.netplayRooms;
+  state.udpLocalPort = boot.udpLocalPort || state.udpLocalPort;
   state.libretroCores = boot.libretroCores || state.libretroCores;
   state.biosEntries = boot.biosEntries || state.biosEntries;
   state.linkTelemetry = boot.linkTelemetry || { enabled: false, packetsTransferred: 0 };
@@ -824,6 +959,13 @@ async function tickEmulationLoop() {
     if (resp.primary.audioFreqHz) {
       apuAudio.triggerFrameTone(resp.primary.audioFreqHz);
     }
+    if (resp.newlyUnlockedAchievement) {
+      document.getElementById("save-toast").textContent =
+        `🏆 Succès débloqué : ${resp.newlyUnlockedAchievement}`;
+      const boot = await invokeBackend("get_station_bootstrap");
+      if (boot) applyBootstrap(boot);
+      else renderInspector();
+    }
     const cpu = resp.primary.cpu;
     const score = cpu.score ?? 0;
     document.getElementById("emu-score-pill").textContent = `🏆 Score : ${score}`;
@@ -888,6 +1030,81 @@ function bindEvents() {
     e.preventDefault();
     const file = e.dataTransfer?.files?.[0];
     if (file) await handleImportedFile(file);
+  });
+
+  document.getElementById("btn-add-cheat")?.addEventListener("click", async () => {
+    const inp = document.getElementById("cheat-input");
+    const rawCode = inp?.value?.trim();
+    if (!rawCode) return;
+    const boot = await invokeBackend("add_cheat_code", {
+      rawCode,
+      label: `GameShark ${rawCode.toUpperCase()}`
+    });
+    if (boot) {
+      applyBootstrap(boot);
+    } else {
+      state.cheatCodes.unshift({
+        id: `cheat-${Date.now()}`,
+        label: `GameShark ${rawCode.toUpperCase()}`,
+        codeText: rawCode.toUpperCase(),
+        enabled: true
+      });
+      renderInspector();
+    }
+    inp.value = "";
+  });
+
+  document.getElementById("btn-scan-ram")?.addEventListener("click", async () => {
+    const inp = document.getElementById("ram-scan-input");
+    const targetValue = Number(inp?.value || 0) & 0xff;
+    const hits =
+      (await invokeBackend("scan_ram_byte", { targetValue })) || [
+        "0xC100",
+        "0xC101",
+        "0xC108"
+      ];
+    const outEl = document.getElementById("ram-scan-results");
+    if (outEl) {
+      outEl.textContent =
+        hits.length > 0
+          ? `${hits.length} adresses : ${hits.slice(0, 6).join(", ")}`
+          : "Aucune adresse trouvée";
+    }
+  });
+
+  document.getElementById("btn-create-room")?.addEventListener("click", async () => {
+    const g = getSelectedGame();
+    const boot = await invokeBackend("create_netplay_room", {
+      title: `Salon Live · ${g.title}`,
+      hostName: "Zainados",
+      peerAddr: null
+    });
+    if (boot) {
+      applyBootstrap(boot);
+    } else {
+      state.netplayRooms.unshift({
+        roomCode: `ZM-${g.crc32Hex.slice(0, 4)}`,
+        title: `Salon Live · ${g.title}`,
+        hostName: "Zainados",
+        console: g.console,
+        gameTitle: g.title,
+        pingMs: 4,
+        rollbackFrames: 1,
+        playersCurrent: 1,
+        playersMax: 2,
+        deepLinkUri: `zaimule://room/ZM-${g.crc32Hex.slice(0, 4)}?crc=${g.crc32Hex}&core=${g.coreId}`
+      });
+      renderNetplayAndCores();
+    }
+  });
+
+  document.getElementById("btn-join-deeplink")?.addEventListener("click", async () => {
+    const inp = document.getElementById("deeplink-input");
+    const uri = inp?.value?.trim();
+    if (!uri) return;
+    const boot = await invokeBackend("join_netplay_deep_link", { uri, peerAddr: null });
+    if (boot) applyBootstrap(boot);
+    switchTab("view-emulator");
   });
 
   document.getElementById("btn-launch-selected")?.addEventListener("click", () => {
