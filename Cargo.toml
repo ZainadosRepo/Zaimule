@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/zaimule-core", "crates/zaimule-emu", "src-tauri"]
+
+# Profiles are only honoured at the workspace root.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Emulation loops, PPU/APU stepping and audio resampling need optimization even in dev builds.
+[profile.dev.package."*"]
+opt-level = 2

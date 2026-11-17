@@ -1,0 +1,12 @@
+[package]
+name = "zaimule-emu"
+version = "0.1.0"
+description = "Native Rust emulator cores (Game Boy/GBC with Link Cable, NES 6502/2C02, CHIP-8) and Libretro C-ABI host bridge for Zaimule"
+authors = ["ZainadosRepo"]
+edition = "2021"
+publish = false
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+zaimule-core = { path = "../zaimule-core" }
