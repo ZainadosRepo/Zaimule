@@ -4,12 +4,14 @@
 //! and Dual-Instance + UDP Rollback Link Cable synchronization.
 
 use crate::chip8::{build_space_interceptor_rom, Chip8Core};
+use crate::debugger::{build_vram_inspector_snapshot, disassemble_window, DebuggerPayload};
 use crate::gb::{build_gb_pocket_arena_rom, GameBoyCore};
+use crate::gba::{build_gba_golden_horizon_rom, GbaCore};
 use crate::libretro::{
     build_verified_libretro_stub, default_libretro_cores, inspect_libretro_binary,
     LibretroCoreDescriptor,
 };
-use crate::link::{step_dual_link_frame, LinkCableTelemetry};
+use crate::link::{step_quad_link_frame, LinkCableTelemetry};
 use crate::nes::{build_nes_chrono_knight_rom, NesCore};
 use crate::traits::{EmulatorBackend, FrameStepResult};
 use serde::{Deserialize, Serialize};
@@ -58,12 +60,14 @@ pub struct StationBootstrap {
     pub warning: Option<String>,
 }
 
-/// Combined frame step response for single or dual-instance viewport rendering.
+/// Combined frame step response for single, dual (2P), or quad (4P Tournament) viewport rendering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ViewportStepResponse {
     pub primary: FrameStepResult,
     pub secondary: Option<FrameStepResult>,
+    pub tertiary: Option<FrameStepResult>,
+    pub quaternary: Option<FrameStepResult>,
     pub link_telemetry: LinkCableTelemetry,
     pub rewind_snapshots_count: usize,
     pub rewind_memory_bytes: usize,
@@ -89,10 +93,13 @@ pub struct EmulatorSession {
     pub rewind_buffer: RewindBuffer,
     pub save_states_ram: HashMap<(String, u8), (SaveStateSlotInfo, Vec<u8>)>,
     pub custom_roms: HashMap<String, Vec<u8>>,
+    pub breakpoints: Vec<u32>,
     pub sram_dirty: bool,
     pub warning: Option<String>,
     core_p1: Box<dyn EmulatorBackend>,
     core_p2: Box<dyn EmulatorBackend>,
+    core_p3: Box<dyn EmulatorBackend>,
+    core_p4: Box<dyn EmulatorBackend>,
 }
 
 impl Default for EmulatorSession {
@@ -101,12 +108,35 @@ impl Default for EmulatorSession {
     }
 }
 
+fn build_core_for(console: ConsoleKind, rom: &[u8]) -> Result<Box<dyn EmulatorBackend>, String> {
+    match console {
+        ConsoleKind::Chip8 => {
+            let mut c = Chip8Core::new();
+            c.load_rom(rom)?;
+            Ok(Box::new(c))
+        }
+        ConsoleKind::Gba | ConsoleKind::Nds => {
+            let mut c = GbaCore::new();
+            c.load_rom(rom)?;
+            Ok(Box::new(c))
+        }
+        ConsoleKind::Nes | ConsoleKind::Snes | ConsoleKind::Ps1 | ConsoleKind::N64 => {
+            let mut c = NesCore::new();
+            c.load_rom(rom)?;
+            Ok(Box::new(c))
+        }
+        _ => {
+            let mut c = GameBoyCore::new();
+            c.load_rom(rom)?;
+            Ok(Box::new(c))
+        }
+    }
+}
+
 impl EmulatorSession {
     pub fn new() -> Self {
         let catalog = default_catalog();
         let active_game_id = catalog[0].id.clone();
-        let core_p1: Box<dyn EmulatorBackend> = Box::new(GameBoyCore::new());
-        let core_p2: Box<dyn EmulatorBackend> = Box::new(GameBoyCore::new());
 
         let mut session = Self {
             settings: GlobalSettings::default(),
@@ -126,10 +156,13 @@ impl EmulatorSession {
             rewind_buffer: RewindBuffer::new(240), // 240 snapshots @ 4Hz = 60s
             save_states_ram: HashMap::new(),
             custom_roms: HashMap::new(),
+            breakpoints: vec![0x0150, 0x0800_00C0],
             sram_dirty: false,
             warning: None,
-            core_p1,
-            core_p2,
+            core_p1: Box::new(GameBoyCore::new()),
+            core_p2: Box::new(GameBoyCore::new()),
+            core_p3: Box::new(GameBoyCore::new()),
+            core_p4: Box::new(GameBoyCore::new()),
         };
         let _ = session.create_save_state(1, "Point de départ Arène".into(), 1_700_000_000_000);
         session
@@ -193,6 +226,7 @@ impl EmulatorSession {
         }
         match console {
             ConsoleKind::Chip8 => build_space_interceptor_rom(),
+            ConsoleKind::Gba | ConsoleKind::Nds => build_gba_golden_horizon_rom(),
             ConsoleKind::Nes | ConsoleKind::Snes | ConsoleKind::Ps1 | ConsoleKind::N64 => {
                 build_nes_chrono_knight_rom()
             }
@@ -200,7 +234,7 @@ impl EmulatorSession {
         }
     }
 
-    /// Switches the active game and instantiates the appropriate Rust core.
+    /// Switches the active game and instantiates the appropriate Rust core across all 4 Link ports.
     pub fn select_game(&mut self, game_id: &str) -> Result<StationBootstrap, String> {
         let Some(game) = self.catalog.iter().find(|g| g.id == game_id).cloned() else {
             return Err(format!("jeu introuvable dans la bibliothèque : {game_id}"));
@@ -209,32 +243,10 @@ impl EmulatorSession {
         self.rewind_buffer.clear();
         let rom = self.base_rom_for_game(&game.id, game.console);
 
-        let (p1, p2): (Box<dyn EmulatorBackend>, Box<dyn EmulatorBackend>) = match game.console {
-            ConsoleKind::Chip8 => {
-                let mut c1 = Chip8Core::new();
-                let mut c2 = Chip8Core::new();
-                c1.load_rom(&rom)?;
-                c2.load_rom(&rom)?;
-                (Box::new(c1), Box::new(c2))
-            }
-            ConsoleKind::Nes | ConsoleKind::Snes | ConsoleKind::Ps1 | ConsoleKind::N64 => {
-                let mut c1 = NesCore::new();
-                let mut c2 = NesCore::new();
-                c1.load_rom(&rom)?;
-                c2.load_rom(&rom)?;
-                (Box::new(c1), Box::new(c2))
-            }
-            _ => {
-                let mut c1 = GameBoyCore::new();
-                let mut c2 = GameBoyCore::new();
-                c1.load_rom(&rom)?;
-                c2.load_rom(&rom)?;
-                (Box::new(c1), Box::new(c2))
-            }
-        };
-
-        self.core_p1 = p1;
-        self.core_p2 = p2;
+        self.core_p1 = build_core_for(game.console, &rom)?;
+        self.core_p2 = build_core_for(game.console, &rom)?;
+        self.core_p3 = build_core_for(game.console, &rom)?;
+        self.core_p4 = build_core_for(game.console, &rom)?;
         Ok(self.bootstrap_snapshot())
     }
 
@@ -300,6 +312,8 @@ impl EmulatorSession {
             .insert(game.id.clone(), patched_rom.clone());
         self.core_p1.load_rom(&patched_rom)?;
         self.core_p2.load_rom(&patched_rom)?;
+        self.core_p3.load_rom(&patched_rom)?;
+        self.core_p4.load_rom(&patched_rom)?;
 
         let mod_id = format!("ips-{}", new_crc.to_ascii_lowercase());
         self.mod_layers.retain(|m| m.id != mod_id);
@@ -545,11 +559,19 @@ impl EmulatorSession {
             }
         }
 
-        let (primary, secondary) = step_dual_link_frame(
-            self.core_p1.as_mut(),
-            self.core_p2.as_mut(),
-            mask_p1,
-            mask_p2,
+        let (primary, secondary, tertiary, quaternary) = step_quad_link_frame(
+            [
+                self.core_p1.as_mut(),
+                self.core_p2.as_mut(),
+                self.core_p3.as_mut(),
+                self.core_p4.as_mut(),
+            ],
+            [
+                mask_p1,
+                mask_p2,
+                mask_p1.rotate_left(1),
+                mask_p2.rotate_right(1),
+            ],
             &mut self.link_telemetry,
         );
 
@@ -581,12 +603,50 @@ impl EmulatorSession {
         ViewportStepResponse {
             primary,
             secondary,
+            tertiary,
+            quaternary,
             link_telemetry: self.link_telemetry.clone(),
             rewind_snapshots_count: self.rewind_buffer.len(),
             rewind_memory_bytes: self.rewind_buffer.memory_usage_bytes(),
             active_macro_id: self.active_macro_id.clone(),
             newly_unlocked_achievement,
         }
+    }
+
+    /// Enables or disables 4-Player Tournament Split-Screen (2x2 Quad-Link) mode.
+    pub fn set_quad_link_mode(&mut self, quad_enabled: bool) -> StationBootstrap {
+        self.link_telemetry.quad_mode = quad_enabled;
+        if quad_enabled {
+            self.link_telemetry.enabled = true;
+        }
+        self.bootstrap_snapshot()
+    }
+
+    /// Returns a live BGB/Mesen-style Debugger payload containing the VRAM 128x64 Tile Atlas
+    /// and a 10-instruction disassembled window around the current Program Counter (`PC`).
+    pub fn inspect_vram_and_disassembly(&self) -> DebuggerPayload {
+        let game = self.active_game();
+        let rom = self.base_rom_for_game(&game.id, game.console);
+        let cpu = self.core_p1.debug_snapshot();
+        let pc = u32::from_str_radix(cpu.pc_hex.trim_start_matches("0x"), 16).unwrap_or(0x0100);
+        let disassembly = disassemble_window(game.console, &rom, pc, &self.breakpoints, 10);
+        let vram = build_vram_inspector_snapshot(self.core_p1.read_vram_slice());
+        DebuggerPayload {
+            cpu,
+            disassembly,
+            breakpoints: self.breakpoints.clone(),
+            vram,
+        }
+    }
+
+    /// Toggles a hardware breakpoint at `addr` and returns the updated `DebuggerPayload`.
+    pub fn toggle_breakpoint(&mut self, addr: u32) -> DebuggerPayload {
+        if let Some(pos) = self.breakpoints.iter().position(|&a| a == addr) {
+            self.breakpoints.remove(pos);
+        } else {
+            self.breakpoints.push(addr);
+        }
+        self.inspect_vram_and_disassembly()
     }
 
     /// Creates a compressed, CRC32-verified Save State in `slot` (1..=9).
@@ -724,5 +784,23 @@ mod tests {
             .provision_libretro_core("mgba_libretro", None)
             .unwrap();
         assert!(snap4.libretro_cores[0].installed);
+    }
+
+    #[test]
+    fn session_runs_gba_core_quad_link_and_vram_disassembler_debugger() {
+        let mut session = EmulatorSession::new();
+        session.select_game("gba-golden-horizon").unwrap();
+        session.set_quad_link_mode(true);
+        let step = session.step_viewport(BTN_RIGHT | BTN_A, BTN_A, false);
+        assert_eq!(step.primary.width, 240);
+        assert_eq!(step.primary.height, 160);
+        assert!(step.secondary.is_some());
+        assert!(step.tertiary.is_some());
+        assert!(step.quaternary.is_some());
+
+        let dbg = session.toggle_breakpoint(0x0800_00C4);
+        assert_eq!(dbg.vram.atlas_width, 128);
+        assert_eq!(dbg.disassembly.len(), 10);
+        assert!(dbg.breakpoints.contains(&0x0800_00C4));
     }
 }

@@ -643,6 +643,46 @@ html, body {
   height: 285px;
 }
 
+.emu-screens-wrap.quad-mode {
+  display: grid;
+  grid-template-columns: repeat(2, auto);
+  gap: 10px;
+  padding: 10px;
+}
+
+.emu-screens-wrap.quad-mode .screen-container {
+  width: 290px;
+  height: 196px;
+}
+
+.disasm-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 3px 6px;
+  border-radius: 4px;
+  font-size: 10.5px;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+  color: var(--text-muted);
+}
+
+.disasm-row:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-main);
+}
+
+.disasm-row.is-pc {
+  background: var(--gold-soft);
+  color: var(--gold-bright);
+  font-weight: 700;
+}
+
+.disasm-row.has-bp {
+  border-left-color: var(--coral);
+  background: rgba(248, 113, 113, 0.12);
+}
+
 canvas.game-canvas {
   width: 100%;
   height: 100%;

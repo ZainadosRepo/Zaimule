@@ -56,4 +56,7 @@ pub trait EmulatorBackend: Send {
     fn read_ram_slice(&self) -> &[u8] {
         &[]
     }
+    fn read_vram_slice(&self) -> &[u8] {
+        &[]
+    }
 }

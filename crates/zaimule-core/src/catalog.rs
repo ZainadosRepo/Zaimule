@@ -41,8 +41,8 @@ impl ConsoleKind {
         match self {
             Self::Chip8 => "zaimule-rust-chip8",
             Self::Gb | Self::Gbc => "zaimule-rust-gb",
+            Self::Gba => "zaimule-rust-gba",
             Self::Nes => "zaimule-rust-nes",
-            Self::Gba => "mgba_libretro",
             Self::Snes => "snes9x_libretro",
             Self::Nds => "melonds_libretro",
             Self::Ps1 => "swanstation_libretro",
@@ -53,7 +53,10 @@ impl ConsoleKind {
     }
 
     pub fn is_native_rust(self) -> bool {
-        matches!(self, Self::Chip8 | Self::Gb | Self::Gbc | Self::Nes)
+        matches!(
+            self,
+            Self::Chip8 | Self::Gb | Self::Gbc | Self::Gba | Self::Nes
+        )
     }
 
     pub fn supports_link_cable(self) -> bool {
@@ -245,6 +248,23 @@ pub fn default_catalog() -> Vec<GameEntry> {
             embedded_rom_key: Some("gb_pocket_arena".into()),
             cover_accent: "#1e3a8a".into(),
             cover_symbol: "🐉".into(),
+        },
+        GameEntry {
+            id: "gba-golden-horizon".into(),
+            title: "Golden Horizon : Alchemy Tactics (GBA)".into(),
+            console: ConsoleKind::Gba,
+            engine_kind: CoreEngineKind::NativeRust,
+            core_id: "zaimule-rust-gba".into(),
+            region: "EUR · FR (ARM7TDMI Inclus)".into(),
+            crc32_hex: "89FA410C".into(),
+            size_bytes: 32_768,
+            sram_summary: "64 Ko FlashRAM + Multi-Link 4P".into(),
+            playtime_seconds: 19_800,
+            favorite: true,
+            link_cable_ready: true,
+            embedded_rom_key: Some("gba_golden_horizon".into()),
+            cover_accent: "#b45309".into(),
+            cover_symbol: "☀️".into(),
         },
         GameEntry {
             id: "nes-cyber-knight".into(),

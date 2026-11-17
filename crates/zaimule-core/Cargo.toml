@@ -1,6 +1,6 @@
 [package]
 name = "zaimule-core"
-version = "0.2.0"
+version = "0.3.0"
 description = "Multi-console ROM catalog, CRC32/SHA256 hasher, IPS patcher, 60s rewind ring-buffer, visual keymapper, TAS macro engine, and P2P netplay protocol for Zaimule"
 authors = ["ZainadosRepo"]
 edition = "2021"

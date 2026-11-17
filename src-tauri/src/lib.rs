@@ -13,6 +13,7 @@ use zaimule_core::storage::{
     load_json_atomic, load_sram_bytes, load_state_slot_atomic, save_json_atomic,
     save_rom_binary_atomic, save_sram_with_rotation, save_state_slot_atomic, LoadedJson,
 };
+use zaimule_emu::debugger::DebuggerPayload;
 use zaimule_emu::session::{EmulatorSession, StationBootstrap, ViewportStepResponse};
 
 const LIVE_SRAM_FLUSH_INTERVAL_MS: u64 = 10_000;
@@ -295,7 +296,40 @@ fn set_dual_link_enabled(
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
     session.link_telemetry.enabled = enabled;
+    if !enabled {
+        session.link_telemetry.quad_mode = false;
+    }
     Ok(session.bootstrap_snapshot())
+}
+
+#[tauri::command]
+fn set_quad_link_enabled(
+    state: tauri::State<AppState>,
+    enabled: bool,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    Ok(session.set_quad_link_mode(enabled))
+}
+
+#[tauri::command]
+fn get_vram_and_disassembly(state: tauri::State<AppState>) -> Result<DebuggerPayload, String> {
+    let session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    Ok(session.inspect_vram_and_disassembly())
+}
+
+#[tauri::command]
+fn toggle_breakpoint(state: tauri::State<AppState>, addr: u32) -> Result<DebuggerPayload, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    Ok(session.toggle_breakpoint(addr))
 }
 
 #[tauri::command]
@@ -470,6 +504,9 @@ pub fn run() {
             save_keymapper_layout,
             step_viewport,
             set_dual_link_enabled,
+            set_quad_link_enabled,
+            get_vram_and_disassembly,
+            toggle_breakpoint,
             create_save_state,
             restore_save_state,
             rewind_frames,

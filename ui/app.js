@@ -16,10 +16,12 @@ import {
   clampWidgetPosition
 } from "./keymapper.js";
 import { ApuAudioEngine } from "./audio.js";
+import { ViewportRecorder } from "./recorder.js";
 
 const tauriInvoke = window.__TAURI__?.core?.invoke;
 const appWindow = window.__TAURI__?.window?.getCurrentWindow?.();
 const apuAudio = new ApuAudioEngine();
+const viewportRecorder = new ViewportRecorder();
 
 const FALLBACK_CATALOG = [
   {
@@ -40,18 +42,18 @@ const FALLBACK_CATALOG = [
   },
   {
     id: "gba-golden-horizon",
-    title: "Golden Horizon: Alchemy Tactics",
+    title: "Golden Horizon : Alchemy Tactics (GBA)",
     console: "GBA",
-    engineKind: "libretroAbi",
-    coreId: "mgba_libretro",
-    region: "EUR · FR",
-    crc32Hex: "8F912C04",
-    sizeBytes: 16777216,
-    sramSummary: "64 Ko FlashRAM (.srm + 3 rotations)",
-    playtimeSeconds: 42300,
+    engineKind: "nativeRust",
+    coreId: "zaimule-rust-gba",
+    region: "EUR · FR (ARM7TDMI Inclus)",
+    crc32Hex: "89FA410C",
+    sizeBytes: 32768,
+    sramSummary: "64 Ko FlashRAM + Multi-Link 4P",
+    playtimeSeconds: 19800,
     favorite: true,
     linkCableReady: true,
-    coverAccent: "#78350f",
+    coverAccent: "#b45309",
     coverSymbol: "☀️"
   },
   {
@@ -297,11 +299,14 @@ let state = {
       notes: "Requis pour PlayStation 1 PAL/EUR"
     }
   ],
-  linkTelemetry: { enabled: false, packetsTransferred: 0 },
+  linkTelemetry: { enabled: false, quadMode: false, packetsTransferred: 0 },
   consoleFilter: "ALL",
   searchQuery: "",
   keymapperVisible: false,
   dualLinkMode: false,
+  quadLinkMode: false,
+  debuggerPaused: false,
+  stepOnceRequested: false,
   speedMult: 1,
   activeMacroId: null,
   recordingMacro: false,
@@ -938,7 +943,65 @@ async function handleImportedFile(file) {
   switchTab("view-emulator");
 }
 
+function renderDebuggerPayload(dbg) {
+  if (!dbg) return;
+  if (dbg.vram) {
+    paintRgbaFrame("vram-atlas-canvas", {
+      width: dbg.vram.atlasWidth || 128,
+      height: dbg.vram.atlasHeight || 64,
+      rgba: dbg.vram.tileAtlasRgba
+    });
+    const badge = document.getElementById("vram-tiles-badge");
+    if (badge) {
+      badge.textContent = `${dbg.vram.activeTilesCount || 6} tiles`;
+    }
+  }
+  const listEl = document.getElementById("disasm-list");
+  if (listEl && Array.isArray(dbg.disassembly)) {
+    listEl.innerHTML = "";
+    for (const line of dbg.disassembly) {
+      const row = document.createElement("div");
+      row.className = `disasm-row${line.isPc ? " is-pc" : ""}${line.hasBreakpoint ? " has-bp" : ""}`;
+      row.innerHTML = `
+        <span>${line.hasBreakpoint ? "● " : line.isPc ? "▶ " : "  "}${line.addrHex}</span>
+        <span style="color:var(--text-main)">${line.mnemonic}</span>
+      `;
+      row.title = "Cliquer pour basculer un point d'arrêt (Breakpoint PC)";
+      row.addEventListener("click", async () => {
+        const updated = await invokeBackend("toggle_breakpoint", { addr: line.addr });
+        if (updated) renderDebuggerPayload(updated);
+      });
+      listEl.appendChild(row);
+    }
+  }
+}
+
+async function refreshDebuggerDrawer() {
+  const dbg = await invokeBackend("get_vram_and_disassembly");
+  if (dbg) {
+    renderDebuggerPayload(dbg);
+    return;
+  }
+  const fallbackDisasm = [
+    { addr: 0x0150, addrHex: "0x0150", mnemonic: "LDH A, ($FF00)", isPc: true, hasBreakpoint: true },
+    { addr: 0x0152, addrHex: "0x0152", mnemonic: "INC B", isPc: false, hasBreakpoint: false },
+    { addr: 0x0153, addrHex: "0x0153", mnemonic: "INC HL", isPc: false, hasBreakpoint: false },
+    { addr: 0x0154, addrHex: "0x0154", mnemonic: "SWAP A", isPc: false, hasBreakpoint: false },
+    { addr: 0x0156, addrHex: "0x0156", mnemonic: "JP $0150", isPc: false, hasBreakpoint: false }
+  ];
+  renderDebuggerPayload({
+    disassembly: fallbackDisasm,
+    vram: null
+  });
+}
+
 async function tickEmulationLoop() {
+  if (state.debuggerPaused && !state.stepOnceRequested) {
+    requestAnimationFrame(tickEmulationLoop);
+    return;
+  }
+  state.stepOnceRequested = false;
+
   const buttonsP1 = computeBitmaskFromPressedCodes(pressedKeys) | pollGamepadBitmask();
   if (state.recordingMacro) {
     state.recordedFrames.push(buttonsP1);
@@ -956,6 +1019,17 @@ async function tickEmulationLoop() {
     if (resp.secondary) {
       paintRgbaFrame("canvas-p2", resp.secondary);
     }
+    if (resp.tertiary) {
+      paintRgbaFrame("canvas-p3", resp.tertiary);
+    } else if (state.quadLinkMode) {
+      paintRgbaFrame("canvas-p3", resp.primary);
+    }
+    if (resp.quaternary) {
+      paintRgbaFrame("canvas-p4", resp.quaternary);
+    } else if (state.quadLinkMode) {
+      paintRgbaFrame("canvas-p4", resp.primary);
+    }
+
     if (resp.primary.audioFreqHz) {
       apuAudio.triggerFrameTone(resp.primary.audioFreqHz);
     }
@@ -977,8 +1051,12 @@ async function tickEmulationLoop() {
     document.getElementById("dbg-sio").textContent = `${cpu.serialSbHex} / ${resp.primary.audioFreqHz || 0} Hz`;
     document.getElementById("tel-rewind").textContent = `${resp.rewindSnapshotsCount} clichés (${Math.round(resp.rewindMemoryBytes / 1024)} Ko)`;
     if (resp.linkTelemetry?.enabled) {
+      const modePrefix = resp.linkTelemetry.quadMode ? "4P Tournoi" : "2P Sync";
       document.getElementById("tel-link").textContent =
-        `2P Sync (${resp.linkTelemetry.packetsTransferred} pkts · ${resp.linkTelemetry.lastP1ToP2Hex})`;
+        `${modePrefix} (${resp.linkTelemetry.packetsTransferred} pkts · ${resp.linkTelemetry.lastP1ToP2Hex})`;
+    }
+    if ((resp.primary.frameNumber & 15) === 1 || state.debuggerPaused) {
+      await refreshDebuggerDrawer();
     }
   }
 
@@ -1119,6 +1197,20 @@ function bindEvents() {
     e.currentTarget.textContent = `🔊 Audio APU : ${on ? "ON" : "MUET"}`;
   });
 
+  document.getElementById("btn-record-video")?.addEventListener("click", (e) => {
+    const canvas = document.getElementById("canvas-p1");
+    if (!viewportRecorder.isRecording) {
+      viewportRecorder.start(canvas, state.activeGameId);
+      e.currentTarget.textContent = "⏹ Stop .WebM";
+      document.getElementById("save-toast").textContent = "🎥 Capture vidéo 60 FPS en cours...";
+    } else {
+      const res = viewportRecorder.stop();
+      e.currentTarget.textContent = "🎥 Clip .WebM";
+      document.getElementById("save-toast").textContent =
+        `✓ Clip enregistré : ${res.fileName} (${res.durationText})`;
+    }
+  });
+
   const shaders = ["mode-crt", "mode-lcd", "mode-clean"];
   const shaderLabels = [
     "📺 Shader : CRT Scanlines",
@@ -1129,7 +1221,7 @@ function bindEvents() {
   document.getElementById("btn-shader-cycle")?.addEventListener("click", (e) => {
     shaderIdx = (shaderIdx + 1) % shaders.length;
     e.currentTarget.textContent = shaderLabels[shaderIdx];
-    ["screen-1", "screen-2"].forEach((id) => {
+    ["screen-1", "screen-2", "screen-3", "screen-4"].forEach((id) => {
       const el = document.getElementById(id);
       if (!el) return;
       el.classList.remove("mode-crt", "mode-lcd", "mode-clean");
@@ -1174,13 +1266,53 @@ function bindEvents() {
 
   document.getElementById("btn-toggle-dual")?.addEventListener("click", async (e) => {
     state.dualLinkMode = !state.dualLinkMode;
+    if (!state.dualLinkMode) {
+      state.quadLinkMode = false;
+      document.getElementById("bezel-p3").style.display = "none";
+      document.getElementById("bezel-p4").style.display = "none";
+      document.getElementById("screens-wrap").classList.remove("quad-mode");
+      const quadBtn = document.getElementById("btn-toggle-quad");
+      if (quadBtn) quadBtn.textContent = "🏆 Tournoi 4P : OFF";
+    }
     document.getElementById("bezel-p2").style.display = state.dualLinkMode ? "flex" : "none";
-    document.getElementById("screens-wrap").classList.toggle("dual-mode", state.dualLinkMode);
-    e.currentTarget.textContent = `🔗 Multi-Instance 2P : ${state.dualLinkMode ? "ACTIF" : "OFF"}`;
+    document.getElementById("screens-wrap").classList.toggle("dual-mode", state.dualLinkMode && !state.quadLinkMode);
+    e.currentTarget.textContent = `🔗 Link 2P : ${state.dualLinkMode ? "ACTIF" : "OFF"}`;
     document.getElementById("link-status-pill").textContent = state.dualLinkMode
       ? "🔗 Câble Link 2P Synchronisé"
       : "Mode 1P Solo";
     await invokeBackend("set_dual_link_enabled", { enabled: state.dualLinkMode });
+  });
+
+  document.getElementById("btn-toggle-quad")?.addEventListener("click", async (e) => {
+    state.quadLinkMode = !state.quadLinkMode;
+    if (state.quadLinkMode) {
+      state.dualLinkMode = true;
+    }
+    const wrap = document.getElementById("screens-wrap");
+    wrap.classList.remove("dual-mode");
+    wrap.classList.toggle("quad-mode", state.quadLinkMode);
+    document.getElementById("bezel-p2").style.display = state.quadLinkMode || state.dualLinkMode ? "flex" : "none";
+    document.getElementById("bezel-p3").style.display = state.quadLinkMode ? "flex" : "none";
+    document.getElementById("bezel-p4").style.display = state.quadLinkMode ? "flex" : "none";
+    e.currentTarget.textContent = `🏆 Tournoi 4P : ${state.quadLinkMode ? "ACTIF" : "OFF"}`;
+    document.getElementById("link-status-pill").textContent = state.quadLinkMode
+      ? "🏆 Tournoi 4P Multi-SIO"
+      : state.dualLinkMode
+        ? "🔗 Câble Link 2P Synchronisé"
+        : "Mode 1P Solo";
+    await invokeBackend("set_quad_link_enabled", { enabled: state.quadLinkMode });
+  });
+
+  document.getElementById("btn-dbg-pause")?.addEventListener("click", (e) => {
+    state.debuggerPaused = !state.debuggerPaused;
+    e.currentTarget.textContent = state.debuggerPaused ? "▶ Reprendre" : "⏸ Pause CPU";
+  });
+
+  document.getElementById("btn-dbg-step")?.addEventListener("click", () => {
+    state.debuggerPaused = true;
+    state.stepOnceRequested = true;
+    const pauseBtn = document.getElementById("btn-dbg-pause");
+    if (pauseBtn) pauseBtn.textContent = "▶ Reprendre";
   });
 
   document.getElementById("btn-speed-cycle")?.addEventListener("click", (e) => {
@@ -1245,6 +1377,7 @@ async function init() {
   if (boot) {
     applyBootstrap(boot);
   }
+  await refreshDebuggerDrawer();
   requestAnimationFrame(tickEmulationLoop);
 }
 
