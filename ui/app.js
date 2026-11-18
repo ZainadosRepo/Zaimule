@@ -156,6 +156,22 @@ const FALLBACK_CATALOG = [
     coverSymbol: "🏎️"
   },
   {
+    id: "psp-pulse-horizon",
+    title: "Pulse Horizon : Widescreen 333MHz (PSP)",
+    console: "PSP",
+    engineKind: "nativeRust",
+    coreId: "zaimule-rust-psp",
+    region: "EUR · FR (MIPS Allegrex + VFPU 16:9 Inclus)",
+    crc32Hex: "77E49C01",
+    sizeBytes: 65536,
+    sramSummary: "64 Ko Memory Stick PRO Duo (.msd) + Ad-Hoc WLAN",
+    playtimeSeconds: 21600,
+    favorite: true,
+    linkCableReady: true,
+    coverAccent: "#0284c7",
+    coverSymbol: "🛸"
+  },
+  {
     id: "chip8-space-interceptor",
     title: "Space Interceptor VIP (CHIP-8)",
     console: "CHIP8",
@@ -207,6 +223,38 @@ let state = {
       enabled: false
     }
   ],
+  memoryWatchpoints: [
+    {
+      id: "wp-c100",
+      label: "Coordonnée X / Vélocité Joueur",
+      addr: 0xc100,
+      addrHex: "0xC100",
+      currentValue: 0x48,
+      previousValue: 0x48,
+      frozen: false,
+      frozenValue: 0x48
+    },
+    {
+      id: "wp-c104",
+      label: "État & Cadence Tir Plasma",
+      addr: 0xc104,
+      addrHex: "0xC104",
+      currentValue: 0x01,
+      previousValue: 0x00,
+      frozen: false,
+      frozenValue: 0x01
+    },
+    {
+      id: "wp-c108",
+      label: "Compteur Score / Énergie Arène",
+      addr: 0xc108,
+      addrHex: "0xC108",
+      currentValue: 0x64,
+      previousValue: 0x50,
+      frozen: false,
+      frozenValue: 0x64
+    }
+  ],
   achievements: [
     {
       id: "ach-first-orb",
@@ -252,6 +300,24 @@ let state = {
   macros: [
     { id: "macro-shiny-reset", name: "✨ Soft-Reset Starter & Dialogue Rapide" },
     { id: "macro-fast-battle", name: "⚔ Boucle Expédition & Tir Plasma" }
+  ],
+  tasTimeline: [
+    {
+      segmentIndex: 0,
+      startFrame: 0,
+      endFrame: 3,
+      durationFrames: 4,
+      buttonsMask: 0x0f,
+      buttonsLabel: "↑+↓+←+→"
+    },
+    {
+      segmentIndex: 1,
+      startFrame: 4,
+      endFrame: 21,
+      durationFrames: 18,
+      buttonsMask: 0x01,
+      buttonsLabel: "A"
+    }
   ],
   netplayRooms: [
     {
@@ -707,6 +773,7 @@ function renderSidebarCounts() {
   setTxt("count-megadrive", counts.MEGADRIVE);
   setTxt("count-nds", counts.NDS);
   setTxt("count-ps1", counts.PS1);
+  setTxt("count-psp", counts.PSP);
   setTxt("count-chip8", counts.CHIP8);
   setTxt("count-rust", counts.RUST);
   setTxt("count-link", counts.LINK);
@@ -981,6 +1048,60 @@ function renderKeymapperAndMacros() {
       macrosList.appendChild(row);
     }
   }
+
+  const tasList = document.getElementById("tas-timeline-list");
+  if (tasList) {
+    tasList.innerHTML = "";
+    for (const seg of (state.tasTimeline || []).slice(0, 4)) {
+      const row = document.createElement("div");
+      row.className = "mod-item";
+      row.style.fontSize = "10.5px";
+      row.innerHTML = `
+        <span>F${seg.startFrame}..${seg.endFrame} (${seg.durationFrames}f) · <strong style="color:var(--gold)">${seg.buttonsLabel}</strong></span>
+        <button class="btn mono" style="padding:1px 6px; font-size:9.5px;">⚡ +A</button>
+      `;
+      row.querySelector("button").addEventListener("click", async () => {
+        const boot = await invokeBackend("toggle_tas_timeline_button", {
+          macroId: state.activeMacroId,
+          segmentIndex: seg.segmentIndex,
+          buttonBit: BTN_A
+        });
+        if (boot) applyBootstrap(boot);
+        else {
+          seg.buttonsMask ^= BTN_A;
+          seg.buttonsLabel = seg.buttonsMask ? `0x${seg.buttonsMask.toString(16).toUpperCase()}` : "∅";
+          renderKeymapperAndMacros();
+        }
+      });
+      tasList.appendChild(row);
+    }
+  }
+
+  const wpList = document.getElementById("watchpoints-list");
+  if (wpList) {
+    wpList.innerHTML = "";
+    for (const wp of state.memoryWatchpoints || []) {
+      const row = document.createElement("div");
+      row.className = "mod-item";
+      row.style.fontSize = "10.5px";
+      const hexVal = `0x${(wp.currentValue ?? 0).toString(16).padStart(2, "0").toUpperCase()}`;
+      row.innerHTML = `
+        <span><strong style="color:var(--cobalt)">${wp.addrHex}</strong> ${wp.label} : <strong style="color:var(--phosphor-green)">${hexVal}</strong></span>
+        <button class="btn mono" style="padding:1px 6px; font-size:9.5px; color:${wp.frozen ? "var(--gold)" : "var(--text-muted)"};">
+          ${wp.frozen ? "🔒 Gelé" : "🔓 Pin"}
+        </button>
+      `;
+      row.querySelector("button").addEventListener("click", async () => {
+        const boot = await invokeBackend("toggle_watchpoint_freeze", { watchId: wp.id });
+        if (boot) applyBootstrap(boot);
+        else {
+          wp.frozen = !wp.frozen;
+          renderKeymapperAndMacros();
+        }
+      });
+      wpList.appendChild(row);
+    }
+  }
 }
 
 function renderNetplayAndCores() {
@@ -1250,10 +1371,12 @@ function applyBootstrap(boot) {
   state.catalog = boot.catalog || state.catalog;
   state.modLayers = boot.modLayers || state.modLayers;
   state.cheatCodes = boot.cheatCodes || state.cheatCodes;
+  state.memoryWatchpoints = boot.memoryWatchpoints || state.memoryWatchpoints;
   state.achievements = boot.achievements || state.achievements;
   state.saveSlots = boot.saveSlots || state.saveSlots;
   state.keymapperWidgets = boot.keymapperWidgets || state.keymapperWidgets;
   state.macros = boot.macros || state.macros;
+  state.tasTimeline = boot.tasTimeline || state.tasTimeline;
   state.netplayRooms = boot.netplayRooms || state.netplayRooms;
   state.udpLocalPort = boot.udpLocalPort || state.udpLocalPort;
   state.stunCandidate = boot.stunCandidate || state.stunCandidate;
@@ -1751,7 +1874,7 @@ function bindEvents() {
         new TextEncoder().encode(
           JSON.stringify({
             magic: "ZAIMULE_PACK_V1",
-            version: "0.7.0",
+            version: "1.0.0",
             activeGameId: state.activeGameId,
             cheatCodes: state.cheatCodes,
             macros: state.macros
@@ -1825,6 +1948,31 @@ function bindEvents() {
       renderInspector();
     }
     inp.value = "";
+  });
+
+  document.getElementById("btn-add-watchpoint")?.addEventListener("click", async () => {
+    const inp = document.getElementById("ram-scan-input");
+    const rawAddr = inp?.value?.trim() || "0xC110=7F";
+    const boot = await invokeBackend("add_memory_watchpoint", {
+      rawAddr,
+      label: `Pin ${rawAddr.toUpperCase()}`,
+      frozen: true
+    });
+    if (boot) {
+      applyBootstrap(boot);
+    } else {
+      state.memoryWatchpoints.unshift({
+        id: `wp-${Date.now()}`,
+        label: `Pin ${rawAddr.toUpperCase()}`,
+        addr: 0xc110,
+        addrHex: rawAddr.split("=")[0].toUpperCase(),
+        currentValue: 0x7f,
+        previousValue: 0x7f,
+        frozen: true,
+        frozenValue: 0x7f
+      });
+      renderKeymapperAndMacros();
+    }
   });
 
   document.getElementById("btn-scan-ram")?.addEventListener("click", async () => {
@@ -1911,14 +2059,18 @@ function bindEvents() {
       state.upscalerMode === "OFF"
         ? "SCALE2X"
         : state.upscalerMode === "SCALE2X"
-          ? "BLOOM"
-          : "OFF";
+          ? "XBRZ"
+          : state.upscalerMode === "XBRZ"
+            ? "BLOOM"
+            : "OFF";
     const label =
       state.upscalerMode === "SCALE2X"
         ? "✨ Upscaler : Scale2x EPX"
-        : state.upscalerMode === "BLOOM"
-          ? "✨ Upscaler : CRT Bloom"
-          : "✨ Upscaler : Natif 1x";
+        : state.upscalerMode === "XBRZ"
+          ? "✨ Upscaler : xBRZ 2x"
+          : state.upscalerMode === "BLOOM"
+            ? "✨ Upscaler : CRT Bloom"
+            : "✨ Upscaler : Natif 1x";
     e.currentTarget.textContent = label;
   });
 

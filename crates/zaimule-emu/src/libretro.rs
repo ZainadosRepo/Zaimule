@@ -57,6 +57,21 @@ pub struct LibretroInspectionReport {
     pub symbols_total: usize,
 }
 
+/// Converts a `RETRO_PIXEL_FORMAT_0RGB1555` (`RGB0555`) framebuffer into packed RGBA8888 bytes.
+pub fn convert_rgb0555_to_rgba8888(pixels_555: &[u16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pixels_555.len() * 4);
+    for &px in pixels_555 {
+        let r5 = ((px >> 10) & 0x1F) as u8;
+        let g5 = ((px >> 5) & 0x1F) as u8;
+        let b5 = (px & 0x1F) as u8;
+        let r = (r5 << 3) | (r5 >> 2);
+        let g = (g5 << 3) | (g5 >> 2);
+        let b = (b5 << 3) | (b5 >> 2);
+        out.extend_from_slice(&[r, g, b, 255]);
+    }
+    out
+}
+
 /// Converts a `RETRO_PIXEL_FORMAT_RGB565` framebuffer into packed RGBA8888 bytes for WebGL2/Canvas.
 pub fn convert_rgb565_to_rgba8888(pixels_565: &[u16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(pixels_565.len() * 4);
@@ -231,6 +246,66 @@ pub fn default_libretro_cores() -> Vec<LibretroCoreDescriptor> {
             verified_crc32_hex: None,
             status_label: "Pont C-ABI Prêt · Cliquer pour Provisionner".into(),
         },
+        LibretroCoreDescriptor {
+            core_id: "mupen64plus_next_libretro".into(),
+            display_name: "Mupen64Plus-Next (Nintendo 64 · ParaLLEl RDP)".into(),
+            console: ConsoleKind::N64,
+            library_windows: "mupen64plus_next_libretro.dll".into(),
+            library_macos: "mupen64plus_next_libretro.dylib".into(),
+            library_linux: "mupen64plus_next_libretro.so".into(),
+            buildbot_windows_url:
+                "https://buildbot.libretro.com/nightly/windows/x86_64/latest/mupen64plus_next_libretro.dll.zip"
+                    .into(),
+            buildbot_macos_url:
+                "https://buildbot.libretro.com/nightly/apple/osx/arm64/latest/mupen64plus_next_libretro.dylib.zip"
+                    .into(),
+            pixel_format: RetroPixelFormat::Xrgb8888,
+            supports_savestates: true,
+            supports_sram: true,
+            installed: false,
+            verified_crc32_hex: None,
+            status_label: "Pont C-ABI Prêt · Cliquer pour Provisionner".into(),
+        },
+        LibretroCoreDescriptor {
+            core_id: "genesis_plus_gx_libretro".into(),
+            display_name: "Genesis Plus GX (Mega Drive / Genesis · YM2612)".into(),
+            console: ConsoleKind::Megadrive,
+            library_windows: "genesis_plus_gx_libretro.dll".into(),
+            library_macos: "genesis_plus_gx_libretro.dylib".into(),
+            library_linux: "genesis_plus_gx_libretro.so".into(),
+            buildbot_windows_url:
+                "https://buildbot.libretro.com/nightly/windows/x86_64/latest/genesis_plus_gx_libretro.dll.zip"
+                    .into(),
+            buildbot_macos_url:
+                "https://buildbot.libretro.com/nightly/apple/osx/arm64/latest/genesis_plus_gx_libretro.dylib.zip"
+                    .into(),
+            pixel_format: RetroPixelFormat::Rgb565,
+            supports_savestates: true,
+            supports_sram: true,
+            installed: false,
+            verified_crc32_hex: None,
+            status_label: "Pont C-ABI Prêt · Cliquer pour Provisionner".into(),
+        },
+        LibretroCoreDescriptor {
+            core_id: "ppsspp_libretro".into(),
+            display_name: "PPSSPP (PlayStation Portable · Allegrex 16:9)".into(),
+            console: ConsoleKind::Psp,
+            library_windows: "ppsspp_libretro.dll".into(),
+            library_macos: "ppsspp_libretro.dylib".into(),
+            library_linux: "ppsspp_libretro.so".into(),
+            buildbot_windows_url:
+                "https://buildbot.libretro.com/nightly/windows/x86_64/latest/ppsspp_libretro.dll.zip"
+                    .into(),
+            buildbot_macos_url:
+                "https://buildbot.libretro.com/nightly/apple/osx/arm64/latest/ppsspp_libretro.dylib.zip"
+                    .into(),
+            pixel_format: RetroPixelFormat::Xrgb8888,
+            supports_savestates: true,
+            supports_sram: true,
+            installed: false,
+            verified_crc32_hex: None,
+            status_label: "Pont C-ABI Prêt · Cliquer pour Provisionner".into(),
+        },
     ]
 }
 
@@ -239,7 +314,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn converts_rgb565_white_and_black_pixels_accurately() {
+    fn converts_rgb0555_and_rgb565_white_and_black_pixels_accurately() {
+        let rgba555 = convert_rgb0555_to_rgba8888(&[0x7FFF, 0x0000]);
+        assert_eq!(&rgba555[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&rgba555[4..8], &[0, 0, 0, 255]);
+
         let rgba = convert_rgb565_to_rgba8888(&[0xFFFF, 0x0000]);
         assert_eq!(&rgba[0..4], &[255, 255, 255, 255]);
         assert_eq!(&rgba[4..8], &[0, 0, 0, 255]);
@@ -256,8 +335,9 @@ mod tests {
             "Linux ELF64 (.so)"
         );
 
-        let stub = build_verified_libretro_stub("mgba_libretro");
+        let stub = build_verified_libretro_stub("ppsspp_libretro");
         let report = inspect_libretro_binary(&stub).unwrap();
         assert_eq!(report.symbols_found, REQUIRED_LIBRETRO_SYMBOLS.len());
+        assert_eq!(default_libretro_cores().len(), 7);
     }
 }

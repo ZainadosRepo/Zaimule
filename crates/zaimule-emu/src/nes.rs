@@ -25,6 +25,12 @@ pub struct NesCore {
     pub pc: u16,
     pub status: u8,
     pub mapper_id: u8,
+    pub prg_bank_lo: usize,
+    pub chr_bank: usize,
+    pub mmc1_shift: u8,
+    pub mmc1_count: u8,
+    pub mmc3_bank_select: u8,
+    pub mmc3_irq_latch: u8,
     pub cycles: u64,
     pub frame_number: u64,
     pub hero_x: u8,
@@ -52,6 +58,12 @@ impl Default for NesCore {
             pc: 0x8000,
             status: 0x24,
             mapper_id: 0,
+            prg_bank_lo: 0,
+            chr_bank: 0,
+            mmc1_shift: 0x10,
+            mmc1_count: 0,
+            mmc3_bank_select: 0,
+            mmc3_irq_latch: 0,
             cycles: 0,
             frame_number: 0,
             hero_x: 120,
@@ -73,6 +85,89 @@ impl NesCore {
         Self::default()
     }
 
+    /// Reads a byte from the 6502 CPU 16-bit address space (`$0000..=$FFFF`), resolving
+    /// NROM (0), MMC1 (1), UxROM (2), CNROM (3), and MMC3 (4) PRG-ROM banks.
+    pub fn read_cpu_byte(&self, addr: u16) -> u8 {
+        match addr {
+            0x0000..=0x1FFF => self.ram[(addr as usize) & 0x07FF],
+            0x6000..=0x7FFF => self.sram[(addr as usize) - 0x6000],
+            0x8000..=0xBFFF => {
+                let bank_offset = self.prg_bank_lo.saturating_mul(0x4000);
+                let idx = (bank_offset + ((addr as usize) - 0x8000)) % self.prg_rom.len().max(1);
+                self.prg_rom[idx]
+            }
+            0xC000..=0xFFFF => {
+                // Fixed to last 16 KiB PRG bank for UxROM/MMC1/MMC3, or mirrored for 16 KiB NROM
+                let last_bank_base = self.prg_rom.len().saturating_sub(0x4000);
+                let idx = (last_bank_base + ((addr as usize) - 0xC000)) % self.prg_rom.len().max(1);
+                self.prg_rom[idx]
+            }
+            _ => 0x00,
+        }
+    }
+
+    /// Writes a byte to the 6502 CPU 16-bit address space, handling RAM, PRG-RAM,
+    /// and hardware mapper registers (MMC1 shift register, UxROM PRG select, CNROM CHR select, MMC3 bank select).
+    pub fn write_cpu_byte(&mut self, addr: u16, val: u8) {
+        match addr {
+            0x0000..=0x1FFF => {
+                self.ram[(addr as usize) & 0x07FF] = val;
+            }
+            0x6000..=0x7FFF => {
+                self.sram[(addr as usize) - 0x6000] = val;
+            }
+            0x8000..=0xFFFF => match self.mapper_id {
+                1 => {
+                    // MMC1 (SxROM) 5-write serial shift register
+                    if (val & 0x80) != 0 {
+                        self.mmc1_shift = 0x10;
+                        self.mmc1_count = 0;
+                    } else {
+                        self.mmc1_shift = (self.mmc1_shift >> 1) | ((val & 1) << 4);
+                        self.mmc1_count += 1;
+                        if self.mmc1_count >= 5 {
+                            let reg_val = (self.mmc1_shift & 0x1F) as usize;
+                            if addr >= 0xE000 {
+                                self.prg_bank_lo = reg_val & 0x0F;
+                            } else if (0xA000..=0xDFFF).contains(&addr) {
+                                self.chr_bank = reg_val;
+                            }
+                            self.mmc1_shift = 0x10;
+                            self.mmc1_count = 0;
+                        }
+                    }
+                }
+                2 => {
+                    // UxROM: 16 KiB switchable PRG-ROM bank at $8000..$BFFF
+                    self.prg_bank_lo = (val & 0x0F) as usize;
+                }
+                3 => {
+                    // CNROM: 8 KiB switchable CHR-ROM bank
+                    self.chr_bank = (val & 0x03) as usize;
+                }
+                4 => {
+                    // MMC3 (TxROM): Even/Odd register pairs ($8000/$8001, $C000/$C001)
+                    if addr < 0xA000 {
+                        if (addr & 1) == 0 {
+                            self.mmc3_bank_select = val;
+                        } else {
+                            let target = self.mmc3_bank_select & 0x07;
+                            if target >= 6 {
+                                self.prg_bank_lo = (val & 0x3F) as usize;
+                            } else {
+                                self.chr_bank = val as usize;
+                            }
+                        }
+                    } else if (0xC000..=0xDFFF).contains(&addr) && (addr & 1) == 0 {
+                        self.mmc3_irq_latch = val;
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
     fn set_zn(&mut self, val: u8) {
         if val == 0 {
             self.status |= 0x02;
@@ -88,9 +183,9 @@ impl NesCore {
 
     fn step_6502(&mut self, buttons_mask: u16) {
         for _ in 0..64 {
-            let offset = (self.pc.saturating_sub(0x8000) as usize) % self.prg_rom.len().max(1);
-            let op = self.prg_rom[offset];
-            self.pc = self.pc.wrapping_add(1);
+            let op = self.read_cpu_byte(self.pc);
+            let next_pc = self.pc.wrapping_add(1);
+            self.pc = next_pc;
             self.cycles = self.cycles.wrapping_add(2);
 
             match op {
@@ -112,14 +207,14 @@ impl NesCore {
                     self.set_zn(self.y);
                 }
                 0xA9 => {
-                    let imm = self.prg_rom[(offset + 1) % self.prg_rom.len().max(1)];
+                    let imm = self.read_cpu_byte(self.pc);
                     self.pc = self.pc.wrapping_add(1);
                     self.a = imm;
                     self.set_zn(self.a);
                 }
                 0x4C => {
-                    let lo = self.prg_rom[(offset + 1) % self.prg_rom.len().max(1)] as u16;
-                    let hi = self.prg_rom[(offset + 2) % self.prg_rom.len().max(1)] as u16;
+                    let lo = self.read_cpu_byte(self.pc) as u16;
+                    let hi = self.read_cpu_byte(self.pc.wrapping_add(1)) as u16;
                     self.pc = (hi << 8) | lo;
                 }
                 _ => {
@@ -388,5 +483,38 @@ mod tests {
         assert_eq!(out.height, 240);
         assert_eq!(out.rgba.len(), 256 * 240 * 4);
         assert!(nes.cycles > 0);
+    }
+
+    #[test]
+    fn nes_mappers_uxrom_mmc1_and_mmc3_switch_banks_accurately() {
+        let mut nes = NesCore::new();
+        nes.prg_rom = vec![0u8; 4 * 0x4000]; // 4 x 16 KiB PRG banks
+        nes.prg_rom[0x0000] = 0x11; // Bank 0
+        nes.prg_rom[0x4000] = 0x22; // Bank 1
+        nes.prg_rom[0x8000] = 0x33; // Bank 2
+        nes.prg_rom[0xC000] = 0x44; // Bank 3 (Last fixed bank)
+
+        // UxROM (Mapper 2): switch $8000..$BFFF to Bank 2 while $C000..$FFFF remains Bank 3
+        nes.mapper_id = 2;
+        nes.write_cpu_byte(0x8000, 2);
+        assert_eq!(nes.read_cpu_byte(0x8000), 0x33);
+        assert_eq!(nes.read_cpu_byte(0xC000), 0x44);
+
+        // MMC1 (Mapper 1): 5 serial bit writes to $E000 to select Bank 1 (0b00001)
+        nes.mapper_id = 1;
+        nes.write_cpu_byte(0x8000, 0x80); // Reset shift register
+        for bit in [1u8, 0, 0, 0, 0] {
+            nes.write_cpu_byte(0xE000, bit);
+        }
+        assert_eq!(nes.prg_bank_lo, 1);
+        assert_eq!(nes.read_cpu_byte(0x8000), 0x22);
+
+        // MMC3 (Mapper 4): Select R6 ($8000 = 6), set PRG bank 2 ($8001 = 2) and IRQ latch ($C000 = 42)
+        nes.mapper_id = 4;
+        nes.write_cpu_byte(0x8000, 6);
+        nes.write_cpu_byte(0x8001, 2);
+        nes.write_cpu_byte(0xC000, 42);
+        assert_eq!(nes.prg_bank_lo, 2);
+        assert_eq!(nes.mmc3_irq_latch, 42);
     }
 }

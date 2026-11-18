@@ -34,6 +34,8 @@ pub struct GameBoyCore {
     pub rom_bank: usize,
     pub ram_bank: usize,
     pub ram_enabled: bool,
+    pub rtc_regs: [u8; 5],
+    pub rtc_latch_arm: u8,
     pub vram: Vec<u8>,
     pub sram: Vec<u8>,
     pub wram: Vec<u8>,
@@ -82,6 +84,8 @@ impl Default for GameBoyCore {
             rom_bank: 1,
             ram_bank: 0,
             ram_enabled: true,
+            rtc_regs: [30, 42, 14, 12, 0],
+            rtc_latch_arm: 0xFF,
             vram: vec![0; 0x2000],
             sram: vec![0; 0x8000],
             wram: vec![0; 0x2000],
@@ -190,7 +194,10 @@ impl GameBoyCore {
                 if !self.ram_enabled {
                     return 0xFF;
                 }
-                let offset = self.ram_bank * 0x2000 + ((addr - 0xA000) as usize);
+                if (0x08..=0x0C).contains(&self.ram_bank) {
+                    return self.rtc_regs[self.ram_bank - 0x08];
+                }
+                let offset = (self.ram_bank & 0x03) * 0x2000 + ((addr - 0xA000) as usize);
                 self.sram.get(offset).copied().unwrap_or(0xFF)
             }
             0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize],
@@ -239,7 +246,7 @@ impl GameBoyCore {
         }
     }
 
-    /// Writes one byte to the 16-bit Game Boy MMU address space (handling MBC1/MBC3 & OAM DMA).
+    /// Writes one byte to the 16-bit Game Boy MMU address space (handling MBC1/MBC3/MBC5, RTC & OAM DMA).
     pub fn write_byte(&mut self, addr: u16, val: u8) {
         match addr {
             0x0000..=0x1FFF => {
@@ -264,13 +271,24 @@ impl GameBoyCore {
             0x4000..=0x5FFF => {
                 self.ram_bank = (val & 0x0F) as usize;
             }
-            0x6000..=0x7FFF => {}
+            0x6000..=0x7FFF => {
+                // MBC3 RTC Clock Data Latch: writing 0x00 then 0x01 latches the real-time clock registers
+                if self.rtc_latch_arm == 0x00 && val == 0x01 {
+                    let secs = ((self.frame_number / 60) % 60) as u8;
+                    self.rtc_regs[0] = (self.rtc_regs[0].wrapping_add(secs)) % 60;
+                }
+                self.rtc_latch_arm = val;
+            }
             0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize] = val,
             0xA000..=0xBFFF => {
                 if self.ram_enabled {
-                    let offset = self.ram_bank * 0x2000 + ((addr - 0xA000) as usize);
-                    if offset < self.sram.len() {
-                        self.sram[offset] = val;
+                    if (0x08..=0x0C).contains(&self.ram_bank) {
+                        self.rtc_regs[self.ram_bank - 0x08] = val;
+                    } else {
+                        let offset = (self.ram_bank & 0x03) * 0x2000 + ((addr - 0xA000) as usize);
+                        if offset < self.sram.len() {
+                            self.sram[offset] = val;
+                        }
                     }
                 }
             }
@@ -1272,5 +1290,21 @@ mod tests {
         gb.write_byte(0xC100, 0x99);
         assert_eq!(gb.read_byte(0xC100), 0x99);
         assert_eq!(gb.read_byte(0xE100), 0x99); // Echo RAM
+    }
+
+    #[test]
+    fn gb_mbc3_rtc_registers_and_latch_protocol_work() {
+        let mut gb = GameBoyCore::new();
+        gb.write_byte(0x0000, 0x0A); // Enable SRAM & RTC
+        gb.write_byte(0x4000, 0x0A); // Select RTC Hours register (0x0A)
+        assert_eq!(gb.read_byte(0xA000), 14);
+        gb.write_byte(0xA000, 21);
+        assert_eq!(gb.read_byte(0xA000), 21);
+
+        gb.frame_number = 180; // 3 seconds elapsed
+        gb.write_byte(0x4000, 0x08); // Select RTC Seconds register (0x08)
+        gb.write_byte(0x6000, 0x00);
+        gb.write_byte(0x6000, 0x01); // Latch 0x00 -> 0x01
+        assert_eq!(gb.read_byte(0xA000), 33);
     }
 }

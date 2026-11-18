@@ -19,6 +19,7 @@ use crate::n64::{build_n64_star_wing_rom, N64Core};
 use crate::nds::{build_nds_dual_phantom_rom, NdsCore};
 use crate::nes::{build_nes_chrono_knight_rom, NesCore};
 use crate::ps1::{build_ps1_cyber_ridge_rom, Ps1Core};
+use crate::psp::{build_psp_wipeout_pulse_rom, PspCore};
 use crate::snes::{build_snes_valkyrie_mode7_rom, SnesCore};
 use crate::traits::{EmulatorBackend, FrameStepResult};
 use serde::{Deserialize, Serialize};
@@ -29,13 +30,14 @@ use zaimule_core::catalog::{
     ConsoleKind, CoreEngineKind, GameEntry,
 };
 use zaimule_core::cheats::{
-    default_achievements, default_cheat_codes, parse_cheat_code, scan_ram_for_exact_byte,
-    AchievementEntry, CheatCodeEntry,
+    default_achievements, default_cheat_codes, default_memory_watchpoints, parse_cheat_code,
+    parse_watchpoint_address, scan_ram_for_exact_byte, AchievementEntry, CheatCodeEntry,
+    MemoryWatchpoint,
 };
 use zaimule_core::keymap::{apply_turbo_mask, default_keymapper_widgets, KeymapWidget};
 use zaimule_core::macros::{
     default_ghost_leaderboard, default_macros, verify_and_build_ghost_entry, GhostLeaderboardEntry,
-    MacroSequence,
+    MacroSequence, TasTimelineRow,
 };
 use zaimule_core::netplay::{
     default_netplay_chat, default_netplay_rooms, default_tournament_bracket,
@@ -63,11 +65,13 @@ pub struct StationBootstrap {
     pub mod_layers: Vec<ModLayerEntry>,
     pub community_mods: Vec<CommunityModPackage>,
     pub cheat_codes: Vec<CheatCodeEntry>,
+    pub memory_watchpoints: Vec<MemoryWatchpoint>,
     pub achievements: Vec<AchievementEntry>,
     pub save_slots: Vec<SaveStateSlotInfo>,
     pub sram_hex_inspection: SramHexInspection,
     pub keymapper_widgets: Vec<KeymapWidget>,
     pub macros: Vec<MacroSequence>,
+    pub tas_timeline: Vec<TasTimelineRow>,
     pub ghost_leaderboard: Vec<GhostLeaderboardEntry>,
     pub netplay_rooms: Vec<NetplayRoom>,
     pub netplay_chat: Vec<NetplayChatMessage>,
@@ -105,6 +109,7 @@ pub struct EmulatorSession {
     pub mod_layers: Vec<ModLayerEntry>,
     pub community_mods: Vec<CommunityModPackage>,
     pub cheat_codes: Vec<CheatCodeEntry>,
+    pub memory_watchpoints: Vec<MemoryWatchpoint>,
     pub achievements: Vec<AchievementEntry>,
     pub keymapper_widgets: Vec<KeymapWidget>,
     pub macros: Vec<MacroSequence>,
@@ -169,6 +174,11 @@ fn build_core_for(console: ConsoleKind, rom: &[u8]) -> Result<Box<dyn EmulatorBa
             c.load_rom(rom)?;
             Ok(Box::new(c))
         }
+        ConsoleKind::Psp => {
+            let mut c = PspCore::new();
+            c.load_rom(rom)?;
+            Ok(Box::new(c))
+        }
         ConsoleKind::Megadrive => {
             let mut c = MegaDriveCore::new();
             c.load_rom(rom)?;
@@ -199,6 +209,7 @@ impl EmulatorSession {
             mod_layers: default_mod_layers(),
             community_mods: default_community_mods(),
             cheat_codes: default_cheat_codes(),
+            memory_watchpoints: default_memory_watchpoints(),
             achievements: default_achievements(),
             keymapper_widgets: default_keymapper_widgets(),
             macros: default_macros(),
@@ -214,7 +225,14 @@ impl EmulatorSession {
             rewind_buffer: RewindBuffer::new(240), // 240 snapshots @ 4Hz = 60s
             save_states_ram: HashMap::new(),
             custom_roms: HashMap::new(),
-            breakpoints: vec![0x0150, 0x0800_00C0, 0x8001_0000, 0x8000_0400, 0x0000_0200],
+            breakpoints: vec![
+                0x0150,
+                0x0800_00C0,
+                0x8001_0000,
+                0x8000_0400,
+                0x8000_0100,
+                0x0000_0200,
+            ],
             last_score: 0,
             recent_inputs_trace: Vec::with_capacity(128),
             sram_dirty: false,
@@ -238,6 +256,13 @@ impl EmulatorSession {
     pub fn bootstrap_snapshot(&self) -> StationBootstrap {
         let game = self.active_game();
         let effective_config = resolve_effective_config(&self.settings, &game.id, game.console);
+        let tas_timeline = self
+            .active_macro_id
+            .as_ref()
+            .and_then(|id| self.macros.iter().find(|m| &m.id == id))
+            .or_else(|| self.macros.first())
+            .map(|m| m.timeline_rows())
+            .unwrap_or_default();
         StationBootstrap {
             active_game_id: self.active_game_id.clone(),
             catalog: self.catalog.clone(),
@@ -245,11 +270,13 @@ impl EmulatorSession {
             mod_layers: self.mod_layers.clone(),
             community_mods: self.community_mods.clone(),
             cheat_codes: self.cheat_codes.clone(),
+            memory_watchpoints: self.memory_watchpoints.clone(),
             achievements: self.achievements.clone(),
             save_slots: self.list_save_slots_for(&self.active_game_id),
             sram_hex_inspection: inspect_sram_hex(self.core_p1.sram(), 0, 4),
             keymapper_widgets: self.keymapper_widgets.clone(),
             macros: self.macros.clone(),
+            tas_timeline,
             ghost_leaderboard: self.ghost_leaderboard.clone(),
             netplay_rooms: self.netplay_rooms.clone(),
             netplay_chat: self.netplay_chat.clone(),
@@ -294,6 +321,7 @@ impl EmulatorSession {
             ConsoleKind::Snes => build_snes_valkyrie_mode7_rom(),
             ConsoleKind::Ps1 => build_ps1_cyber_ridge_rom(),
             ConsoleKind::N64 => build_n64_star_wing_rom(),
+            ConsoleKind::Psp => build_psp_wipeout_pulse_rom(),
             ConsoleKind::Megadrive => build_md_supersonic_rom(),
             ConsoleKind::Nes => build_nes_chrono_knight_rom(),
             _ => build_gb_pocket_arena_rom(),
@@ -616,6 +644,13 @@ impl EmulatorSession {
             }
         }
 
+        // Apply frozen Memory Watchpoints before stepping
+        for wp in &self.memory_watchpoints {
+            if wp.frozen {
+                self.core_p1.apply_ram_cheat(wp.addr, wp.frozen_value);
+            }
+        }
+
         // Exchange UDP ZML2 Rollback & Link Cable datagrams if a peer is connected
         if self.udp_node.peer_addr.is_some() {
             let snap = self.core_p1.debug_snapshot();
@@ -647,6 +682,19 @@ impl EmulatorSession {
             ],
             &mut self.link_telemetry,
         );
+
+        let ram_slice = self.core_p1.read_ram_slice();
+        if !ram_slice.is_empty() {
+            for wp in &mut self.memory_watchpoints {
+                wp.previous_value = wp.current_value;
+                if wp.frozen {
+                    wp.current_value = wp.frozen_value;
+                } else {
+                    let idx = (wp.addr as usize) % ram_slice.len();
+                    wp.current_value = ram_slice[idx];
+                }
+            }
+        }
 
         // Evaluate RetroAchievements against live score and Link Cable activity
         let mut newly_unlocked_achievement = None;
@@ -845,7 +893,7 @@ impl EmulatorSession {
         }
         let pack = ZaimulePortablePack {
             magic: PORTABLE_PACK_MAGIC.into(),
-            version: "0.7.0".into(),
+            version: "1.0.0".into(),
             active_game_id: self.active_game_id.clone(),
             sram_rle,
             sram_uncompressed_len: sram_raw.len(),
@@ -1108,6 +1156,80 @@ impl EmulatorSession {
         }
         self.bootstrap_snapshot()
     }
+
+    /// Adds or updates a live RAM Memory Watchpoint (Cheat Engine / Mesen style) with optional freeze pin.
+    pub fn add_memory_watchpoint(
+        &mut self,
+        raw_addr: &str,
+        label: &str,
+        frozen: bool,
+    ) -> Result<StationBootstrap, String> {
+        let mut parts = raw_addr.split('=');
+        let addr_part = parts.next().unwrap_or(raw_addr);
+        let addr = parse_watchpoint_address(addr_part)?;
+        let ram = self.core_p1.read_ram_slice();
+        let ram_val = if !ram.is_empty() {
+            ram[(addr as usize) % ram.len()]
+        } else {
+            0
+        };
+        let explicit_val = parts
+            .next()
+            .and_then(|v| u8::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok());
+        let val = explicit_val.unwrap_or(ram_val);
+        let wp = MemoryWatchpoint {
+            id: format!("wp-{addr:04x}"),
+            label: if label.trim().is_empty() {
+                format!("Watchpoint 0x{addr:04X}")
+            } else {
+                label.trim().to_string()
+            },
+            addr,
+            addr_hex: format!("0x{addr:04X}"),
+            current_value: val,
+            previous_value: ram_val,
+            frozen,
+            frozen_value: val,
+        };
+        self.memory_watchpoints.retain(|w| w.id != wp.id);
+        self.memory_watchpoints.insert(0, wp);
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Toggles whether a Memory Watchpoint freezes/pins its RAM address on every frame.
+    pub fn toggle_watchpoint_freeze(&mut self, watch_id: &str) -> Result<StationBootstrap, String> {
+        for wp in &mut self.memory_watchpoints {
+            if wp.id == watch_id {
+                wp.frozen = !wp.frozen;
+                if wp.frozen {
+                    wp.frozen_value = wp.current_value;
+                }
+            }
+        }
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Toggles a button bit (`BTN_A`, `BTN_B`, `BTN_RIGHT`, etc.) inside a TAS Studio Timeline RLE segment.
+    pub fn toggle_tas_timeline_button(
+        &mut self,
+        macro_id: Option<&str>,
+        segment_index: usize,
+        button_bit: u16,
+    ) -> Result<StationBootstrap, String> {
+        let target_id = macro_id
+            .map(|s| s.to_string())
+            .or_else(|| self.active_macro_id.clone())
+            .or_else(|| self.macros.first().map(|m| m.id.clone()));
+        let Some(id) = target_id else {
+            return Err("aucune séquence macro TAS disponible".into());
+        };
+        let Some(seq) = self.macros.iter_mut().find(|m| m.id == id) else {
+            return Err(format!("séquence macro TAS introuvable : {id}"));
+        };
+        seq.toggle_segment_button(segment_index, button_bit)?;
+        self.active_macro_id = Some(id);
+        Ok(self.bootstrap_snapshot())
+    }
 }
 
 #[cfg(test)]
@@ -1270,5 +1392,27 @@ mod tests {
             tourney_boot.tournament_bracket.champion.as_deref(),
             Some("Zainados")
         );
+    }
+
+    #[test]
+    fn session_runs_psp_core_manages_watchpoints_and_edits_tas_timeline() {
+        let mut session = EmulatorSession::new();
+        session.select_game("psp-pulse-horizon").unwrap();
+        let step_psp = session.step_viewport(BTN_RIGHT | BTN_A, 0, false);
+        assert_eq!(step_psp.primary.width, 480);
+        assert_eq!(step_psp.primary.height, 272);
+        assert!(step_psp.primary.cpu.arch.contains("Allegrex"));
+
+        let wp_boot = session
+            .add_memory_watchpoint("0xC110=7F", "Jauge VFPU", true)
+            .unwrap();
+        assert_eq!(wp_boot.memory_watchpoints[0].addr, 0xC110);
+        assert!(wp_boot.memory_watchpoints[0].frozen);
+
+        let wp_unfrozen = session.toggle_watchpoint_freeze("wp-c110").unwrap();
+        assert!(!wp_unfrozen.memory_watchpoints[0].frozen);
+
+        let tas_boot = session.toggle_tas_timeline_button(None, 0, 0x02).unwrap();
+        assert!(!tas_boot.tas_timeline.is_empty());
     }
 }

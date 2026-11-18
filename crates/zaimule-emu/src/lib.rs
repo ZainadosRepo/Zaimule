@@ -13,6 +13,7 @@ pub mod n64;
 pub mod nds;
 pub mod nes;
 pub mod ps1;
+pub mod psp;
 pub mod session;
 pub mod snes;
 pub mod traits;

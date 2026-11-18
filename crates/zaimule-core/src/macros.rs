@@ -175,6 +175,80 @@ pub fn verify_ghost_entry_integrity(entry: &GhostLeaderboardEntry) -> bool {
     entry.verified_deterministic && expected == entry.inputs_crc32_hex
 }
 
+/// Frame/Segment row exposed to the TAS Studio Timeline Grid in the UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TasTimelineRow {
+    pub segment_index: usize,
+    pub start_frame: u64,
+    pub duration_frames: u32,
+    pub buttons_mask: u16,
+    pub buttons_label: String,
+}
+
+/// Formats a 16-bit joypad bitmask into a human-readable TAS timeline chord label.
+pub fn format_buttons_mask_label(mask: u16) -> String {
+    let mut parts = Vec::new();
+    if (mask & BTN_UP) != 0 {
+        parts.push("↑");
+    }
+    if (mask & BTN_DOWN) != 0 {
+        parts.push("↓");
+    }
+    if (mask & BTN_LEFT) != 0 {
+        parts.push("←");
+    }
+    if (mask & BTN_RIGHT) != 0 {
+        parts.push("→");
+    }
+    if (mask & BTN_A) != 0 {
+        parts.push("A");
+    }
+    if (mask & BTN_B) != 0 {
+        parts.push("B");
+    }
+    if (mask & BTN_START) != 0 {
+        parts.push("START");
+    }
+    if parts.is_empty() {
+        "Neutre (0x00)".into()
+    } else {
+        parts.join(" + ")
+    }
+}
+
+impl MacroSequence {
+    /// Builds the structured TAS Studio Timeline rows for inspection and live button editing.
+    pub fn timeline_rows(&self) -> Vec<TasTimelineRow> {
+        let mut acc = 0u64;
+        let mut rows = Vec::with_capacity(self.segments.len());
+        for (idx, seg) in self.segments.iter().enumerate() {
+            rows.push(TasTimelineRow {
+                segment_index: idx,
+                start_frame: acc,
+                duration_frames: seg.duration_frames,
+                buttons_mask: seg.buttons_mask,
+                buttons_label: format_buttons_mask_label(seg.buttons_mask),
+            });
+            acc += seg.duration_frames as u64;
+        }
+        rows
+    }
+
+    /// Toggles a button bit (`BTN_A`, `BTN_B`, `BTN_RIGHT`, etc.) on a specific TAS timeline segment.
+    pub fn toggle_segment_button(
+        &mut self,
+        segment_index: usize,
+        button_bit: u16,
+    ) -> Result<(), String> {
+        let Some(seg) = self.segments.get_mut(segment_index) else {
+            return Err(format!("segment TAS #{segment_index} introuvable"));
+        };
+        seg.buttons_mask ^= button_bit;
+        Ok(())
+    }
+}
+
 /// Curated global Ghost Leaderboard runs ready for 1-click TAS Ghost Challenge.
 pub fn default_ghost_leaderboard() -> Vec<GhostLeaderboardEntry> {
     vec![
@@ -190,6 +264,20 @@ pub fn default_ghost_leaderboard() -> Vec<GhostLeaderboardEntry> {
                 (BTN_UP | BTN_A) as u8,
                 (BTN_LEFT | BTN_A) as u8,
                 (BTN_UP | BTN_A | BTN_B) as u8,
+            ],
+        ),
+        verify_and_build_ghost_entry(
+            "ghost-psp-pulse",
+            "psp-pulse-horizon",
+            "Pulse Horizon : Widescreen 333MHz (PSP)",
+            "PSP",
+            "Valkyrie_333",
+            540,
+            vec![
+                (BTN_RIGHT | BTN_A | BTN_B) as u8,
+                (BTN_LEFT | BTN_A) as u8,
+                (BTN_UP | BTN_A) as u8,
+                (BTN_RIGHT | BTN_A) as u8,
             ],
         ),
         verify_and_build_ghost_entry(
@@ -239,12 +327,17 @@ mod tests {
         assert_eq!(seq.sample_at_frame(1), Some(BTN_A));
         assert_eq!(seq.sample_at_frame(2), Some(BTN_B));
         assert_eq!(seq.sample_at_frame(3), None);
+
+        seq.toggle_segment_button(0, BTN_RIGHT).unwrap();
+        let rows = seq.timeline_rows();
+        assert_eq!(rows[0].buttons_mask, BTN_A | BTN_RIGHT);
+        assert!(rows[0].buttons_label.contains("→"));
     }
 
     #[test]
     fn ghost_leaderboard_entries_verify_crc32_determinism() {
         let ghosts = default_ghost_leaderboard();
-        assert_eq!(ghosts.len(), 3);
+        assert_eq!(ghosts.len(), 4);
         for g in &ghosts {
             assert!(verify_ghost_entry_integrity(g));
         }

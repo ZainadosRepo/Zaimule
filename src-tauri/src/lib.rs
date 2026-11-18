@@ -638,6 +638,46 @@ fn toggle_tournament_spectator(state: tauri::State<AppState>) -> Result<StationB
 }
 
 #[tauri::command]
+fn add_memory_watchpoint(
+    state: tauri::State<AppState>,
+    raw_addr: String,
+    label: String,
+    frozen: bool,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    session.add_memory_watchpoint(&raw_addr, &label, frozen)
+}
+
+#[tauri::command]
+fn toggle_watchpoint_freeze(
+    state: tauri::State<AppState>,
+    watch_id: String,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    session.toggle_watchpoint_freeze(&watch_id)
+}
+
+#[tauri::command]
+fn toggle_tas_timeline_button(
+    state: tauri::State<AppState>,
+    macro_id: Option<String>,
+    segment_index: usize,
+    button_bit: u16,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    session.toggle_tas_timeline_button(macro_id.as_deref(), segment_index, button_bit)
+}
+
+#[tauri::command]
 fn load_settings(app: AppHandle) -> Result<LoadedJson, String> {
     load_json_atomic(&settings_path(&app)?)
 }
@@ -704,6 +744,9 @@ pub fn run() {
             transfer_sram_p1_to_p2,
             advance_tournament_match,
             toggle_tournament_spectator,
+            add_memory_watchpoint,
+            toggle_watchpoint_freeze,
+            toggle_tas_timeline_button,
             add_cheat_code,
             toggle_cheat_code,
             scan_ram_byte,

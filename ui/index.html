@@ -12,7 +12,7 @@
         <div class="brand-group" data-tauri-drag-region>
           <div class="brand-emblem">Z</div>
           <span class="brand-title">ZAIMULE</span>
-          <span class="brand-sub">Rust Multi-Console Station · v0.7.0</span>
+          <span class="brand-sub">Rust Multi-Console Station · v1.0.0</span>
         </div>
 
         <nav class="nav-tabs" role="tablist">
@@ -49,7 +49,7 @@
       <input
         type="file"
         id="rom-file-input"
-        accept=".gb,.gbc,.gba,.nes,.sfc,.smc,.nds,.psx,.z64,.n64,.md,.gen,.ch8,.rom,.bin"
+        accept=".gb,.gbc,.gba,.nes,.sfc,.smc,.nds,.psx,.pbp,.iso,.cso,.z64,.n64,.md,.gen,.ch8,.rom,.bin"
         style="display: none;"
       />
       <input
@@ -105,6 +105,10 @@
             <button class="console-btn" data-console="PS1">
               <span>💿 PlayStation 1</span>
               <span class="console-count mono" id="count-ps1">0</span>
+            </button>
+            <button class="console-btn" data-console="PSP">
+              <span>🛸 PlayStation Portable</span>
+              <span class="console-count mono" id="count-psp">0</span>
             </button>
             <button class="console-btn" data-console="CHIP8">
               <span>🦀 CHIP-8 Homebrew</span>
@@ -347,7 +351,7 @@
 
               <div class="dock-card">
                 <div class="section-title">
-                  <span>🤖 Macros TAS Déterministes</span>
+                  <span>🤖 Macros TAS &amp; Timeline Studio</span>
                   <span class="mono" id="macro-status">PRÊT</span>
                 </div>
                 <div style="margin-bottom:8px;">
@@ -356,6 +360,7 @@
                   </button>
                 </div>
                 <div id="macros-list"></div>
+                <div id="tas-timeline-list" class="mono" style="margin-top:6px; border-top:1px solid var(--border-subtle); padding-top:6px;"></div>
               </div>
 
               <div class="dock-card">
@@ -374,7 +379,8 @@
 
               <div class="dock-card">
                 <div class="section-title">
-                  <span>🔬 Registres CPU &amp; Oscilloscope APU</span>
+                  <span>🔬 Registres CPU, APU &amp; Watchpoints</span>
+                  <button class="btn mono" id="btn-add-watchpoint" style="padding:2px 6px; font-size:10px;" title="Épingler l'adresse RAM saisie dans les Watchpoints">+ Pin RAM</button>
                 </div>
                 <div class="kv-row mono"><span class="kv-label">PC / SP</span><span id="dbg-pc-sp">0x0150 / 0xFFFE</span></div>
                 <div class="kv-row mono"><span class="kv-label">AF / BC</span><span id="dbg-af-bc">0x11B0 / 0x0013</span></div>
@@ -391,12 +397,13 @@
                     type="text"
                     id="ram-scan-input"
                     class="search-input mono"
-                    placeholder="Octet RAM (ex: 48)"
+                    placeholder="Octet ou 0xC110=7F"
                     style="background:var(--bg-elevated); padding:3px 6px; border-radius:4px; border:1px solid var(--border-subtle); font-size:11px;"
                   />
                   <button class="btn mono" id="btn-scan-ram" style="padding:3px 8px; font-size:11px;">🔍 Scan</button>
                 </div>
                 <div id="ram-scan-results" class="mono" style="margin-top:4px; font-size:10px; color:var(--cobalt);"></div>
+                <div id="watchpoints-list" class="mono" style="margin-top:6px; border-top:1px solid var(--border-subtle); padding-top:6px;"></div>
               </div>
 
               <div class="dock-card">

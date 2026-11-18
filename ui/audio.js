@@ -11,7 +11,7 @@ export function sanitizeApuFrequency(freqHz) {
 
 /**
  * Generates `sampleCount` normalized (`-1.0..=1.0`) waveform samples combining:
- * - Ch1: Square Lead (`freqHz`)
+ * - Ch1: Square Lead / YM2612 FM Carrier (`freqHz`)
  * - Ch2: Pulse Fifth Harmony (`1.5 * freqHz`)
  * - Ch3: Triangle / SPC700 Sub-Bass (`0.5 * freqHz`)
  * - Ch4: LFSR Pseudo-Noise transient
@@ -27,7 +27,8 @@ export function synthesizeMultiChannelSamples(rawFreqHz, frameNumber = 0, sample
 
   for (let i = 0; i < count; i++) {
     const phase = (i / count) * Math.PI * 2 + f * 0.28;
-    const ch1Square = Math.sin(phase * (baseFreq / 220)) >= 0 ? 0.45 : -0.45;
+    const fmMod = Math.sin(phase * 2.0) * 0.35;
+    const ch1Square = Math.sin(phase * (baseFreq / 220) + fmMod) >= 0 ? 0.45 : -0.45;
     const ch2Fifth = Math.sin(phase * ((baseFreq * 1.5) / 220)) >= 0.25 ? 0.22 : -0.22;
     const triRaw = ((i / count + f * 0.03) * 2) % 2;
     const ch3Triangle = (triRaw < 1 ? triRaw * 2 - 1 : 3 - triRaw * 2) * 0.25;

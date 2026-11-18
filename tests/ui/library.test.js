@@ -42,6 +42,17 @@ const SAMPLE_ENTRIES = [
     crc32Hex: "9B8E71A2",
     favorite: false,
     linkCableReady: false
+  },
+  {
+    id: "psp-pulse-horizon",
+    title: "Pulse Horizon : Widescreen 333MHz (PSP)",
+    console: "PSP",
+    engineKind: "nativeRust",
+    coreId: "zaimule-rust-psp",
+    region: "EUR · FR",
+    crc32Hex: "77E49C01",
+    favorite: true,
+    linkCableReady: true
   }
 ];
 
@@ -61,22 +72,27 @@ test("filterCatalogEntries filters by console, nativeRust, linkCable, and accent
   assert.equal(byQuery.length, 1);
   assert.equal(byQuery[0].id, "gba-emerald");
 
+  const byPsp = filterCatalogEntries(SAMPLE_ENTRIES, { consoleFilter: "PSP" });
+  assert.equal(byPsp.length, 1);
+  assert.equal(byPsp[0].id, "psp-pulse-horizon");
+
   const byRust = filterCatalogEntries(SAMPLE_ENTRIES, { onlyNativeRust: true });
-  assert.equal(byRust.length, 2);
+  assert.equal(byRust.length, 3);
   assert.equal(byRust[0].id, "gb-pocket-arena");
 
   const byLink = filterCatalogEntries(SAMPLE_ENTRIES, { onlyLinkReady: true });
-  assert.equal(byLink.length, 2);
+  assert.equal(byLink.length, 3);
 });
 
 test("computeConsoleCounts tallies consoles, rust cores, and link cable games", () => {
   const counts = computeConsoleCounts(SAMPLE_ENTRIES);
-  assert.equal(counts.ALL, 3);
+  assert.equal(counts.ALL, 4);
   assert.equal(counts.GBC, 1);
   assert.equal(counts.GBA, 1);
   assert.equal(counts.PS1, 1);
-  assert.equal(counts.RUST, 2);
-  assert.equal(counts.LINK, 2);
+  assert.equal(counts.PSP, 1);
+  assert.equal(counts.RUST, 3);
+  assert.equal(counts.LINK, 3);
 });
 
 test("formatHardwareProfileLabel formats Yuzu CPU overclock and PGXP state", () => {

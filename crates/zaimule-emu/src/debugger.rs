@@ -306,6 +306,7 @@ fn decode_mips_r3000a(rom: &[u8], pc: u32) -> (u32, String, String) {
                 _ => format!("COP2 GTE 0x{gte_cmd:02X}"),
             }
         }
+        0x18 => "VFPU VADD.Q C000, C010, C020".into(),
         0x2B => format!("SW ${rt}, 0x{imm:04X}(${rs})"),
         _ => format!("DW 0x{instr:08X}"),
     };

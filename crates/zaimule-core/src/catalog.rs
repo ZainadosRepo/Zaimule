@@ -47,7 +47,7 @@ impl ConsoleKind {
             Self::Nds => "zaimule-rust-nds",
             Self::Ps1 => "zaimule-rust-ps1",
             Self::N64 => "zaimule-rust-n64",
-            Self::Psp => "ppsspp_libretro",
+            Self::Psp => "zaimule-rust-psp",
             Self::Megadrive => "zaimule-rust-md",
         }
     }
@@ -64,6 +64,7 @@ impl ConsoleKind {
                 | Self::Nds
                 | Self::Ps1
                 | Self::N64
+                | Self::Psp
                 | Self::Megadrive
         )
     }
@@ -71,7 +72,7 @@ impl ConsoleKind {
     pub fn supports_link_cable(self) -> bool {
         matches!(
             self,
-            Self::Gb | Self::Gbc | Self::Gba | Self::Nds | Self::N64 | Self::Megadrive
+            Self::Gb | Self::Gbc | Self::Gba | Self::Nds | Self::N64 | Self::Psp | Self::Megadrive
         )
     }
 }
@@ -187,6 +188,10 @@ pub fn detect_console(file_name: &str, rom_bytes: &[u8]) -> ConsoleKind {
     {
         return ConsoleKind::Megadrive;
     }
+    // 5. Check PlayStation Portable EBOOT.PBP magic header ("\0PBP")
+    if rom_bytes.len() >= 0x10 && &rom_bytes[0..4] == b"\x00PBP" {
+        return ConsoleKind::Psp;
+    }
 
     let lower = file_name.to_ascii_lowercase();
     if lower.ends_with(".gbc") {
@@ -205,7 +210,7 @@ pub fn detect_console(file_name: &str, rom_bytes: &[u8]) -> ConsoleKind {
         ConsoleKind::Ps1
     } else if lower.ends_with(".z64") || lower.ends_with(".n64") || lower.ends_with(".v64") {
         ConsoleKind::N64
-    } else if lower.ends_with(".cso") || lower.ends_with(".iso") {
+    } else if lower.ends_with(".cso") || lower.ends_with(".iso") || lower.ends_with(".pbp") {
         ConsoleKind::Psp
     } else if lower.ends_with(".md") || lower.ends_with(".gen") || lower.ends_with(".smd") {
         ConsoleKind::Megadrive
@@ -424,6 +429,23 @@ pub fn default_catalog() -> Vec<GameEntry> {
             embedded_rom_key: Some("md_supersonic".into()),
             cover_accent: "#0f172a".into(),
             cover_symbol: "🦔".into(),
+        },
+        GameEntry {
+            id: "psp-pulse-horizon".into(),
+            title: "Pulse Horizon : Widescreen 333MHz (PSP)".into(),
+            console: ConsoleKind::Psp,
+            engine_kind: CoreEngineKind::NativeRust,
+            core_id: "zaimule-rust-psp".into(),
+            region: "EUR · FR (MIPS Allegrex + VFPU 16:9)".into(),
+            crc32_hex: "333F0480".into(),
+            size_bytes: 32_768,
+            sram_summary: "64 Ko Memory Stick Duo (.msd) + Ad-Hoc WLAN".into(),
+            playtime_seconds: 51_600,
+            favorite: true,
+            link_cable_ready: true,
+            embedded_rom_key: Some("psp_wipeout_pulse".into()),
+            cover_accent: "#0369a1".into(),
+            cover_symbol: "🚀".into(),
         },
     ]
 }

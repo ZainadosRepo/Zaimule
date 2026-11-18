@@ -157,6 +157,69 @@ pub fn default_achievements() -> Vec<AchievementEntry> {
     ]
 }
 
+/// Live RAM Watchpoint with delta tracking (`previous_value -> current_value`) and Freeze/Pin support.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryWatchpoint {
+    pub id: String,
+    pub label: String,
+    pub addr: u16,
+    pub addr_hex: String,
+    pub current_value: u8,
+    pub previous_value: u8,
+    pub frozen: bool,
+    pub frozen_value: u8,
+}
+
+/// Parses a 16-bit hexadecimal RAM watchpoint address (e.g. `"0xC104"` or `"C104"`).
+pub fn parse_watchpoint_address(raw_addr: &str) -> Result<u16, String> {
+    let cleaned = raw_addr
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+    if cleaned.is_empty() || cleaned.len() > 4 {
+        return Err("adresse Watchpoint invalide (ex: 0xC104)".into());
+    }
+    u16::from_str_radix(cleaned, 16)
+        .map_err(|_| format!("adresse hexadécimale Watchpoint invalide : {raw_addr}"))
+}
+
+/// Built-in Memory Watchpoints for live RAM inspection and 1-click value freezing.
+pub fn default_memory_watchpoints() -> Vec<MemoryWatchpoint> {
+    vec![
+        MemoryWatchpoint {
+            id: "wp-c100".into(),
+            label: "Coordonnée X / Vélocité Joueur".into(),
+            addr: 0xC100,
+            addr_hex: "0xC100".into(),
+            current_value: 0x48,
+            previous_value: 0x48,
+            frozen: false,
+            frozen_value: 0x48,
+        },
+        MemoryWatchpoint {
+            id: "wp-c104".into(),
+            label: "État & Cadence Tir Plasma".into(),
+            addr: 0xC104,
+            addr_hex: "0xC104".into(),
+            current_value: 0x01,
+            previous_value: 0x00,
+            frozen: false,
+            frozen_value: 0x01,
+        },
+        MemoryWatchpoint {
+            id: "wp-c108".into(),
+            label: "Compteur Score / Énergie Arène".into(),
+            addr: 0xC108,
+            addr_hex: "0xC108".into(),
+            current_value: 0x64,
+            previous_value: 0x50,
+            frozen: false,
+            frozen_value: 0x64,
+        },
+    ]
+}
+
 /// Resolves a deterministic Libretro No-Intro thumbnail URL for a given console and game title.
 pub fn resolve_cover_thumbnail_url(console_badge: &str, title: &str) -> String {
     let repo_dir = match console_badge {
@@ -168,6 +231,8 @@ pub fn resolve_cover_thumbnail_url(console_badge: &str, title: &str) -> String {
         "NDS" => "Nintendo - Nintendo DS",
         "PS1" => "Sony - PlayStation",
         "N64" => "Nintendo - Nintendo 64",
+        "PSP" => "Sony - PlayStation Portable",
+        "MEGADRIVE" => "Sega - Mega Drive - Genesis",
         _ => "Nintendo - Game Boy Color",
     };
     let sanitized: String = title
@@ -201,9 +266,12 @@ mod tests {
     }
 
     #[test]
-    fn scans_ram_for_matching_bytes() {
+    fn scans_ram_for_matching_bytes_and_parses_watchpoints() {
         let ram = [0x00, 0x42, 0x10, 0x42, 0xFF];
         let hits = scan_ram_for_exact_byte(&ram, 0xC000, 0x42, 10);
         assert_eq!(hits, vec![0xC001, 0xC003]);
+
+        assert_eq!(parse_watchpoint_address("0xC108").unwrap(), 0xC108);
+        assert_eq!(default_memory_watchpoints().len(), 3);
     }
 }

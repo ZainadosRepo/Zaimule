@@ -1,7 +1,7 @@
 [package]
 name = "zaimule-emu"
-version = "0.7.0"
-description = "Native Rust emulator cores (Game Boy/GBC with Link Cable, GBA ARM7TDMI, N64 MIPS VR4300 + RCP Z-Buffer 3D, Mega Drive Motorola 68000 + YM2612, NDS ARM9+ARM7 Dual-Screen, PS1 MIPS R3000A + GTE 3D PGXP, SNES 65C816/Mode 7, NES 6502/2C02, CHIP-8) and Libretro C-ABI host bridge for Zaimule"
+version = "1.0.0"
+description = "11 Native Rust emulator cores (Game Boy/GBC MBC3 RTC, GBA ARM7TDMI, NES Multi-Mapper, SNES 65C816/Mode 7, N64 MIPS VR4300 Z-Buffer 3D, Mega Drive Motorola 68000 + YM2612, NDS ARM9+ARM7 Dual-Screen, PS1 MIPS R3000A + GTE PGXP, PSP MIPS Allegrex + VFPU 16:9, CHIP-8) and 7-core Libretro C-ABI host bridge for Zaimule"
 authors = ["ZainadosRepo"]
 edition = "2021"
 publish = false
