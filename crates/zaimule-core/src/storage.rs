@@ -2,6 +2,7 @@
 //! Writes to `.tmp` then renames atomically, moves corrupted JSON files aside to `.json.bad`,
 //! and rotates `.srm.bak1`..`.srm.bak3` backups for cartridge SRAM saves.
 
+use crate::catalog::{compute_crc32, format_crc32_hex};
 use crate::cheats::CheatCodeEntry;
 use crate::keymap::KeymapWidget;
 use crate::macros::MacroSequence;
@@ -199,7 +200,7 @@ pub fn load_state_slot_atomic(path: &Path) -> Result<Option<PersistedSaveState>,
     }
 }
 
-/// Saves an imported ROM binary atomically (`<crc32>.rom.tmp` -> `<crc32>.rom`).
+///Saves an imported ROM binary atomically (`<crc32>.rom.tmp` -> `<crc32>.rom`).
 pub fn save_rom_binary_atomic(path: &Path, rom_bytes: &[u8]) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -207,6 +208,82 @@ pub fn save_rom_binary_atomic(path: &Path, rom_bytes: &[u8]) -> Result<(), Strin
     let tmp = path.with_extension("rom.tmp");
     fs::write(&tmp, rom_bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
     fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Structured hexadecimal inspection snapshot of a cartridge SRAM (`.srm`) or Memory Card (`.mcd`/`.mpk`) buffer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SramHexInspection {
+    pub total_bytes: usize,
+    pub non_zero_bytes: usize,
+    pub crc32_hex: String,
+    pub base_offset: usize,
+    pub hex_rows: Vec<String>,
+    pub score_slot_value: u8,
+}
+
+/// Formats `row_count` 8-byte hexadecimal + ASCII lines starting at `offset` from an SRAM/Memory Card buffer.
+pub fn inspect_sram_hex(sram: &[u8], offset: usize, row_count: usize) -> SramHexInspection {
+    let total_bytes = sram.len();
+    let non_zero_bytes = sram.iter().filter(|&&b| b != 0).count();
+    let crc32_hex = format_crc32_hex(compute_crc32(sram));
+    let score_slot_value = sram.get(4).copied().unwrap_or(0);
+    let clamped_offset = offset.min(total_bytes.saturating_sub(1)) & !0x07;
+    let rows = row_count.clamp(1, 16);
+    let mut hex_rows = Vec::with_capacity(rows);
+
+    for r in 0..rows {
+        let addr = clamped_offset + r * 8;
+        if addr >= total_bytes && total_bytes > 0 {
+            break;
+        }
+        let mut hex_part = String::with_capacity(24);
+        let mut ascii_part = String::with_capacity(8);
+        for i in 0..8 {
+            if let Some(&b) = sram.get(addr + i) {
+                hex_part.push_str(&format!("{b:02X} "));
+                let ch = if (0x20..=0x7E).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                };
+                ascii_part.push(ch);
+            } else {
+                hex_part.push_str("-- ");
+                ascii_part.push(' ');
+            }
+        }
+        hex_rows.push(format!(
+            "0x{addr:04X}: {}|{}",
+            hex_part.trim_end(),
+            ascii_part
+        ));
+    }
+
+    SramHexInspection {
+        total_bytes,
+        non_zero_bytes,
+        crc32_hex,
+        base_offset: clamped_offset,
+        hex_rows,
+        score_slot_value,
+    }
+}
+
+/// Mutates a single byte inside an SRAM/Memory Card buffer and returns the updated `SramHexInspection`.
+pub fn write_sram_byte_and_rehash(
+    sram: &mut [u8],
+    offset: usize,
+    value: u8,
+) -> Result<SramHexInspection, String> {
+    if offset >= sram.len() {
+        return Err(format!(
+            "adresse SRAM hors limites (0x{offset:04X} >= {})",
+            sram.len()
+        ));
+    }
+    sram[offset] = value;
+    Ok(inspect_sram_hex(sram, offset & !0x1F, 4))
 }
 
 #[cfg(test)]
@@ -307,5 +384,15 @@ mod tests {
         let decoded = decode_portable_pack(&bytes).unwrap();
         assert_eq!(decoded.active_game_id, "gb-pocket-arena");
         assert_eq!(decoded.payload_crc32_hex, "DCE0682B");
+    }
+
+    #[test]
+    fn sram_hex_inspector_formats_rows_and_writes_bytes_accurately() {
+        let mut sram = vec![0u8; 64];
+        sram[0..4].copy_from_slice(b"ZAIM");
+        let updated = write_sram_byte_and_rehash(&mut sram, 4, 0x99).unwrap();
+        assert_eq!(updated.score_slot_value, 0x99);
+        assert_eq!(updated.non_zero_bytes, 5);
+        assert!(updated.hex_rows[0].contains("5A 41 49 4D 99"));
     }
 }

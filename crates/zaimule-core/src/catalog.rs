@@ -46,9 +46,9 @@ impl ConsoleKind {
             Self::Snes => "zaimule-rust-snes",
             Self::Nds => "zaimule-rust-nds",
             Self::Ps1 => "zaimule-rust-ps1",
-            Self::N64 => "mupen64plus_next_libretro",
+            Self::N64 => "zaimule-rust-n64",
             Self::Psp => "ppsspp_libretro",
-            Self::Megadrive => "genesis_plus_gx_libretro",
+            Self::Megadrive => "zaimule-rust-md",
         }
     }
 
@@ -63,11 +63,16 @@ impl ConsoleKind {
                 | Self::Snes
                 | Self::Nds
                 | Self::Ps1
+                | Self::N64
+                | Self::Megadrive
         )
     }
 
     pub fn supports_link_cable(self) -> bool {
-        matches!(self, Self::Gb | Self::Gbc | Self::Gba | Self::Nds)
+        matches!(
+            self,
+            Self::Gb | Self::Gbc | Self::Gba | Self::Nds | Self::N64 | Self::Megadrive
+        )
     }
 }
 
@@ -171,6 +176,17 @@ pub fn detect_console(file_name: &str, rom_bytes: &[u8]) -> ConsoleKind {
         }
         return ConsoleKind::Gb;
     }
+    // 3. Check N64 Big-Endian .z64 magic header (0x80371240)
+    if rom_bytes.len() >= 0x40 && rom_bytes[0..4] == [0x80, 0x37, 0x12, 0x40] {
+        return ConsoleKind::N64;
+    }
+    // 4. Check Sega Mega Drive / Genesis magic header at 0x0100..0x0110
+    if rom_bytes.len() >= 0x0200
+        && (&rom_bytes[0x0100..0x010F] == b"SEGA MEGA DRIVE"
+            || &rom_bytes[0x0100..0x010C] == b"SEGA GENESIS")
+    {
+        return ConsoleKind::Megadrive;
+    }
 
     let lower = file_name.to_ascii_lowercase();
     if lower.ends_with(".gbc") {
@@ -187,11 +203,11 @@ pub fn detect_console(file_name: &str, rom_bytes: &[u8]) -> ConsoleKind {
         ConsoleKind::Nds
     } else if lower.ends_with(".bin") || lower.ends_with(".cue") || lower.ends_with(".chd") {
         ConsoleKind::Ps1
-    } else if lower.ends_with(".z64") || lower.ends_with(".n64") {
+    } else if lower.ends_with(".z64") || lower.ends_with(".n64") || lower.ends_with(".v64") {
         ConsoleKind::N64
     } else if lower.ends_with(".cso") || lower.ends_with(".iso") {
         ConsoleKind::Psp
-    } else if lower.ends_with(".md") || lower.ends_with(".gen") {
+    } else if lower.ends_with(".md") || lower.ends_with(".gen") || lower.ends_with(".smd") {
         ConsoleKind::Megadrive
     } else {
         ConsoleKind::Chip8
@@ -374,6 +390,40 @@ pub fn default_catalog() -> Vec<GameEntry> {
             embedded_rom_key: Some("ps1_cyber_ridge".into()),
             cover_accent: "#312e81".into(),
             cover_symbol: "🏎️".into(),
+        },
+        GameEntry {
+            id: "n64-star-wing-64".into(),
+            title: "Star Wing 64 : Lylat Z-Buffer (N64)".into(),
+            console: ConsoleKind::N64,
+            engine_kind: CoreEngineKind::NativeRust,
+            core_id: "zaimule-rust-n64".into(),
+            region: "EUR · FR (MIPS VR4300 + RCP Z-Buffer 3D)".into(),
+            crc32_hex: "64FA8037".into(),
+            size_bytes: 32_768,
+            sram_summary: "32 Ko Controller Pak (.mpk) + Rumble".into(),
+            playtime_seconds: 44_200,
+            favorite: true,
+            link_cable_ready: true,
+            embedded_rom_key: Some("n64_star_wing".into()),
+            cover_accent: "#1e40af".into(),
+            cover_symbol: "🦊".into(),
+        },
+        GameEntry {
+            id: "md-supersonic-blast".into(),
+            title: "Supersonic Blast : 16-Bit FM (Mega Drive)".into(),
+            console: ConsoleKind::Megadrive,
+            engine_kind: CoreEngineKind::NativeRust,
+            core_id: "zaimule-rust-md".into(),
+            region: "EUR · FR (Motorola 68000 + VDP + YM2612)".into(),
+            crc32_hex: "68000FA1".into(),
+            size_bytes: 32_768,
+            sram_summary: "64 Ko FeRAM + Synthèse FM YM2612".into(),
+            playtime_seconds: 38_400,
+            favorite: true,
+            link_cable_ready: true,
+            embedded_rom_key: Some("md_supersonic".into()),
+            cover_accent: "#0f172a".into(),
+            cover_symbol: "🦔".into(),
         },
     ]
 }

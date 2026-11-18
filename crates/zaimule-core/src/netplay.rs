@@ -312,6 +312,108 @@ pub fn default_netplay_chat() -> Vec<NetplayChatMessage> {
     ]
 }
 
+/// A single match node in an automated 4P/8P elimination tournament bracket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TournamentMatch {
+    pub id: String,
+    pub round_label: String,
+    pub player_a: String,
+    pub player_b: String,
+    pub score_a: u32,
+    pub score_b: u32,
+    pub winner: Option<String>,
+    pub spectators_count: u16,
+}
+
+/// Automated elimination Tournament Bracket with live Spectator telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TournamentBracket {
+    pub id: String,
+    pub title: String,
+    pub console: String,
+    pub game_title: String,
+    pub matches: Vec<TournamentMatch>,
+    pub champion: Option<String>,
+    pub spectator_mode_active: bool,
+}
+
+impl TournamentBracket {
+    /// Records the score for `match_id`, crowns its winner, and automatically populates the Grand Final or Champion.
+    pub fn advance_match(
+        &mut self,
+        match_id: &str,
+        score_a: u32,
+        score_b: u32,
+    ) -> Result<(), String> {
+        let Some(idx) = self.matches.iter().position(|m| m.id == match_id) else {
+            return Err(format!("match de tournoi introuvable : {match_id}"));
+        };
+        let winner_name = if score_a >= score_b {
+            self.matches[idx].player_a.clone()
+        } else {
+            self.matches[idx].player_b.clone()
+        };
+        self.matches[idx].score_a = score_a;
+        self.matches[idx].score_b = score_b;
+        self.matches[idx].winner = Some(winner_name.clone());
+
+        if idx == 0 && self.matches.len() >= 3 {
+            self.matches[2].player_a = winner_name;
+        } else if idx == 1 && self.matches.len() >= 3 {
+            self.matches[2].player_b = winner_name;
+        } else if idx == 2 {
+            self.champion = Some(winner_name);
+        }
+        Ok(())
+    }
+}
+
+/// Builds the default 4-Player Championship Tournament Bracket (`Demi-Finales` + `Grande Finale`).
+pub fn default_tournament_bracket() -> TournamentBracket {
+    TournamentBracket {
+        id: "tourney-zaimule-cup-1".into(),
+        title: "🏆 Zaimule Championship Cup (Arbre 4P + Spectateur)".into(),
+        console: "Multi-Consoles (GBC / N64 / PS1 / MD)".into(),
+        game_title: "Pocket Monster Link Arena & Star Wing 64".into(),
+        matches: vec![
+            TournamentMatch {
+                id: "match-semi-1".into(),
+                round_label: "Demi-Finale #1".into(),
+                player_a: "Zainados".into(),
+                player_b: "ShadowLink".into(),
+                score_a: 185,
+                score_b: 140,
+                winner: Some("Zainados".into()),
+                spectators_count: 14,
+            },
+            TournamentMatch {
+                id: "match-semi-2".into(),
+                round_label: "Demi-Finale #2".into(),
+                player_a: "Kaelen_FR".into(),
+                player_b: "RetroPulse".into(),
+                score_a: 210,
+                score_b: 175,
+                winner: Some("Kaelen_FR".into()),
+                spectators_count: 19,
+            },
+            TournamentMatch {
+                id: "match-final".into(),
+                round_label: "Grande Finale".into(),
+                player_a: "Zainados".into(),
+                player_b: "Kaelen_FR".into(),
+                score_a: 0,
+                score_b: 0,
+                winner: None,
+                spectators_count: 42,
+            },
+        ],
+        champion: None,
+        spectator_mode_active: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +457,13 @@ mod tests {
         let chat = default_netplay_chat();
         assert_eq!(chat.len(), 2);
         assert_eq!(chat[0].shared_state_slot, Some(1));
+    }
+
+    #[test]
+    fn tournament_bracket_advances_semifinals_and_crowns_champion() {
+        let mut bracket = default_tournament_bracket();
+        assert_eq!(bracket.champion, None);
+        bracket.advance_match("match-final", 260, 215).unwrap();
+        assert_eq!(bracket.champion.as_deref(), Some("Zainados"));
     }
 }

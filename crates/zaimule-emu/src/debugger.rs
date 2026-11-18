@@ -55,6 +55,7 @@ pub fn disassemble_window(
             ConsoleKind::Ps1 | ConsoleKind::N64 | ConsoleKind::Psp => {
                 decode_mips_r3000a(rom, cursor)
             }
+            ConsoleKind::Megadrive => decode_m68k(rom, cursor),
             ConsoleKind::Chip8 => decode_chip8(rom, cursor),
             ConsoleKind::Nes | ConsoleKind::Snes => decode_mos6502(rom, cursor),
             _ => decode_lr35902(rom, cursor),
@@ -69,6 +70,8 @@ pub fn disassemble_window(
                 | ConsoleKind::Psp
         ) {
             format!("0x{cursor:08X}")
+        } else if console == ConsoleKind::Megadrive {
+            format!("0x{:06X}", cursor & 0x00FF_FFFF)
         } else {
             format!("0x{:04X}", cursor & 0xFFFF)
         };
@@ -256,7 +259,12 @@ fn decode_arm7tdmi(rom: &[u8], pc: u32) -> (u32, String, String) {
 }
 
 fn decode_mips_r3000a(rom: &[u8], pc: u32) -> (u32, String, String) {
-    let offset = (pc.saturating_sub(0x8001_0000) as usize) & !3;
+    let raw_off = if pc >= 0x8001_0000 {
+        (pc - 0x8001_0000) as usize
+    } else {
+        (pc.saturating_sub(0x8000_0000)) as usize
+    };
+    let offset = raw_off & !3;
     let b0 = read_rom_byte(rom, offset);
     let b1 = read_rom_byte(rom, offset + 1);
     let b2 = read_rom_byte(rom, offset + 2);
@@ -298,9 +306,54 @@ fn decode_mips_r3000a(rom: &[u8], pc: u32) -> (u32, String, String) {
                 _ => format!("COP2 GTE 0x{gte_cmd:02X}"),
             }
         }
+        0x2B => format!("SW ${rt}, 0x{imm:04X}(${rs})"),
         _ => format!("DW 0x{instr:08X}"),
     };
     (4, hex, mnem)
+}
+
+fn decode_m68k(rom: &[u8], pc: u32) -> (u32, String, String) {
+    let offset = (pc as usize) & !1;
+    let hi = read_rom_byte(rom, offset);
+    let lo = read_rom_byte(rom, offset + 1);
+    let op = u16::from_be_bytes([hi, lo]);
+    let hex = format!("{hi:02X} {lo:02X}");
+
+    let mnem = if op == 0x4E71 {
+        "NOP".into()
+    } else if op == 0x4E75 {
+        "RTS".into()
+    } else if (op & 0xF100) == 0x7000 {
+        let reg = (op >> 9) & 7;
+        let imm = op & 0xFF;
+        format!("MOVEQ #${imm:02X}, D{reg}")
+    } else if (op & 0xF1C0) == 0x5040 {
+        let reg = op & 7;
+        let mut imm = (op >> 9) & 7;
+        if imm == 0 {
+            imm = 8;
+        }
+        format!("ADDQ.W #{imm}, D{reg}")
+    } else if (op & 0xF000) == 0x3000 {
+        let dst = (op >> 9) & 7;
+        let src = op & 7;
+        format!("MOVE.W D{src}, D{dst}")
+    } else if (op & 0xF000) == 0xB000 {
+        let dst = (op >> 9) & 7;
+        let src = op & 7;
+        format!("CMP.W D{src}, D{dst}")
+    } else if (op & 0xFF00) == 0x6600 {
+        let disp = (op & 0xFF) as i8;
+        let target = (pc as i32 + 2 + disp as i32) as u32;
+        format!("BNE.S 0x{target:06X}")
+    } else if (op & 0xFF00) == 0x6000 {
+        let disp = (op & 0xFF) as i8;
+        let target = (pc as i32 + 2 + disp as i32) as u32;
+        format!("BRA.S 0x{target:06X}")
+    } else {
+        format!("DC.W ${op:04X}")
+    };
+    (2, hex, mnem)
 }
 
 fn decode_chip8(rom: &[u8], pc: u32) -> (u32, String, String) {

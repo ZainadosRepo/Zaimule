@@ -1,0 +1,122 @@
+// Zaimule — Real-Time Pixel-Art Upscaler & CRT Phosphor Bloom Pipeline
+// Pure ES module testable under Node.js (`node --test`) and browser WebView.
+
+export const UPSCALER_MODES = ["OFF", "SCALE2X", "BLOOM"];
+
+function samePixel(rgba, idxA, idxB) {
+  return (
+    rgba[idxA] === rgba[idxB] &&
+    rgba[idxA + 1] === rgba[idxB + 1] &&
+    rgba[idxA + 2] === rgba[idxB + 2] &&
+    rgba[idxA + 3] === rgba[idxB + 3]
+  );
+}
+
+function copyPixel(src, srcIdx, dst, dstIdx) {
+  dst[dstIdx] = src[srcIdx];
+  dst[dstIdx + 1] = src[srcIdx + 1];
+  dst[dstIdx + 2] = src[srcIdx + 2];
+  dst[dstIdx + 3] = src[srcIdx + 3];
+}
+
+/**
+ * Applies Eric Johnston's EPX / Scale2x pixel-art edge-preserving 2x upscaler
+ * on an RGBA8888 buffer of size `width * height * 4`.
+ */
+export function applyScale2xRgba(rgba, width, height) {
+  const w = Math.max(1, Number(width) || 1);
+  const h = Math.max(1, Number(height) || 1);
+  const outW = w * 2;
+  const outH = h * 2;
+  const out = new Uint8ClampedArray(outW * outH * 4);
+
+  for (let y = 0; y < h; y += 1) {
+    const yUp = y > 0 ? y - 1 : y;
+    const yDown = y + 1 < h ? y + 1 : y;
+
+    for (let x = 0; x < w; x += 1) {
+      const xLeft = x > 0 ? x - 1 : x;
+      const xRight = x + 1 < w ? x + 1 : x;
+
+      const p = (y * w + x) * 4;
+      const b = (yUp * w + x) * 4; // Top (B)
+      const hIdx = (yDown * w + x) * 4; // Bottom (H)
+      const d = (y * w + xLeft) * 4; // Left (D)
+      const f = (y * w + xRight) * 4; // Right (F)
+
+      let e0 = p;
+      let e1 = p;
+      let e2 = p;
+      let e3 = p;
+
+      if (!samePixel(rgba, b, hIdx) && !samePixel(rgba, d, f)) {
+        if (samePixel(rgba, d, b)) e0 = d;
+        if (samePixel(rgba, b, f)) e1 = f;
+        if (samePixel(rgba, d, hIdx)) e2 = d;
+        if (samePixel(rgba, hIdx, f)) e3 = f;
+      }
+
+      const dstTopRow = y * 2 * outW + x * 2;
+      const dstBotRow = (y * 2 + 1) * outW + x * 2;
+
+      copyPixel(rgba, e0, out, dstTopRow * 4);
+      copyPixel(rgba, e1, out, (dstTopRow + 1) * 4);
+      copyPixel(rgba, e2, out, dstBotRow * 4);
+      copyPixel(rgba, e3, out, (dstBotRow + 1) * 4);
+    }
+  }
+
+  return { width: outW, height: outH, rgba: out };
+}
+
+/**
+ * Applies a warm CRT phosphor bloom on high-luma pixels with horizontal glow bleed.
+ */
+export function applyCrtPhosphorBloomRgba(rgba, width, height) {
+  const w = Math.max(1, Number(width) || 1);
+  const h = Math.max(1, Number(height) || 1);
+  const out = new Uint8ClampedArray(rgba.length);
+
+  for (let y = 0; y < h; y += 1) {
+    for (let x = 0; x < w; x += 1) {
+      const idx = (y * w + x) * 4;
+      const leftIdx = (y * w + (x > 0 ? x - 1 : x)) * 4;
+      const rightIdx = (y * w + (x + 1 < w ? x + 1 : x)) * 4;
+
+      const r = rgba[idx];
+      const g = rgba[idx + 1];
+      const b = rgba[idx + 2];
+
+      const neighborGlowR = (rgba[leftIdx] + rgba[rightIdx]) >> 3;
+      const neighborGlowG = (rgba[leftIdx + 1] + rgba[rightIdx + 1]) >> 3;
+      const neighborGlowB = (rgba[leftIdx + 2] + rgba[rightIdx + 2]) >> 3;
+
+      const luma = (r * 77 + g * 150 + b * 29) >> 8;
+      const boost = luma > 140 ? (luma - 140) >> 2 : 0;
+
+      out[idx] = Math.min(255, r + neighborGlowR + boost + 4);
+      out[idx + 1] = Math.min(255, g + neighborGlowG + boost + 2);
+      out[idx + 2] = Math.min(255, b + neighborGlowB + (boost >> 1));
+      out[idx + 3] = rgba[idx + 3];
+    }
+  }
+
+  return { width: w, height: h, rgba: out };
+}
+
+/**
+ * Transforms a frame `{ width, height, rgba }` according to the active upscaler mode.
+ */
+export function upscaleFrameIfEnabled(frame, mode = "OFF") {
+  if (!frame || !frame.rgba) {
+    return frame;
+  }
+  const normalized = String(mode || "OFF").toUpperCase();
+  if (normalized === "SCALE2X") {
+    return applyScale2xRgba(frame.rgba, frame.width, frame.height);
+  }
+  if (normalized === "BLOOM") {
+    return applyCrtPhosphorBloomRgba(frame.rgba, frame.width, frame.height);
+  }
+  return frame;
+}

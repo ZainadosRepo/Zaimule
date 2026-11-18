@@ -19,6 +19,7 @@ import {
 } from "./keymapper.js";
 import { ApuAudioEngine, synthesizeMultiChannelSamples } from "./audio.js";
 import { ViewportRecorder } from "./recorder.js";
+import { upscaleFrameIfEnabled } from "./upscaler.js";
 
 const tauriInvoke = window.__TAURI__?.core?.invoke;
 const appWindow = window.__TAURI__?.window?.getCurrentWindow?.();
@@ -89,6 +90,38 @@ const FALLBACK_CATALOG = [
     linkCableReady: false,
     coverAccent: "#14532d",
     coverSymbol: "🕰️"
+  },
+  {
+    id: "n64-star-wing-64",
+    title: "Star Wing 64 : Lylat Z-Buffer (N64)",
+    console: "N64",
+    engineKind: "nativeRust",
+    coreId: "zaimule-rust-n64",
+    region: "EUR · FR (MIPS VR4300 + RCP 3D Inclus)",
+    crc32Hex: "64F09A1B",
+    sizeBytes: 65536,
+    sramSummary: "32 Ko Controller Pak (.mpk) + Z-Buffer 16-bit",
+    playtimeSeconds: 24600,
+    favorite: true,
+    linkCableReady: true,
+    coverAccent: "#065f46",
+    coverSymbol: "🦊"
+  },
+  {
+    id: "md-supersonic-blast",
+    title: "Supersonic Blast : 16-Bit FM (Mega Drive)",
+    console: "MEGADRIVE",
+    engineKind: "nativeRust",
+    coreId: "zaimule-rust-md",
+    region: "EUR · FR (Motorola 68000 + YM2612 Inclus)",
+    crc32Hex: "68000FA4",
+    sizeBytes: 65536,
+    sramSummary: "64 Ko FeRAM + Synthétiseur FM YM2612",
+    playtimeSeconds: 18300,
+    favorite: true,
+    linkCableReady: true,
+    coverAccent: "#1d4ed8",
+    coverSymbol: "🦔"
   },
   {
     id: "nds-dual-phantom",
@@ -318,6 +351,51 @@ let state = {
   ],
   cpuOverclockPct: 100,
   pgxpSubpixel: true,
+  sramHexInspection: {
+    totalBytes: 32768,
+    crc32Hex: "5A41494D",
+    offset: 0,
+    rows: [
+      "0x0000: 5A 41 49 4D 55 4C 45 30  00 00 00 00 00 00 00 00 | ZAIMULE0........",
+      "0x0010: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 | ................"
+    ]
+  },
+  tournamentBracket: {
+    tournamentId: "tourney-zaimule-cup",
+    title: "🏆 Coupe Zaimule 4P Rollback & Multi-SIO",
+    spectatorCount: 3,
+    spectatorModeActive: false,
+    champion: null,
+    matches: [
+      {
+        matchId: "semi-1",
+        roundLabel: "Demi-Finale #1",
+        playerA: "Zainados",
+        playerB: "Kaelen_FR",
+        scoreA: 2,
+        scoreB: 1,
+        winner: null
+      },
+      {
+        matchId: "semi-2",
+        roundLabel: "Demi-Finale #2",
+        playerA: "Nyx_TAS",
+        playerB: "Orpheus_64",
+        scoreA: 1,
+        scoreB: 2,
+        winner: null
+      },
+      {
+        matchId: "grand-final",
+        roundLabel: "Grande Finale 60 FPS",
+        playerA: "Vainqueur DF1",
+        playerB: "Vainqueur DF2",
+        scoreA: 0,
+        scoreB: 0,
+        winner: null
+      }
+    ]
+  },
   libretroCores: [
     {
       coreId: "mgba_libretro",
@@ -384,6 +462,7 @@ let state = {
   prevNavMask: 0,
   vramPaintColorIdx: 3,
   stylusPressed: false,
+  upscalerMode: "OFF",
   speedMult: 1,
   activeMacroId: null,
   recordingMacro: false,
@@ -624,6 +703,8 @@ function renderSidebarCounts() {
   setTxt("count-gba", counts.GBA);
   setTxt("count-nes", counts.NES);
   setTxt("count-snes", counts.SNES);
+  setTxt("count-n64", counts.N64);
+  setTxt("count-megadrive", counts.MEGADRIVE);
   setTxt("count-nds", counts.NDS);
   setTxt("count-ps1", counts.PS1);
   setTxt("count-chip8", counts.CHIP8);
@@ -701,6 +782,17 @@ function renderInspector() {
   document.getElementById("insp-playtime").textContent = formatPlaytime(g.playtimeSeconds);
   document.getElementById("active-emu-game").textContent = `${g.console} · ${g.title}`;
   document.getElementById("tel-core").textContent = `${g.coreId} (${g.console})`;
+
+  const sramHexEl = document.getElementById("sram-hex-dump");
+  if (sramHexEl && state.sramHexInspection?.rows) {
+    sramHexEl.innerHTML = state.sramHexInspection.rows
+      .map((r) => `<div>${r}</div>`)
+      .join("");
+  }
+  const sramCrcBadge = document.getElementById("sram-crc-badge");
+  if (sramCrcBadge && state.sramHexInspection?.crc32Hex) {
+    sramCrcBadge.textContent = `✓ CRC ${state.sramHexInspection.crc32Hex}`;
+  }
 
   const ocBadge = document.getElementById("insp-overclock-badge");
   if (ocBadge) {
@@ -900,6 +992,11 @@ function renderNetplayAndCores() {
   if (stunBadge && state.stunCandidate) {
     stunBadge.textContent = `STUN Hole-Punch : ${state.stunCandidate.publicEndpoint} (${state.stunCandidate.natType})`;
   }
+  const specBtn = document.getElementById("btn-toggle-spectator");
+  if (specBtn && state.tournamentBracket) {
+    const active = state.tournamentBracket.spectatorModeActive;
+    specBtn.textContent = `👁️ Spectateur (${state.tournamentBracket.spectatorCount}) : ${active ? "ACTIF" : "OFF"}`;
+  }
 
   const chatList = document.getElementById("netplay-chat-list");
   if (chatList) {
@@ -932,6 +1029,73 @@ function renderNetplayAndCores() {
   const netGrid = document.getElementById("netplay-grid");
   if (netGrid) {
     netGrid.innerHTML = "";
+
+    if (state.tournamentBracket) {
+      const t = state.tournamentBracket;
+      const tourneyCard = document.createElement("div");
+      tourneyCard.className = "panel-card";
+      tourneyCard.id = "tournament-bracket-card";
+      tourneyCard.innerHTML = `
+        <div class="section-title">
+          <span>${t.title}</span>
+          <span class="pill-badge pill-gold mono">
+            ${t.champion ? `👑 Champion : ${t.champion}` : `👁️ ${t.spectatorCount} Spectateurs`}
+          </span>
+        </div>
+        <div class="bracket-matches"></div>
+      `;
+      const matchesWrap = tourneyCard.querySelector(".bracket-matches");
+      for (const m of t.matches || []) {
+        const mRow = document.createElement("div");
+        mRow.className = "mod-item";
+        mRow.innerHTML = `
+          <div>
+            <div class="mono" style="font-size:10.5px; color:var(--cobalt)">${m.roundLabel}</div>
+            <div style="font-weight:700">${m.playerA} <span style="color:var(--gold)">vs</span> ${m.playerB}</div>
+            <div class="mono" style="font-size:10.5px; color:${m.winner ? "var(--phosphor-green)" : "var(--text-muted)"}">
+              ${m.winner ? `✓ Vainqueur : ${m.winner}` : `Score Live : ${m.scoreA} - ${m.scoreB}`}
+            </div>
+          </div>
+          <div style="display:flex; gap:4px;">
+            <button class="btn mono btn-win-a" style="padding:3px 7px; font-size:10px;">🏆 ${m.playerA}</button>
+            <button class="btn mono btn-win-b" style="padding:3px 7px; font-size:10px;">🏆 ${m.playerB}</button>
+          </div>
+        `;
+        mRow.querySelector(".btn-win-a")?.addEventListener("click", async () => {
+          const boot = await invokeBackend("advance_tournament_match", {
+            matchId: m.matchId,
+            scoreA: 3,
+            scoreB: 1
+          });
+          if (boot) applyBootstrap(boot);
+          else {
+            m.winner = m.playerA;
+            if (m.matchId === "semi-1") t.matches[2].playerA = m.playerA;
+            else if (m.matchId === "semi-2") t.matches[2].playerB = m.playerA;
+            else if (m.matchId === "grand-final") t.champion = m.playerA;
+            renderNetplayAndCores();
+          }
+        });
+        mRow.querySelector(".btn-win-b")?.addEventListener("click", async () => {
+          const boot = await invokeBackend("advance_tournament_match", {
+            matchId: m.matchId,
+            scoreA: 1,
+            scoreB: 3
+          });
+          if (boot) applyBootstrap(boot);
+          else {
+            m.winner = m.playerB;
+            if (m.matchId === "semi-1") t.matches[2].playerA = m.playerB;
+            else if (m.matchId === "semi-2") t.matches[2].playerB = m.playerB;
+            else if (m.matchId === "grand-final") t.champion = m.playerB;
+            renderNetplayAndCores();
+          }
+        });
+        matchesWrap.appendChild(mRow);
+      }
+      netGrid.appendChild(tourneyCard);
+    }
+
     for (const r of state.netplayRooms) {
       const card = document.createElement("div");
       card.className = "panel-card";
@@ -1099,6 +1263,8 @@ function applyBootstrap(boot) {
   state.cpuOverclockPct = boot.cpuOverclockPct || state.cpuOverclockPct;
   state.pgxpSubpixel =
     boot.pgxpSubpixel !== undefined ? boot.pgxpSubpixel : state.pgxpSubpixel;
+  state.sramHexInspection = boot.sramHexInspection || state.sramHexInspection;
+  state.tournamentBracket = boot.tournamentBracket || state.tournamentBracket;
   state.libretroCores = boot.libretroCores || state.libretroCores;
   state.biosEntries = boot.biosEntries || state.biosEntries;
   state.linkTelemetry = boot.linkTelemetry || { enabled: false, packetsTransferred: 0 };
@@ -1125,14 +1291,18 @@ function switchTab(targetId) {
 function paintRgbaFrame(canvasId, frame) {
   const canvas = document.getElementById(canvasId);
   if (!canvas || !frame || !frame.rgba) return;
-  if (canvas.width !== frame.width || canvas.height !== frame.height) {
-    canvas.width = frame.width;
-    canvas.height = frame.height;
+  const processed =
+    canvasId.startsWith("canvas-p") && state.upscalerMode !== "OFF"
+      ? upscaleFrameIfEnabled(frame, state.upscalerMode)
+      : frame;
+  if (canvas.width !== processed.width || canvas.height !== processed.height) {
+    canvas.width = processed.width;
+    canvas.height = processed.height;
   }
   const ctx = canvas.getContext("2d");
-  const clamped = new Uint8ClampedArray(frame.rgba);
-  if (clamped.length === frame.width * frame.height * 4) {
-    const imgData = new ImageData(clamped, frame.width, frame.height);
+  const clamped = new Uint8ClampedArray(processed.rgba);
+  if (clamped.length === processed.width * processed.height * 4) {
+    const imgData = new ImageData(clamped, processed.width, processed.height);
     ctx.putImageData(imgData, 0, 0);
   }
 }
@@ -1510,6 +1680,47 @@ function bindEvents() {
     else renderInspector();
   });
 
+  document.getElementById("btn-sram-boost")?.addEventListener("click", async () => {
+    const updated = await invokeBackend("write_sram_byte_live", {
+      offset: 4,
+      value: 0xff
+    });
+    if (updated?.sramHexInspection) {
+      applyBootstrap(updated);
+    } else if (updated) {
+      state.sramHexInspection = updated;
+      renderInspector();
+    } else if (state.sramHexInspection) {
+      state.sramHexInspection.crc32Hex = "FF90A12C";
+      state.sramHexInspection.rows[0] =
+        "0x0000: 5A 41 49 4D FF 4C 45 30  00 00 00 00 00 00 00 00 | ZAIM.LE0........";
+      renderInspector();
+    }
+    const toast = document.getElementById("save-toast");
+    if (toast) toast.textContent = "✏️ Octet SRAM 0x0004 = 0xFF écrit & CRC32 recalculé !";
+  });
+
+  document.getElementById("btn-sram-transfer")?.addEventListener("click", async () => {
+    const boot = await invokeBackend("transfer_sram_p1_to_p2");
+    if (boot) applyBootstrap(boot);
+    const toast = document.getElementById("save-toast");
+    if (toast) toast.textContent = "🔄 Batterie SRAM / Carte Mémoire synchronisée J1 ➔ J2 !";
+  });
+
+  document.getElementById("btn-toggle-spectator")?.addEventListener("click", async () => {
+    const boot = await invokeBackend("toggle_tournament_spectator");
+    if (boot) {
+      applyBootstrap(boot);
+    } else if (state.tournamentBracket) {
+      state.tournamentBracket.spectatorModeActive =
+        !state.tournamentBracket.spectatorModeActive;
+      state.tournamentBracket.spectatorCount += state.tournamentBracket.spectatorModeActive
+        ? 1
+        : -1;
+      renderNetplayAndCores();
+    }
+  });
+
   document.getElementById("btn-submit-ghost")?.addEventListener("click", async () => {
     const g = getSelectedGame();
     const boot = await invokeBackend("submit_ghost_leaderboard_run", {
@@ -1540,7 +1751,7 @@ function bindEvents() {
         new TextEncoder().encode(
           JSON.stringify({
             magic: "ZAIMULE_PACK_V1",
-            version: "0.6.0",
+            version: "0.7.0",
             activeGameId: state.activeGameId,
             cheatCodes: state.cheatCodes,
             macros: state.macros
@@ -1693,6 +1904,22 @@ function bindEvents() {
       document.getElementById("save-toast").textContent =
         `✓ Clip enregistré : ${res.fileName} (${res.durationText})`;
     }
+  });
+
+  document.getElementById("btn-upscaler-cycle")?.addEventListener("click", (e) => {
+    state.upscalerMode =
+      state.upscalerMode === "OFF"
+        ? "SCALE2X"
+        : state.upscalerMode === "SCALE2X"
+          ? "BLOOM"
+          : "OFF";
+    const label =
+      state.upscalerMode === "SCALE2X"
+        ? "✨ Upscaler : Scale2x EPX"
+        : state.upscalerMode === "BLOOM"
+          ? "✨ Upscaler : CRT Bloom"
+          : "✨ Upscaler : Natif 1x";
+    e.currentTarget.textContent = label;
   });
 
   const shaders = ["mode-crt", "mode-trinitron", "mode-dmg", "mode-lcd", "mode-clean"];

@@ -12,7 +12,7 @@
         <div class="brand-group" data-tauri-drag-region>
           <div class="brand-emblem">Z</div>
           <span class="brand-title">ZAIMULE</span>
-          <span class="brand-sub">Rust Multi-Console Station · v0.6.0</span>
+          <span class="brand-sub">Rust Multi-Console Station · v0.7.0</span>
         </div>
 
         <nav class="nav-tabs" role="tablist">
@@ -49,7 +49,7 @@
       <input
         type="file"
         id="rom-file-input"
-        accept=".gb,.gbc,.gba,.nes,.sfc,.smc,.nds,.psx,.ch8,.rom,.bin"
+        accept=".gb,.gbc,.gba,.nes,.sfc,.smc,.nds,.psx,.z64,.n64,.md,.gen,.ch8,.rom,.bin"
         style="display: none;"
       />
       <input
@@ -89,6 +89,14 @@
             <button class="console-btn" data-console="SNES">
               <span>🎮 Super Nintendo</span>
               <span class="console-count mono" id="count-snes">0</span>
+            </button>
+            <button class="console-btn" data-console="N64">
+              <span>🦊 Nintendo 64</span>
+              <span class="console-count mono" id="count-n64">0</span>
+            </button>
+            <button class="console-btn" data-console="MEGADRIVE">
+              <span>🦔 Sega Mega Drive</span>
+              <span class="console-count mono" id="count-megadrive">0</span>
             </button>
             <button class="console-btn" data-console="NDS">
               <span>🖊️ Nintendo DS</span>
@@ -153,7 +161,7 @@
             <div class="inspector-section">
               <div class="section-title">
                 <span>🔐 Intégrité &amp; Batterie SRAM</span>
-                <span class="mono" style="color: var(--phosphor-green);">✓ .tmp → .srm</span>
+                <span class="mono" style="color: var(--phosphor-green);" id="sram-crc-badge">✓ .tmp → .srm</span>
               </div>
               <div class="kv-row">
                 <span class="kv-label">Empreinte CRC32</span>
@@ -166,6 +174,15 @@
               <div class="kv-row">
                 <span class="kv-label">Temps de jeu</span>
                 <span class="kv-val mono" id="insp-playtime">—</span>
+              </div>
+              <div id="sram-hex-dump" class="mono" style="margin-top:6px; padding:5px 7px; background:var(--bg-obsidian); border:1px solid var(--border-subtle); border-radius:4px; font-size:9.5px; color:var(--cobalt); max-height:58px; overflow-y:auto;"></div>
+              <div style="display:grid; grid-template-columns:1fr 1fr; gap:5px; margin-top:6px;">
+                <button class="btn mono" id="btn-sram-boost" style="font-size:10px; justify-content:center;" title="Écrire 0xFF en SRAM et recalculer le CRC32 atomique">
+                  ✏️ Boost Octet SRAM
+                </button>
+                <button class="btn mono" id="btn-sram-transfer" style="font-size:10px; justify-content:center; border-color:var(--gold); color:var(--gold);" title="Cloner la sauvegarde Batterie / Carte Mémoire J1 vers J2">
+                  🔄 Échange J1 ➔ J2
+                </button>
               </div>
             </div>
 
@@ -243,6 +260,7 @@
                 <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
                   <button class="btn" id="btn-audio-toggle">🔊 Audio APU : ON</button>
                   <button class="btn" id="btn-record-video">🎥 Clip .WebM</button>
+                  <button class="btn" id="btn-upscaler-cycle">✨ Upscaler : Natif 1x</button>
                   <button class="btn" id="btn-shader-cycle">📺 Shader : CRT Scanlines</button>
                   <button class="btn" id="btn-toggle-keymapper">🎯 Keymapper : OFF</button>
                   <button class="btn" id="btn-toggle-dual">🔗 Link 2P : OFF</button>
@@ -416,6 +434,7 @@
               style="max-width:300px; background:var(--bg-elevated); padding:6px 10px; border-radius:6px; border:1px solid var(--border-subtle);"
             />
             <button class="btn" id="btn-join-deeplink">🔗 Rejoindre Deep-Link</button>
+            <button class="btn" id="btn-toggle-spectator">👁️ Mode Spectateur : OFF</button>
             <button class="btn" id="btn-submit-ghost" style="border-color:var(--cobalt); color:var(--cobalt);">👻 Publier Record &amp; Fantôme TAS</button>
             <button class="btn btn-gold" id="btn-create-room">+ Créer Salon P2P &amp; Câble Link</button>
           </div>

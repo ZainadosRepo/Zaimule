@@ -1,6 +1,6 @@
 [package]
 name = "zaimule"
-version = "0.6.0"
+version = "0.7.0"
 description = "Multi-console emulator station in Rust: native Rust & Libretro cores, 60s rewind, visual keymapper, TAS macros, Link Cable, and Yuzu-style overrides"
 authors = ["ZainadosRepo"]
 edition = "2021"

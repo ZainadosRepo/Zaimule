@@ -14,6 +14,8 @@ use crate::libretro::{
     LibretroCoreDescriptor,
 };
 use crate::link::{step_quad_link_frame, LinkCableTelemetry};
+use crate::megadrive::{build_md_supersonic_rom, MegaDriveCore};
+use crate::n64::{build_n64_star_wing_rom, N64Core};
 use crate::nds::{build_nds_dual_phantom_rom, NdsCore};
 use crate::nes::{build_nes_chrono_knight_rom, NesCore};
 use crate::ps1::{build_ps1_cyber_ridge_rom, Ps1Core};
@@ -36,9 +38,9 @@ use zaimule_core::macros::{
     MacroSequence,
 };
 use zaimule_core::netplay::{
-    default_netplay_chat, default_netplay_rooms, discover_stun_candidate, format_deep_link,
-    parse_deep_link, NetplayChatMessage, NetplayRoom, NetplayWirePacket, StunDiscoveryCandidate,
-    UdpNetplayNode,
+    default_netplay_chat, default_netplay_rooms, default_tournament_bracket,
+    discover_stun_candidate, format_deep_link, parse_deep_link, NetplayChatMessage, NetplayRoom,
+    NetplayWirePacket, StunDiscoveryCandidate, TournamentBracket, UdpNetplayNode,
 };
 use zaimule_core::overrides::{resolve_effective_config, EffectiveGameConfig, GlobalSettings};
 use zaimule_core::patch::{
@@ -47,8 +49,8 @@ use zaimule_core::patch::{
 };
 use zaimule_core::rewind::{rle_compress, rle_decompress, RewindBuffer, SaveStateSlotInfo};
 use zaimule_core::storage::{
-    decode_portable_pack, encode_portable_pack, PersistedSaveState, ZaimulePortablePack,
-    PORTABLE_PACK_MAGIC,
+    decode_portable_pack, encode_portable_pack, inspect_sram_hex, write_sram_byte_and_rehash,
+    PersistedSaveState, SramHexInspection, ZaimulePortablePack, PORTABLE_PACK_MAGIC,
 };
 
 /// Snapshot of the entire Zaimule station sent to the UI.
@@ -63,11 +65,13 @@ pub struct StationBootstrap {
     pub cheat_codes: Vec<CheatCodeEntry>,
     pub achievements: Vec<AchievementEntry>,
     pub save_slots: Vec<SaveStateSlotInfo>,
+    pub sram_hex_inspection: SramHexInspection,
     pub keymapper_widgets: Vec<KeymapWidget>,
     pub macros: Vec<MacroSequence>,
     pub ghost_leaderboard: Vec<GhostLeaderboardEntry>,
     pub netplay_rooms: Vec<NetplayRoom>,
     pub netplay_chat: Vec<NetplayChatMessage>,
+    pub tournament_bracket: TournamentBracket,
     pub stun_candidate: StunDiscoveryCandidate,
     pub udp_local_port: u16,
     pub udp_peer_addr: Option<String>,
@@ -109,6 +113,7 @@ pub struct EmulatorSession {
     pub macro_start_frame: u64,
     pub netplay_rooms: Vec<NetplayRoom>,
     pub netplay_chat: Vec<NetplayChatMessage>,
+    pub tournament_bracket: TournamentBracket,
     pub udp_node: UdpNetplayNode,
     pub libretro_cores: Vec<LibretroCoreDescriptor>,
     pub link_telemetry: LinkCableTelemetry,
@@ -159,7 +164,17 @@ fn build_core_for(console: ConsoleKind, rom: &[u8]) -> Result<Box<dyn EmulatorBa
             c.load_rom(rom)?;
             Ok(Box::new(c))
         }
-        ConsoleKind::Nes | ConsoleKind::N64 => {
+        ConsoleKind::N64 => {
+            let mut c = N64Core::new();
+            c.load_rom(rom)?;
+            Ok(Box::new(c))
+        }
+        ConsoleKind::Megadrive => {
+            let mut c = MegaDriveCore::new();
+            c.load_rom(rom)?;
+            Ok(Box::new(c))
+        }
+        ConsoleKind::Nes => {
             let mut c = NesCore::new();
             c.load_rom(rom)?;
             Ok(Box::new(c))
@@ -192,13 +207,14 @@ impl EmulatorSession {
             macro_start_frame: 0,
             netplay_rooms: default_netplay_rooms(),
             netplay_chat: default_netplay_chat(),
+            tournament_bracket: default_tournament_bracket(),
             udp_node: UdpNetplayNode::bind_ephemeral(),
             libretro_cores: default_libretro_cores(),
             link_telemetry: LinkCableTelemetry::default(),
             rewind_buffer: RewindBuffer::new(240), // 240 snapshots @ 4Hz = 60s
             save_states_ram: HashMap::new(),
             custom_roms: HashMap::new(),
-            breakpoints: vec![0x0150, 0x0800_00C0, 0x8001_0000],
+            breakpoints: vec![0x0150, 0x0800_00C0, 0x8001_0000, 0x8000_0400, 0x0000_0200],
             last_score: 0,
             recent_inputs_trace: Vec::with_capacity(128),
             sram_dirty: false,
@@ -231,11 +247,13 @@ impl EmulatorSession {
             cheat_codes: self.cheat_codes.clone(),
             achievements: self.achievements.clone(),
             save_slots: self.list_save_slots_for(&self.active_game_id),
+            sram_hex_inspection: inspect_sram_hex(self.core_p1.sram(), 0, 4),
             keymapper_widgets: self.keymapper_widgets.clone(),
             macros: self.macros.clone(),
             ghost_leaderboard: self.ghost_leaderboard.clone(),
             netplay_rooms: self.netplay_rooms.clone(),
             netplay_chat: self.netplay_chat.clone(),
+            tournament_bracket: self.tournament_bracket.clone(),
             stun_candidate: discover_stun_candidate(self.udp_node.local_port),
             udp_local_port: self.udp_node.local_port,
             udp_peer_addr: self.udp_node.peer_addr.clone(),
@@ -275,7 +293,9 @@ impl EmulatorSession {
             ConsoleKind::Nds => build_nds_dual_phantom_rom(),
             ConsoleKind::Snes => build_snes_valkyrie_mode7_rom(),
             ConsoleKind::Ps1 => build_ps1_cyber_ridge_rom(),
-            ConsoleKind::Nes | ConsoleKind::N64 => build_nes_chrono_knight_rom(),
+            ConsoleKind::N64 => build_n64_star_wing_rom(),
+            ConsoleKind::Megadrive => build_md_supersonic_rom(),
+            ConsoleKind::Nes => build_nes_chrono_knight_rom(),
             _ => build_gb_pocket_arena_rom(),
         }
     }
@@ -825,7 +845,7 @@ impl EmulatorSession {
         }
         let pack = ZaimulePortablePack {
             magic: PORTABLE_PACK_MAGIC.into(),
-            version: "0.6.0".into(),
+            version: "0.7.0".into(),
             active_game_id: self.active_game_id.clone(),
             sram_rle,
             sram_uncompressed_len: sram_raw.len(),
@@ -1031,6 +1051,63 @@ impl EmulatorSession {
         }
         self.apply_custom_ips_to_active_game(&pkg.title, &pkg.ips_bytes)
     }
+
+    /// Returns a 4-row hexadecimal + ASCII inspection snapshot of the active game's SRAM / Memory Card.
+    pub fn inspect_active_sram_hex(&self, offset: usize) -> SramHexInspection {
+        inspect_sram_hex(self.core_p1.sram(), offset, 4)
+    }
+
+    /// Writes a single byte into the active game's SRAM / Memory Card (`0x0000..sram.len()`),
+    /// synchronizes the live score if offset `4` is edited, and returns the updated `StationBootstrap`.
+    pub fn write_active_sram_byte(
+        &mut self,
+        offset: usize,
+        value: u8,
+    ) -> Result<StationBootstrap, String> {
+        let mut sram_vec = self.core_p1.sram().to_vec();
+        let _ = write_sram_byte_and_rehash(&mut sram_vec, offset, value)?;
+        let _ = self.core_p1.load_sram(&sram_vec);
+        if offset == 4 {
+            self.core_p1.apply_ram_cheat(0xC108, value);
+            self.last_score = value as u32;
+        }
+        self.sram_dirty = true;
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Transfers / synchronizes the active Cartridge SRAM or Memory Card (`.srm` / `.mcd` / `.mpk`)
+    /// from Instance #1 (`J1`) to Instance #2 (`J2`) over the Virtual Link Bridge.
+    pub fn transfer_sram_p1_to_p2(&mut self) -> Result<StationBootstrap, String> {
+        let p1_sram = self.core_p1.sram().to_vec();
+        self.core_p2.load_sram(&p1_sram)?;
+        self.link_telemetry.packets_transferred =
+            self.link_telemetry.packets_transferred.saturating_add(64);
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Advances an elimination Tournament Bracket match and automatically populates the Grand Final / Champion.
+    pub fn advance_tournament_match(
+        &mut self,
+        match_id: &str,
+        score_a: u32,
+        score_b: u32,
+    ) -> Result<StationBootstrap, String> {
+        self.tournament_bracket
+            .advance_match(match_id, score_a, score_b)?;
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Toggles the Netplay Tournament Spectator Mode.
+    pub fn toggle_tournament_spectator_mode(&mut self) -> StationBootstrap {
+        self.tournament_bracket.spectator_mode_active =
+            !self.tournament_bracket.spectator_mode_active;
+        for m in &mut self.tournament_bracket.matches {
+            if self.tournament_bracket.spectator_mode_active {
+                m.spectators_count = m.spectators_count.saturating_add(1);
+            }
+        }
+        self.bootstrap_snapshot()
+    }
 }
 
 #[cfg(test)]
@@ -1164,5 +1241,34 @@ mod tests {
             .install_community_ips_mod("mod-ps1-pgxp-nitro")
             .unwrap();
         assert!(mod_boot.community_mods[0].installed);
+    }
+
+    #[test]
+    fn session_runs_n64_and_megadrive_transfers_sram_and_advances_tournament() {
+        let mut session = EmulatorSession::new();
+        session.select_game("n64-star-wing-64").unwrap();
+        let step_n64 = session.step_viewport(BTN_RIGHT | BTN_A, 0, false);
+        assert_eq!(step_n64.primary.width, 320);
+        assert_eq!(step_n64.primary.height, 240);
+        assert!(step_n64.primary.cpu.arch.contains("VR4300"));
+
+        session.select_game("md-supersonic-blast").unwrap();
+        let step_md = session.step_viewport(BTN_RIGHT | BTN_A, 0, false);
+        assert_eq!(step_md.primary.width, 320);
+        assert_eq!(step_md.primary.height, 224);
+        assert!(step_md.primary.cpu.arch.contains("68000"));
+
+        let sram_boot = session.write_active_sram_byte(4, 0x77).unwrap();
+        assert_eq!(sram_boot.sram_hex_inspection.score_slot_value, 0x77);
+        let xfer_boot = session.transfer_sram_p1_to_p2().unwrap();
+        assert!(xfer_boot.link_telemetry.packets_transferred >= 64);
+
+        let tourney_boot = session
+            .advance_tournament_match("match-final", 300, 210)
+            .unwrap();
+        assert_eq!(
+            tourney_boot.tournament_bracket.champion.as_deref(),
+            Some("Zainados")
+        );
     }
 }

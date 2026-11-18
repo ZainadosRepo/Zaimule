@@ -8,6 +8,8 @@ pub mod gb;
 pub mod gba;
 pub mod libretro;
 pub mod link;
+pub mod megadrive;
+pub mod n64;
 pub mod nds;
 pub mod nes;
 pub mod ps1;

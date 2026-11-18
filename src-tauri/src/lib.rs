@@ -12,6 +12,7 @@ use zaimule_core::rewind::SaveStateSlotInfo;
 use zaimule_core::storage::{
     load_json_atomic, load_sram_bytes, load_state_slot_atomic, save_json_atomic,
     save_rom_binary_atomic, save_sram_with_rotation, save_state_slot_atomic, LoadedJson,
+    SramHexInspection,
 };
 use zaimule_emu::debugger::DebuggerPayload;
 use zaimule_emu::session::{EmulatorSession, StationBootstrap, ViewportStepResponse};
@@ -572,6 +573,71 @@ fn install_community_ips_mod(
 }
 
 #[tauri::command]
+fn inspect_sram_hex_view(
+    state: tauri::State<AppState>,
+    offset: usize,
+) -> Result<SramHexInspection, String> {
+    let session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    Ok(session.inspect_active_sram_hex(offset))
+}
+
+#[tauri::command]
+fn write_sram_byte_live(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    offset: usize,
+    value: u8,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let snap = session.write_active_sram_byte(offset, value)?;
+    flush_sram_best_effort(&app, &session);
+    Ok(snap)
+}
+
+#[tauri::command]
+fn transfer_sram_p1_to_p2(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let snap = session.transfer_sram_p1_to_p2()?;
+    flush_sram_best_effort(&app, &session);
+    Ok(snap)
+}
+
+#[tauri::command]
+fn advance_tournament_match(
+    state: tauri::State<AppState>,
+    match_id: String,
+    score_a: u32,
+    score_b: u32,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    session.advance_tournament_match(&match_id, score_a, score_b)
+}
+
+#[tauri::command]
+fn toggle_tournament_spectator(state: tauri::State<AppState>) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    Ok(session.toggle_tournament_spectator_mode())
+}
+
+#[tauri::command]
 fn load_settings(app: AppHandle) -> Result<LoadedJson, String> {
     load_json_atomic(&settings_path(&app)?)
 }
@@ -633,6 +699,11 @@ pub fn run() {
             submit_ghost_leaderboard_run,
             challenge_ghost_run,
             install_community_ips_mod,
+            inspect_sram_hex_view,
+            write_sram_byte_live,
+            transfer_sram_p1_to_p2,
+            advance_tournament_match,
+            toggle_tournament_spectator,
             add_cheat_code,
             toggle_cheat_code,
             scan_ram_byte,
