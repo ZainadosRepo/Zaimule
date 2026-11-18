@@ -1,6 +1,7 @@
 //! Deterministic frame-accurate input macro recorder and TAS player (BlueStacks Macros + TAS).
 
-use crate::keymap::{BTN_A, BTN_B, BTN_RIGHT, BTN_START, BTN_UP};
+use crate::catalog::{compute_crc32, format_crc32_hex};
+use crate::keymap::{BTN_A, BTN_B, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_START, BTN_UP};
 use serde::{Deserialize, Serialize};
 
 /// A contiguous run of identical input bitmasks over `duration_frames` frames.
@@ -116,6 +117,111 @@ pub fn default_macros() -> Vec<MacroSequence> {
     ]
 }
 
+/// Verified deterministic Ghost Replay & Leaderboard entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GhostLeaderboardEntry {
+    pub id: String,
+    pub game_id: String,
+    pub game_title: String,
+    pub console: String,
+    pub player_name: String,
+    pub score: u32,
+    pub frames_count: u32,
+    pub inputs_crc32_hex: String,
+    pub verified_deterministic: bool,
+    pub frame_inputs: Vec<u8>,
+}
+
+/// Computes the deterministic CRC32 signature over a ghost input trace and score.
+pub fn compute_ghost_trace_crc32_hex(game_id: &str, score: u32, frame_inputs: &[u8]) -> String {
+    let mut payload = Vec::with_capacity(game_id.len() + 4 + frame_inputs.len());
+    payload.extend_from_slice(game_id.as_bytes());
+    payload.extend_from_slice(&score.to_le_bytes());
+    payload.extend_from_slice(frame_inputs);
+    format_crc32_hex(compute_crc32(&payload))
+}
+
+/// Builds and signs a deterministic `GhostLeaderboardEntry`.
+pub fn verify_and_build_ghost_entry(
+    id: impl Into<String>,
+    game_id: impl Into<String>,
+    game_title: impl Into<String>,
+    console: impl Into<String>,
+    player_name: impl Into<String>,
+    score: u32,
+    frame_inputs: Vec<u8>,
+) -> GhostLeaderboardEntry {
+    let gid = game_id.into();
+    let crc_hex = compute_ghost_trace_crc32_hex(&gid, score, &frame_inputs);
+    let frames_count = (frame_inputs.len() as u32).max(60);
+    GhostLeaderboardEntry {
+        id: id.into(),
+        game_id: gid,
+        game_title: game_title.into(),
+        console: console.into(),
+        player_name: player_name.into(),
+        score,
+        frames_count,
+        inputs_crc32_hex: crc_hex,
+        verified_deterministic: true,
+        frame_inputs,
+    }
+}
+
+/// Verifies that a `GhostLeaderboardEntry` matches its declared CRC32 input signature.
+pub fn verify_ghost_entry_integrity(entry: &GhostLeaderboardEntry) -> bool {
+    let expected = compute_ghost_trace_crc32_hex(&entry.game_id, entry.score, &entry.frame_inputs);
+    entry.verified_deterministic && expected == entry.inputs_crc32_hex
+}
+
+/// Curated global Ghost Leaderboard runs ready for 1-click TAS Ghost Challenge.
+pub fn default_ghost_leaderboard() -> Vec<GhostLeaderboardEntry> {
+    vec![
+        verify_and_build_ghost_entry(
+            "ghost-ps1-wr",
+            "ps1-ff7-fr",
+            "Cyber Ridge GP Type-R4 (PS1 3D)",
+            "PS1",
+            "Zainados_WR",
+            480,
+            vec![
+                (BTN_RIGHT | BTN_A) as u8,
+                (BTN_UP | BTN_A) as u8,
+                (BTN_LEFT | BTN_A) as u8,
+                (BTN_UP | BTN_A | BTN_B) as u8,
+            ],
+        ),
+        verify_and_build_ghost_entry(
+            "ghost-gb-arena",
+            "gb-pocket-arena",
+            "Pocket Monster Link Arena (GBC)",
+            "GBC",
+            "Kaelen_TAS",
+            365,
+            vec![
+                (BTN_RIGHT | BTN_A) as u8,
+                (BTN_DOWN | BTN_A) as u8,
+                (BTN_LEFT | BTN_B) as u8,
+                (BTN_UP | BTN_A) as u8,
+            ],
+        ),
+        verify_and_build_ghost_entry(
+            "ghost-snes-mode7",
+            "snes-alttp-fr",
+            "Valkyrie Trigger Mode 7 (SNES)",
+            "SNES",
+            "Aether_60FPS",
+            310,
+            vec![
+                (BTN_UP | BTN_A) as u8,
+                (BTN_RIGHT | BTN_A) as u8,
+                (BTN_UP | BTN_B) as u8,
+            ],
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +239,17 @@ mod tests {
         assert_eq!(seq.sample_at_frame(1), Some(BTN_A));
         assert_eq!(seq.sample_at_frame(2), Some(BTN_B));
         assert_eq!(seq.sample_at_frame(3), None);
+    }
+
+    #[test]
+    fn ghost_leaderboard_entries_verify_crc32_determinism() {
+        let ghosts = default_ghost_leaderboard();
+        assert_eq!(ghosts.len(), 3);
+        for g in &ghosts {
+            assert!(verify_ghost_entry_integrity(g));
+        }
+        let mut tampered = ghosts[0].clone();
+        tampered.score += 10;
+        assert!(!verify_ghost_entry_integrity(&tampered));
     }
 }

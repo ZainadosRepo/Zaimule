@@ -80,3 +80,11 @@ export function computeConsoleCounts(entries) {
   }
   return counts;
 }
+
+export function formatHardwareProfileLabel(cpuOverclockPct = 100, pgxpSubpixel = true) {
+  const clamped = Math.max(50, Math.min(400, Number(cpuOverclockPct) || 100));
+  const mode = clamped > 100 ? "Turbo" : "Natif";
+  const pgxp = pgxpSubpixel ? "PGXP ON" : "PGXP OFF";
+  return `${clamped}% ${mode} · ${pgxp}`;
+}
+

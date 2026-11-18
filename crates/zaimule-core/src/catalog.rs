@@ -45,7 +45,7 @@ impl ConsoleKind {
             Self::Nes => "zaimule-rust-nes",
             Self::Snes => "zaimule-rust-snes",
             Self::Nds => "zaimule-rust-nds",
-            Self::Ps1 => "swanstation_libretro",
+            Self::Ps1 => "zaimule-rust-ps1",
             Self::N64 => "mupen64plus_next_libretro",
             Self::Psp => "ppsspp_libretro",
             Self::Megadrive => "genesis_plus_gx_libretro",
@@ -55,7 +55,14 @@ impl ConsoleKind {
     pub fn is_native_rust(self) -> bool {
         matches!(
             self,
-            Self::Chip8 | Self::Gb | Self::Gbc | Self::Gba | Self::Nes | Self::Snes | Self::Nds
+            Self::Chip8
+                | Self::Gb
+                | Self::Gbc
+                | Self::Gba
+                | Self::Nes
+                | Self::Snes
+                | Self::Nds
+                | Self::Ps1
         )
     }
 
@@ -353,20 +360,20 @@ pub fn default_catalog() -> Vec<GameEntry> {
         },
         GameEntry {
             id: "ps1-ff7-fr".into(),
-            title: "Final Fantasy VII (Disque 1)".into(),
+            title: "Cyber Ridge GP Type-R4 & FF7 (PS1 3D)".into(),
             console: ConsoleKind::Ps1,
-            engine_kind: CoreEngineKind::LibretroAbi,
-            core_id: "swanstation_libretro".into(),
-            region: "EUR · FR".into(),
+            engine_kind: CoreEngineKind::NativeRust,
+            core_id: "zaimule-rust-ps1".into(),
+            region: "EUR · FR (MIPS R3000A + GTE PGXP Inclus)".into(),
             crc32_hex: "9B8E71A2".into(),
-            size_bytes: 681_574_400,
-            sram_summary: "Carte Mémoire .mcr (Slots 1 & 2)".into(),
+            size_bytes: 32_768,
+            sram_summary: "Carte Mémoire .mcd Atomique (Slots 1 & 2)".into(),
             playtime_seconds: 231_120,
             favorite: true,
             link_cable_ready: false,
-            embedded_rom_key: Some("nes_chrono_knight".into()),
-            cover_accent: "#134e4a".into(),
-            cover_symbol: "☄️".into(),
+            embedded_rom_key: Some("ps1_cyber_ridge".into()),
+            cover_accent: "#312e81".into(),
+            cover_symbol: "🏎️".into(),
         },
     ]
 }

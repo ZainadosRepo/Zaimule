@@ -52,14 +52,22 @@ pub fn disassemble_window(
     for i in 0..count {
         let (step_len, bytes_hex, mnemonic) = match console {
             ConsoleKind::Gba | ConsoleKind::Nds => decode_arm7tdmi(rom, cursor),
-            ConsoleKind::Chip8 => decode_chip8(rom, cursor),
-            ConsoleKind::Nes | ConsoleKind::Snes | ConsoleKind::Ps1 | ConsoleKind::N64 => {
-                decode_mos6502(rom, cursor)
+            ConsoleKind::Ps1 | ConsoleKind::N64 | ConsoleKind::Psp => {
+                decode_mips_r3000a(rom, cursor)
             }
+            ConsoleKind::Chip8 => decode_chip8(rom, cursor),
+            ConsoleKind::Nes | ConsoleKind::Snes => decode_mos6502(rom, cursor),
             _ => decode_lr35902(rom, cursor),
         };
 
-        let addr_hex = if matches!(console, ConsoleKind::Gba | ConsoleKind::Nds) {
+        let addr_hex = if matches!(
+            console,
+            ConsoleKind::Gba
+                | ConsoleKind::Nds
+                | ConsoleKind::Ps1
+                | ConsoleKind::N64
+                | ConsoleKind::Psp
+        ) {
             format!("0x{cursor:08X}")
         } else {
             format!("0x{:04X}", cursor & 0xFFFF)
@@ -247,6 +255,54 @@ fn decode_arm7tdmi(rom: &[u8], pc: u32) -> (u32, String, String) {
     (4, hex, format!("DCD 0x{word:08X}"))
 }
 
+fn decode_mips_r3000a(rom: &[u8], pc: u32) -> (u32, String, String) {
+    let offset = (pc.saturating_sub(0x8001_0000) as usize) & !3;
+    let b0 = read_rom_byte(rom, offset);
+    let b1 = read_rom_byte(rom, offset + 1);
+    let b2 = read_rom_byte(rom, offset + 2);
+    let b3 = read_rom_byte(rom, offset + 3);
+    let instr = u32::from_le_bytes([b0, b1, b2, b3]);
+    let hex = format!("{b3:02X}{b2:02X}{b1:02X}{b0:02X}");
+
+    if instr == 0 {
+        return (4, hex, "NOP".into());
+    }
+    let op = instr >> 26;
+    let rs = (instr >> 21) & 0x1F;
+    let rt = (instr >> 16) & 0x1F;
+    let rd = (instr >> 11) & 0x1F;
+    let imm = instr & 0xFFFF;
+
+    let mnem = match op {
+        0x00 => {
+            let funct = instr & 0x3F;
+            match funct {
+                0x08 => format!("JR ${rs}"),
+                0x21 => format!("ADDU ${rd}, ${rs}, ${rt}"),
+                0x23 => format!("SUBU ${rd}, ${rs}, ${rt}"),
+                _ => format!("SPECIAL 0x{funct:02X}"),
+            }
+        }
+        0x02 => {
+            let target = (pc & 0xF000_0000) | ((instr & 0x03FF_FFFF) << 2);
+            format!("J 0x{target:08X}")
+        }
+        0x09 => format!("ADDIU ${rt}, ${rs}, 0x{imm:04X}"),
+        0x0D => format!("ORI ${rt}, ${rs}, 0x{imm:04X}"),
+        0x0F => format!("LUI ${rt}, 0x{imm:04X}"),
+        0x12 => {
+            let gte_cmd = instr & 0x3F;
+            match gte_cmd {
+                0x01 => "COP2 GTE RTPS".into(),
+                0x06 => "COP2 GTE NCLIP".into(),
+                _ => format!("COP2 GTE 0x{gte_cmd:02X}"),
+            }
+        }
+        _ => format!("DW 0x{instr:08X}"),
+    };
+    (4, hex, mnem)
+}
+
 fn decode_chip8(rom: &[u8], pc: u32) -> (u32, String, String) {
     let offset = pc.saturating_sub(0x200) as usize;
     let hi = read_rom_byte(rom, offset);
@@ -368,6 +424,7 @@ mod tests {
     use super::*;
     use crate::gb::build_gb_pocket_arena_rom;
     use crate::gba::build_gba_golden_horizon_rom;
+    use crate::ps1::build_ps1_cyber_ridge_rom;
 
     #[test]
     fn disassembler_decodes_lr35902_and_arm7tdmi_mnemonics() {
@@ -383,6 +440,11 @@ mod tests {
         let gba_lines = disassemble_window(ConsoleKind::Gba, &gba_rom, 0x0800_00C0, &[], 2);
         assert_eq!(gba_lines[0].mnemonic, "ADD R2, R2, #1");
         assert!(gba_lines[1].mnemonic.starts_with("B 0x080000C0"));
+
+        let ps1_rom = build_ps1_cyber_ridge_rom();
+        let ps1_lines = disassemble_window(ConsoleKind::Ps1, &ps1_rom, 0x8001_0000, &[], 5);
+        assert_eq!(ps1_lines[0].mnemonic, "LUI $8, 0x8001");
+        assert_eq!(ps1_lines[3].mnemonic, "COP2 GTE RTPS");
     }
 
     #[test]

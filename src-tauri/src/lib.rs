@@ -516,6 +516,62 @@ fn post_netplay_chat_message(
 }
 
 #[tauri::command]
+fn set_hardware_overclock_profile(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    cpu_overclock_pct: u16,
+    pgxp_subpixel: bool,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let snap = session.set_hardware_overclock_profile(cpu_overclock_pct, pgxp_subpixel);
+    if let Ok(path) = settings_path(&app) {
+        if let Ok(val) = serde_json::to_value(&session.settings) {
+            let _ = save_json_atomic(&path, &val);
+        }
+    }
+    Ok(snap)
+}
+
+#[tauri::command]
+fn submit_ghost_leaderboard_run(
+    state: tauri::State<AppState>,
+    player_name: String,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    Ok(session.submit_ghost_leaderboard_run(player_name))
+}
+
+#[tauri::command]
+fn challenge_ghost_run(
+    state: tauri::State<AppState>,
+    ghost_id: String,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    session.challenge_ghost_run(&ghost_id)
+}
+
+#[tauri::command]
+fn install_community_ips_mod(
+    state: tauri::State<AppState>,
+    mod_id: String,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    session.install_community_ips_mod(&mod_id)
+}
+
+#[tauri::command]
 fn load_settings(app: AppHandle) -> Result<LoadedJson, String> {
     load_json_atomic(&settings_path(&app)?)
 }
@@ -573,6 +629,10 @@ pub fn run() {
             set_nds_stylus,
             paint_vram_atlas_pixel,
             post_netplay_chat_message,
+            set_hardware_overclock_profile,
+            submit_ghost_leaderboard_run,
+            challenge_ghost_run,
+            install_community_ips_mod,
             add_cheat_code,
             toggle_cheat_code,
             scan_ram_byte,

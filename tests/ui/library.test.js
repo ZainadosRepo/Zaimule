@@ -5,7 +5,8 @@ import {
   formatPlaytime,
   formatFileSize,
   filterCatalogEntries,
-  computeConsoleCounts
+  computeConsoleCounts,
+  formatHardwareProfileLabel
 } from "../../ui/library.js";
 
 const SAMPLE_ENTRIES = [
@@ -35,8 +36,8 @@ const SAMPLE_ENTRIES = [
     id: "ps1-ff7",
     title: "Final Fantasy VII",
     console: "PS1",
-    engineKind: "libretroAbi",
-    coreId: "swanstation_libretro",
+    engineKind: "nativeRust",
+    coreId: "zaimule-rust-ps1",
     region: "EUR · FR",
     crc32Hex: "9B8E71A2",
     favorite: false,
@@ -61,7 +62,7 @@ test("filterCatalogEntries filters by console, nativeRust, linkCable, and accent
   assert.equal(byQuery[0].id, "gba-emerald");
 
   const byRust = filterCatalogEntries(SAMPLE_ENTRIES, { onlyNativeRust: true });
-  assert.equal(byRust.length, 1);
+  assert.equal(byRust.length, 2);
   assert.equal(byRust[0].id, "gb-pocket-arena");
 
   const byLink = filterCatalogEntries(SAMPLE_ENTRIES, { onlyLinkReady: true });
@@ -74,6 +75,12 @@ test("computeConsoleCounts tallies consoles, rust cores, and link cable games", 
   assert.equal(counts.GBC, 1);
   assert.equal(counts.GBA, 1);
   assert.equal(counts.PS1, 1);
-  assert.equal(counts.RUST, 1);
+  assert.equal(counts.RUST, 2);
   assert.equal(counts.LINK, 2);
 });
+
+test("formatHardwareProfileLabel formats Yuzu CPU overclock and PGXP state", () => {
+  assert.equal(formatHardwareProfileLabel(100, true), "100% Natif · PGXP ON");
+  assert.equal(formatHardwareProfileLabel(200, false), "200% Turbo · PGXP OFF");
+});
+

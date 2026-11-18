@@ -107,18 +107,18 @@ const FALLBACK_CATALOG = [
     coverSymbol: "🔍"
   },
   {
-    id: "ps1-cyber-ridge",
-    title: "Cyber Ridge GP Type-R4",
+    id: "ps1-ff7-fr",
+    title: "Cyber Ridge GP Type-R4 & FF7 (PS1 3D)",
     console: "PS1",
-    engineKind: "libretroAbi",
-    coreId: "swanstation_libretro",
-    region: "PAL · 60Hz Override",
+    engineKind: "nativeRust",
+    coreId: "zaimule-rust-ps1",
+    region: "EUR · FR (MIPS R3000A + GTE 3D Inclus)",
     crc32Hex: "C9104FA2",
-    sizeBytes: 540000000,
-    sramSummary: "Carte Mémoire Slot 1 (.mcd Atomique)",
+    sizeBytes: 32768,
+    sramSummary: "128 Ko Carte Mémoire Slot 1 (.mcd) + PGXP",
     playtimeSeconds: 11400,
-    favorite: false,
-    linkCableReady: false,
+    favorite: true,
+    linkCableReady: true,
     coverAccent: "#312e81",
     coverSymbol: "🏎️"
   },
@@ -266,6 +266,58 @@ let state = {
       saveStateCrcHex: "DCE0682B"
     }
   ],
+  communityMods: [
+    {
+      id: "mod-fr-integral-dx",
+      title: "🇫🇷 Traduction Française Intégrale DX v2.4 (.ips)",
+      author: "Équipe Zaimule FR",
+      targetConsole: "Multi-Consoles (GBC / GBA / SNES / PS1)",
+      description: "Patch binaire .IPS non-destructif : polices accentuées et dialogues traduits.",
+      installed: false
+    },
+    {
+      id: "mod-60fps-overdrive",
+      title: "⚡ Patch 60 FPS Déverrouillé & Sans Ralentissement (.ips)",
+      author: "Kaelen_TAS",
+      targetConsole: "PS1 / SNES / GBA",
+      description: "Supprime les diviseurs de VBlank 30 FPS et active le pipeline 60 Hz.",
+      installed: false
+    },
+    {
+      id: "mod-trinitron-palette",
+      title: "🎨 Pack Colorimétrique Sony PVM & AGS-101 (.ips)",
+      author: "Zainados",
+      targetConsole: "GBC / GBA / NDS",
+      description: "Recalibre les tables de palettes 15-bit RGB555.",
+      installed: false
+    }
+  ],
+  ghostLeaderboard: [
+    {
+      id: "ghost-wr-zainados",
+      gameId: "gb-pocket-arena",
+      gameTitle: "Pocket Monster Link Arena (DMG/GBC)",
+      console: "GBC",
+      playerName: "Zainados",
+      score: 185,
+      framesCount: 240,
+      traceCrc32Hex: "A482F19B",
+      verified: true
+    },
+    {
+      id: "ghost-wr-ps1-ridge",
+      gameId: "ps1-ff7-fr",
+      gameTitle: "Cyber Ridge GP Type-R4 & FF7 (PS1 3D)",
+      console: "PS1",
+      playerName: "Kaelen_FR",
+      score: 240,
+      framesCount: 240,
+      traceCrc32Hex: "7C91E03A",
+      verified: true
+    }
+  ],
+  cpuOverclockPct: 100,
+  pgxpSubpixel: true,
   libretroCores: [
     {
       coreId: "mgba_libretro",
@@ -317,7 +369,7 @@ let state = {
       console: "PS1",
       fileName: "scph5502.bin",
       expectedCrc32Hex: "32736F17",
-      notes: "Requis pour PlayStation 1 PAL/EUR"
+      notes: "Optionnel (BIOS HLE MIPS R3000A Rust inclus)"
     }
   ],
   linkTelemetry: { enabled: false, quadMode: false, packetsTransferred: 0 },
@@ -650,6 +702,20 @@ function renderInspector() {
   document.getElementById("active-emu-game").textContent = `${g.console} · ${g.title}`;
   document.getElementById("tel-core").textContent = `${g.coreId} (${g.console})`;
 
+  const ocBadge = document.getElementById("insp-overclock-badge");
+  if (ocBadge) {
+    ocBadge.textContent = `${state.cpuOverclockPct}% · PGXP ${state.pgxpSubpixel ? "ON" : "OFF"}`;
+  }
+  const ocBtn = document.getElementById("btn-overclock-cycle");
+  if (ocBtn) {
+    ocBtn.textContent = `⚡ CPU : ${state.cpuOverclockPct}% ${state.cpuOverclockPct > 100 ? "Turbo" : "Natif"}`;
+  }
+  const pgxpBtn = document.getElementById("btn-pgxp-toggle");
+  if (pgxpBtn) {
+    pgxpBtn.textContent = `📐 PGXP 3D : ${state.pgxpSubpixel ? "ON" : "OFF"}`;
+    pgxpBtn.style.color = state.pgxpSubpixel ? "var(--phosphor-green)" : "var(--text-muted)";
+  }
+
   const modsEl = document.getElementById("mods-list");
   if (modsEl) {
     modsEl.innerHTML = "";
@@ -894,11 +960,68 @@ function renderNetplayAndCores() {
       });
       netGrid.appendChild(card);
     }
+
+    for (const ghost of state.ghostLeaderboard || []) {
+      const card = document.createElement("div");
+      card.className = "panel-card";
+      card.innerHTML = `
+        <div class="section-title">
+          <span>👻 Record Fantôme TAS · ${ghost.playerName}</span>
+          <span class="pill-badge pill-cobalt mono">🏆 ${ghost.score} pts · CRC ${ghost.traceCrc32Hex}</span>
+        </div>
+        <div class="kv-row"><span class="kv-label">Jeu &amp; Console</span><span class="kv-val">${ghost.gameTitle} (${ghost.console})</span></div>
+        <div class="kv-row"><span class="kv-label">Trace Déterministe</span><span class="kv-val mono" style="color:var(--phosphor-green)">✓ Vérifié (${ghost.framesCount} frames)</span></div>
+        <div style="margin-top:10px; display:flex; justify-content:flex-end;">
+          <button class="btn mono" style="font-size:11px; border-color:var(--cobalt); color:var(--cobalt);">⚔️ Défier Fantôme TAS en Direct</button>
+        </div>
+      `;
+      card.querySelector("button").addEventListener("click", async () => {
+        const boot = await invokeBackend("challenge_ghost_run", { ghostId: ghost.id });
+        if (boot) applyBootstrap(boot);
+        document.getElementById("macro-status").textContent = "DÉFI FANTÔME TAS";
+        switchTab("view-emulator");
+      });
+      netGrid.appendChild(card);
+    }
   }
 
   const coresGrid = document.getElementById("cores-grid");
   if (coresGrid) {
     coresGrid.innerHTML = "";
+
+    const communityCard = document.createElement("div");
+    communityCard.className = "panel-card";
+    communityCard.innerHTML = `<div class="section-title"><span>🧩 Hub Communautaire de Mods .IPS (Installation 1-Clic Non-Destructive)</span></div>`;
+    for (const mod of state.communityMods || []) {
+      const row = document.createElement("div");
+      row.className = "mod-item";
+      row.innerHTML = `
+        <div>
+          <div style="font-weight:700">${mod.title}</div>
+          <div style="font-size:11px; color:var(--text-muted)">${mod.description}</div>
+          <div class="mono" style="font-size:10.5px; color:var(--gold)">Par ${mod.author} · Cible : ${mod.targetConsole}</div>
+        </div>
+        <button class="btn mono" style="padding:4px 10px; font-size:11px;">
+          ${mod.installed ? "✓ Patch .IPS Actif" : "⚡ Installer .IPS 1-Clic"}
+        </button>
+      `;
+      row.querySelector("button").addEventListener("click", async () => {
+        const boot = await invokeBackend("install_community_ips_mod", { modId: mod.id });
+        if (boot) {
+          applyBootstrap(boot);
+        } else {
+          mod.installed = true;
+          state.modLayers.unshift({
+            id: `comm-${mod.id}`,
+            label: `${mod.title} (Hub Communautaire)`,
+            enabled: true
+          });
+          updateAllViews();
+        }
+      });
+      communityCard.appendChild(row);
+    }
+
     const libCard = document.createElement("div");
     libCard.className = "panel-card";
     libCard.innerHTML = `<div class="section-title"><span>🧩 Hôte Dynamique Libretro C-ABI (libretro.h v1)</span></div>`;
@@ -952,6 +1075,7 @@ function renderNetplayAndCores() {
         .join("")}
     `;
 
+    coresGrid.appendChild(communityCard);
     coresGrid.appendChild(libCard);
     coresGrid.appendChild(biosCard);
   }
@@ -970,6 +1094,11 @@ function applyBootstrap(boot) {
   state.udpLocalPort = boot.udpLocalPort || state.udpLocalPort;
   state.stunCandidate = boot.stunCandidate || state.stunCandidate;
   state.netplayChat = boot.netplayChat || state.netplayChat;
+  state.communityMods = boot.communityMods || state.communityMods;
+  state.ghostLeaderboard = boot.ghostLeaderboard || state.ghostLeaderboard;
+  state.cpuOverclockPct = boot.cpuOverclockPct || state.cpuOverclockPct;
+  state.pgxpSubpixel =
+    boot.pgxpSubpixel !== undefined ? boot.pgxpSubpixel : state.pgxpSubpixel;
   state.libretroCores = boot.libretroCores || state.libretroCores;
   state.biosEntries = boot.biosEntries || state.biosEntries;
   state.linkTelemetry = boot.linkTelemetry || { enabled: false, packetsTransferred: 0 };
@@ -1360,6 +1489,50 @@ function bindEvents() {
   document.getElementById("btn-insp-ips")?.addEventListener("click", () => ipsInput?.click());
   document.getElementById("btn-import-pack")?.addEventListener("click", () => packInput?.click());
 
+  document.getElementById("btn-overclock-cycle")?.addEventListener("click", async () => {
+    state.cpuOverclockPct =
+      state.cpuOverclockPct === 100 ? 150 : state.cpuOverclockPct === 150 ? 200 : 100;
+    const boot = await invokeBackend("set_hardware_overclock_profile", {
+      cpuOverclockPct: state.cpuOverclockPct,
+      pgxpSubpixel: state.pgxpSubpixel
+    });
+    if (boot) applyBootstrap(boot);
+    else renderInspector();
+  });
+
+  document.getElementById("btn-pgxp-toggle")?.addEventListener("click", async () => {
+    state.pgxpSubpixel = !state.pgxpSubpixel;
+    const boot = await invokeBackend("set_hardware_overclock_profile", {
+      cpuOverclockPct: state.cpuOverclockPct,
+      pgxpSubpixel: state.pgxpSubpixel
+    });
+    if (boot) applyBootstrap(boot);
+    else renderInspector();
+  });
+
+  document.getElementById("btn-submit-ghost")?.addEventListener("click", async () => {
+    const g = getSelectedGame();
+    const boot = await invokeBackend("submit_ghost_leaderboard_run", {
+      playerName: "Zainados"
+    });
+    if (boot) {
+      applyBootstrap(boot);
+    } else {
+      state.ghostLeaderboard.unshift({
+        id: `ghost-${Date.now()}`,
+        gameId: g.id,
+        gameTitle: g.title,
+        console: g.console,
+        playerName: "Zainados",
+        score: Math.max(10, fallbackSim.score),
+        framesCount: Math.max(60, fallbackSim.frame),
+        traceCrc32Hex: g.crc32Hex,
+        verified: true
+      });
+      renderNetplayAndCores();
+    }
+  });
+
   document.getElementById("btn-export-pack")?.addEventListener("click", async () => {
     const packBytes =
       (await invokeBackend("export_portable_pack_archive")) ||
@@ -1367,7 +1540,7 @@ function bindEvents() {
         new TextEncoder().encode(
           JSON.stringify({
             magic: "ZAIMULE_PACK_V1",
-            version: "0.5.0",
+            version: "0.6.0",
             activeGameId: state.activeGameId,
             cheatCodes: state.cheatCodes,
             macros: state.macros

@@ -35,6 +35,8 @@ pub struct GlobalSettings {
     pub default_shader: ShaderPreset,
     pub internal_scale: u8,
     pub speed_multiplier: u8,
+    pub cpu_overclock_pct: u16,
+    pub pgxp_subpixel: bool,
     pub integer_scaling: bool,
     pub rewind_enabled: bool,
     pub rewind_horizon_seconds: u16,
@@ -50,6 +52,8 @@ impl Default for GlobalSettings {
             default_shader: ShaderPreset::CrtTrinitron,
             internal_scale: 4,
             speed_multiplier: 1,
+            cpu_overclock_pct: 100,
+            pgxp_subpixel: true,
             integer_scaling: true,
             rewind_enabled: true,
             rewind_horizon_seconds: 60,
@@ -68,6 +72,8 @@ pub struct GameProfileOverride {
     pub custom_shader: Option<ShaderPreset>,
     pub custom_scale: Option<u8>,
     pub custom_speed_multiplier: Option<u8>,
+    pub custom_cpu_overclock_pct: Option<u16>,
+    pub custom_pgxp_subpixel: Option<bool>,
     pub integer_scaling: Option<bool>,
     pub preferred_core_id: Option<String>,
     pub active_ips_mods: Vec<String>,
@@ -82,6 +88,8 @@ pub struct EffectiveGameConfig {
     pub shader: ShaderPreset,
     pub internal_scale: u8,
     pub speed_multiplier: u8,
+    pub cpu_overclock_pct: u16,
+    pub pgxp_subpixel: bool,
     pub integer_scaling: bool,
     pub core_id: String,
     pub active_ips_mods: Vec<String>,
@@ -114,6 +122,13 @@ pub fn resolve_effective_config(
         .and_then(|o| o.custom_speed_multiplier)
         .unwrap_or(global.speed_multiplier)
         .clamp(1, 8);
+    let cpu_overclock_pct = ov
+        .and_then(|o| o.custom_cpu_overclock_pct)
+        .unwrap_or(global.cpu_overclock_pct)
+        .clamp(50, 400);
+    let pgxp_subpixel = ov
+        .and_then(|o| o.custom_pgxp_subpixel)
+        .unwrap_or(global.pgxp_subpixel);
     let integer_scaling = ov
         .and_then(|o| o.integer_scaling)
         .unwrap_or(global.integer_scaling);
@@ -130,6 +145,8 @@ pub fn resolve_effective_config(
         shader,
         internal_scale,
         speed_multiplier,
+        cpu_overclock_pct,
+        pgxp_subpixel,
         integer_scaling,
         core_id,
         active_ips_mods,
@@ -146,6 +163,8 @@ mod tests {
         let cfg_default = resolve_effective_config(&global, "gba-emerald-fr", ConsoleKind::Gba);
         assert_eq!(cfg_default.shader, ShaderPreset::LcdMatrix);
         assert_eq!(cfg_default.internal_scale, 4);
+        assert_eq!(cfg_default.cpu_overclock_pct, 100);
+        assert!(cfg_default.pgxp_subpixel);
 
         global.game_overrides.insert(
             "gba-emerald-fr".into(),
@@ -153,6 +172,8 @@ mod tests {
                 custom_shader: Some(ShaderPreset::ScaleFx),
                 custom_scale: Some(6),
                 custom_speed_multiplier: Some(2),
+                custom_cpu_overclock_pct: Some(200),
+                custom_pgxp_subpixel: Some(false),
                 integer_scaling: Some(false),
                 preferred_core_id: Some("zaimule-rust-gba".into()),
                 active_ips_mods: vec!["patch_60fps.ips".into()],
@@ -163,6 +184,8 @@ mod tests {
         assert_eq!(cfg_custom.shader, ShaderPreset::ScaleFx);
         assert_eq!(cfg_custom.internal_scale, 6);
         assert_eq!(cfg_custom.speed_multiplier, 2);
+        assert_eq!(cfg_custom.cpu_overclock_pct, 200);
+        assert!(!cfg_custom.pgxp_subpixel);
         assert!(!cfg_custom.integer_scaling);
         assert_eq!(cfg_custom.core_id, "zaimule-rust-gba");
     }

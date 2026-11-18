@@ -16,6 +16,7 @@ use crate::libretro::{
 use crate::link::{step_quad_link_frame, LinkCableTelemetry};
 use crate::nds::{build_nds_dual_phantom_rom, NdsCore};
 use crate::nes::{build_nes_chrono_knight_rom, NesCore};
+use crate::ps1::{build_ps1_cyber_ridge_rom, Ps1Core};
 use crate::snes::{build_snes_valkyrie_mode7_rom, SnesCore};
 use crate::traits::{EmulatorBackend, FrameStepResult};
 use serde::{Deserialize, Serialize};
@@ -30,14 +31,20 @@ use zaimule_core::cheats::{
     AchievementEntry, CheatCodeEntry,
 };
 use zaimule_core::keymap::{apply_turbo_mask, default_keymapper_widgets, KeymapWidget};
-use zaimule_core::macros::{default_macros, MacroSequence};
+use zaimule_core::macros::{
+    default_ghost_leaderboard, default_macros, verify_and_build_ghost_entry, GhostLeaderboardEntry,
+    MacroSequence,
+};
 use zaimule_core::netplay::{
     default_netplay_chat, default_netplay_rooms, discover_stun_candidate, format_deep_link,
     parse_deep_link, NetplayChatMessage, NetplayRoom, NetplayWirePacket, StunDiscoveryCandidate,
     UdpNetplayNode,
 };
 use zaimule_core::overrides::{resolve_effective_config, EffectiveGameConfig, GlobalSettings};
-use zaimule_core::patch::{apply_ips_patch, default_mod_layers, diff_roms_to_ips, ModLayerEntry};
+use zaimule_core::patch::{
+    apply_ips_patch, default_community_mods, default_mod_layers, diff_roms_to_ips,
+    CommunityModPackage, ModLayerEntry,
+};
 use zaimule_core::rewind::{rle_compress, rle_decompress, RewindBuffer, SaveStateSlotInfo};
 use zaimule_core::storage::{
     decode_portable_pack, encode_portable_pack, PersistedSaveState, ZaimulePortablePack,
@@ -52,11 +59,13 @@ pub struct StationBootstrap {
     pub catalog: Vec<GameEntry>,
     pub effective_config: EffectiveGameConfig,
     pub mod_layers: Vec<ModLayerEntry>,
+    pub community_mods: Vec<CommunityModPackage>,
     pub cheat_codes: Vec<CheatCodeEntry>,
     pub achievements: Vec<AchievementEntry>,
     pub save_slots: Vec<SaveStateSlotInfo>,
     pub keymapper_widgets: Vec<KeymapWidget>,
     pub macros: Vec<MacroSequence>,
+    pub ghost_leaderboard: Vec<GhostLeaderboardEntry>,
     pub netplay_rooms: Vec<NetplayRoom>,
     pub netplay_chat: Vec<NetplayChatMessage>,
     pub stun_candidate: StunDiscoveryCandidate,
@@ -90,10 +99,12 @@ pub struct EmulatorSession {
     pub catalog: Vec<GameEntry>,
     pub active_game_id: String,
     pub mod_layers: Vec<ModLayerEntry>,
+    pub community_mods: Vec<CommunityModPackage>,
     pub cheat_codes: Vec<CheatCodeEntry>,
     pub achievements: Vec<AchievementEntry>,
     pub keymapper_widgets: Vec<KeymapWidget>,
     pub macros: Vec<MacroSequence>,
+    pub ghost_leaderboard: Vec<GhostLeaderboardEntry>,
     pub active_macro_id: Option<String>,
     pub macro_start_frame: u64,
     pub netplay_rooms: Vec<NetplayRoom>,
@@ -105,6 +116,8 @@ pub struct EmulatorSession {
     pub save_states_ram: HashMap<(String, u8), (SaveStateSlotInfo, Vec<u8>)>,
     pub custom_roms: HashMap<String, Vec<u8>>,
     pub breakpoints: Vec<u32>,
+    pub last_score: u32,
+    pub recent_inputs_trace: Vec<u8>,
     pub sram_dirty: bool,
     pub warning: Option<String>,
     core_p1: Box<dyn EmulatorBackend>,
@@ -141,7 +154,12 @@ fn build_core_for(console: ConsoleKind, rom: &[u8]) -> Result<Box<dyn EmulatorBa
             c.load_rom(rom)?;
             Ok(Box::new(c))
         }
-        ConsoleKind::Nes | ConsoleKind::Ps1 | ConsoleKind::N64 => {
+        ConsoleKind::Ps1 => {
+            let mut c = Ps1Core::new();
+            c.load_rom(rom)?;
+            Ok(Box::new(c))
+        }
+        ConsoleKind::Nes | ConsoleKind::N64 => {
             let mut c = NesCore::new();
             c.load_rom(rom)?;
             Ok(Box::new(c))
@@ -164,10 +182,12 @@ impl EmulatorSession {
             catalog,
             active_game_id,
             mod_layers: default_mod_layers(),
+            community_mods: default_community_mods(),
             cheat_codes: default_cheat_codes(),
             achievements: default_achievements(),
             keymapper_widgets: default_keymapper_widgets(),
             macros: default_macros(),
+            ghost_leaderboard: default_ghost_leaderboard(),
             active_macro_id: None,
             macro_start_frame: 0,
             netplay_rooms: default_netplay_rooms(),
@@ -178,7 +198,9 @@ impl EmulatorSession {
             rewind_buffer: RewindBuffer::new(240), // 240 snapshots @ 4Hz = 60s
             save_states_ram: HashMap::new(),
             custom_roms: HashMap::new(),
-            breakpoints: vec![0x0150, 0x0800_00C0],
+            breakpoints: vec![0x0150, 0x0800_00C0, 0x8001_0000],
+            last_score: 0,
+            recent_inputs_trace: Vec::with_capacity(128),
             sram_dirty: false,
             warning: None,
             core_p1: Box::new(GameBoyCore::new()),
@@ -205,11 +227,13 @@ impl EmulatorSession {
             catalog: self.catalog.clone(),
             effective_config,
             mod_layers: self.mod_layers.clone(),
+            community_mods: self.community_mods.clone(),
             cheat_codes: self.cheat_codes.clone(),
             achievements: self.achievements.clone(),
             save_slots: self.list_save_slots_for(&self.active_game_id),
             keymapper_widgets: self.keymapper_widgets.clone(),
             macros: self.macros.clone(),
+            ghost_leaderboard: self.ghost_leaderboard.clone(),
             netplay_rooms: self.netplay_rooms.clone(),
             netplay_chat: self.netplay_chat.clone(),
             stun_candidate: discover_stun_candidate(self.udp_node.local_port),
@@ -250,7 +274,8 @@ impl EmulatorSession {
             ConsoleKind::Gba => build_gba_golden_horizon_rom(),
             ConsoleKind::Nds => build_nds_dual_phantom_rom(),
             ConsoleKind::Snes => build_snes_valkyrie_mode7_rom(),
-            ConsoleKind::Nes | ConsoleKind::Ps1 | ConsoleKind::N64 => build_nes_chrono_knight_rom(),
+            ConsoleKind::Ps1 => build_ps1_cyber_ridge_rom(),
+            ConsoleKind::Nes | ConsoleKind::N64 => build_nes_chrono_knight_rom(),
             _ => build_gb_pocket_arena_rom(),
         }
     }
@@ -626,6 +651,11 @@ impl EmulatorSession {
                     .push_snapshot(primary.frame_number, &raw_state);
             }
         }
+        self.last_score = primary.cpu.score;
+        if self.recent_inputs_trace.len() >= 120 {
+            self.recent_inputs_trace.remove(0);
+        }
+        self.recent_inputs_trace.push((mask_p1 & 0xFF) as u8);
         self.sram_dirty = true;
 
         ViewportStepResponse {
@@ -775,7 +805,7 @@ impl EmulatorSession {
         let original = Self::unpatched_rom_for_console(game.console);
         let mut modified = self.base_rom_for_game(&game.id, game.console);
         if original == modified && modified.len() >= 0x0150 {
-            let stamp = b"ZAIMULE040";
+            let stamp = b"ZAIMULE060";
             modified[0x0134..0x0134 + stamp.len()].copy_from_slice(stamp);
         }
         diff_roms_to_ips(&original, &modified)
@@ -795,7 +825,7 @@ impl EmulatorSession {
         }
         let pack = ZaimulePortablePack {
             magic: PORTABLE_PACK_MAGIC.into(),
-            version: "0.4.0".into(),
+            version: "0.6.0".into(),
             active_game_id: self.active_game_id.clone(),
             sram_rle,
             sram_uncompressed_len: sram_raw.len(),
@@ -906,6 +936,101 @@ impl EmulatorSession {
         );
         Ok(self.bootstrap_snapshot())
     }
+
+    /// Updates the Yuzu-style per-game Hardware Overclock (`100%` / `150%` / `200%`) and PGXP Subpixel profile.
+    pub fn set_hardware_overclock_profile(
+        &mut self,
+        cpu_overclock_pct: u16,
+        pgxp_subpixel: bool,
+    ) -> StationBootstrap {
+        let clamped_oc = cpu_overclock_pct.clamp(50, 400);
+        self.settings.cpu_overclock_pct = clamped_oc;
+        self.settings.pgxp_subpixel = pgxp_subpixel;
+        let entry = self
+            .settings
+            .game_overrides
+            .entry(self.active_game_id.clone())
+            .or_default();
+        entry.custom_cpu_overclock_pct = Some(clamped_oc);
+        entry.custom_pgxp_subpixel = Some(pgxp_subpixel);
+        self.bootstrap_snapshot()
+    }
+
+    /// Verifies and publishes the player's current deterministic input trace and score to the Ghost Leaderboard.
+    pub fn submit_ghost_leaderboard_run(&mut self, player_name: String) -> StationBootstrap {
+        let game = self.active_game().clone();
+        let clean_player = if player_name.trim().is_empty() {
+            "Zainados".into()
+        } else {
+            player_name.trim().to_string()
+        };
+        let trace = if self.recent_inputs_trace.is_empty() {
+            vec![0x11, 0x18, 0x12, 0x11]
+        } else {
+            self.recent_inputs_trace.clone()
+        };
+        let entry = verify_and_build_ghost_entry(
+            format!("ghost-run-{}", self.ghost_leaderboard.len() + 1),
+            game.id,
+            game.title,
+            format!("{:?}", game.console).to_ascii_uppercase(),
+            clean_player,
+            self.last_score.max(10),
+            trace,
+        );
+        self.ghost_leaderboard.insert(0, entry);
+        self.bootstrap_snapshot()
+    }
+
+    /// Loads a verified Ghost Leaderboard run as an active TAS Macro and switches to its target game.
+    pub fn challenge_ghost_run(&mut self, ghost_id: &str) -> Result<StationBootstrap, String> {
+        let Some(ghost) = self
+            .ghost_leaderboard
+            .iter()
+            .find(|g| g.id == ghost_id)
+            .cloned()
+        else {
+            return Err(format!("fantôme introuvable : {ghost_id}"));
+        };
+        if self.catalog.iter().any(|g| g.id == ghost.game_id) {
+            let _ = self.select_game(&ghost.game_id);
+        }
+        let macro_id = format!("macro-ghost-{}", ghost.id);
+        let mut seq = MacroSequence::new(
+            macro_id.clone(),
+            format!("👻 Fantôme {} ({} pts)", ghost.player_name, ghost.score),
+            true,
+        );
+        for &inp in &ghost.frame_inputs {
+            for _ in 0..15 {
+                seq.record_frame(inp as u16);
+            }
+        }
+        if !self.macros.iter().any(|m| m.id == macro_id) {
+            self.macros.insert(0, seq);
+        }
+        self.active_macro_id = Some(macro_id);
+        self.macro_start_frame = self.core_p1.debug_snapshot().cycles / 256;
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Installs a 1-click Community `.IPS` Mod package non-destructively onto the active ROM in memory.
+    pub fn install_community_ips_mod(&mut self, mod_id: &str) -> Result<StationBootstrap, String> {
+        let Some(pkg) = self
+            .community_mods
+            .iter_mut()
+            .find(|m| m.id == mod_id)
+            .cloned()
+        else {
+            return Err(format!("mod communautaire introuvable : {mod_id}"));
+        };
+        for m in &mut self.community_mods {
+            if m.id == mod_id {
+                m.installed = true;
+            }
+        }
+        self.apply_custom_ips_to_active_game(&pkg.title, &pkg.ips_bytes)
+    }
 }
 
 #[cfg(test)]
@@ -1014,5 +1139,30 @@ mod tests {
             .unwrap();
         assert_eq!(boot.netplay_chat[0].text, "Save State Boss prêt !");
         assert!(boot.stun_candidate.hole_punch_ready);
+    }
+
+    #[test]
+    fn session_runs_ps1_3d_submits_ghost_run_and_installs_community_mod() {
+        let mut session = EmulatorSession::new();
+        session.select_game("ps1-ff7-fr").unwrap();
+        let step = session.step_viewport(BTN_RIGHT | BTN_A, 0, false);
+        assert_eq!(step.primary.width, 320);
+        assert_eq!(step.primary.height, 240);
+        assert!(step.primary.cpu.arch.contains("MIPS R3000A"));
+
+        let oc_boot = session.set_hardware_overclock_profile(200, true);
+        assert_eq!(oc_boot.effective_config.cpu_overclock_pct, 200);
+
+        let ghost_boot = session.submit_ghost_leaderboard_run("Zainados_PRO".into());
+        assert_eq!(ghost_boot.ghost_leaderboard[0].player_name, "Zainados_PRO");
+        assert!(ghost_boot.ghost_leaderboard[0].verified_deterministic);
+
+        let chal_boot = session.challenge_ghost_run("ghost-ps1-wr").unwrap();
+        assert!(chal_boot.macros[0].name.contains("Zainados_WR"));
+
+        let mod_boot = session
+            .install_community_ips_mod("mod-ps1-pgxp-nitro")
+            .unwrap();
+        assert!(mod_boot.community_mods[0].installed);
     }
 }

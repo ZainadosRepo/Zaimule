@@ -10,6 +10,7 @@ pub mod libretro;
 pub mod link;
 pub mod nds;
 pub mod nes;
+pub mod ps1;
 pub mod session;
 pub mod snes;
 pub mod traits;
