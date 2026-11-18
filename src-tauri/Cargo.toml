@@ -1,6 +1,6 @@
 [package]
 name = "zaimule"
-version = "1.1.0"
+version = "1.2.0"
 description = "Multi-console emulator station in Rust: native Rust & Libretro cores, 60s rewind, visual keymapper, TAS macros, Link Cable, and Yuzu-style overrides"
 authors = ["ZainadosRepo"]
 edition = "2021"
@@ -16,6 +16,8 @@ tauri-build = { version = "2.6.3", features = [] }
 [dependencies]
 zaimule-core = { path = "../crates/zaimule-core" }
 zaimule-emu = { path = "../crates/zaimule-emu" }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "system-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tauri = { version = "2.11.3", features = [] }

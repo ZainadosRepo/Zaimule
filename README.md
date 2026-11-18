@@ -31,8 +31,11 @@ Au lancement, l'appli regarde sur GitHub si une version plus récente est publi�
 
 ---
 
-## ✨ Architecture & Fonctionnalités (`v1.1.0`)
+## ✨ Architecture & Fonctionnalités (`v1.2.0`)
 
+- **📦 Chargement Multi-Consoles Disque, Nintendo Switch (`jeuxyuzu`) & Archives RomStation (`.zip` / `.nds`)**
+  - **Auto-découverte & Scanner Dossier (`scanner.rs` & `archive.rs`)** : Détection et scan récursif de `Documents/jeuxyuzu` (`.nsp`, `.xci`, `.nsz`, `.xcz`, `.nro` avec lecture d'en-têtes PBR/PFS0/HEAD sans charger les Go en RAM et extraction `Title ID`) et des bibliothèques `RomStation/games` (lecteur streaming **ZIP / ZIP64** sur répertoire central pour `.zip` contenant `.nds`/ROMs, décompression atomique vers `rom_cache/`).
+  - **Pont Émulateurs Externes & Clés Switch (`external.rs`)** : Détection et lancement non-bloquant vers **Yuzu**, **Eden**, **Sudachi**, **Citron**, **Suyu**, **Torzu**, **Ryujinx** (vérification `prod.keys` / `title.keys`), **melonDS**, **DeSmuME** et **RetroArch**, avec sélecteurs de fichiers/dossiers natifs (`tauri-plugin-dialog`) et glisser-déposer WebView2 direct.
 - **🦀 11 Cœurs 100% Rust Natifs + Hôte Dynamique Libretro C-ABI (`crates/zaimule-emu`)**
   - **Game Boy & Game Boy Color (`zaimule-rust-gb`)** : CPU Sharp LR35902 (256 opcodes `0xCB`), MMU MBC1/MBC3/MBC5 avec **Horloge Temps Réel (RTC `0x08..=0x0C` & protocole de Latch `0x00 → 0x01`)**, PPU 160×144 scanline, APU 4 canaux et Câble Link Série `SB`/`SC` (`0xFF01`/`0xFF02`).
   - **Game Boy Advance (`zaimule-rust-gba`)** : CPU ARM7TDMI 32-bit + Thumb 16-bit, PPU Mode 3/4 `240×160` RGB555, FlashRAM 64 Ko et Multi-SIO 4 joueurs.
@@ -40,11 +43,11 @@ Au lancement, l'appli regarde sur GitHub si une version plus récente est publi�
   - **Super Nintendo (`zaimule-rust-snes`)** : CPU Ricoh 5A22 / WDC 65C816 16-bit, PPU `256×224` avec matrice de perspective **Mode 7** (`M7A`..`M7D`), DMA et synthèse audio DSP SPC700.
   - **Nintendo 64 (`zaimule-rust-n64`)** : CPU MIPS VR4300 64-bit @ 93.75 MHz, Reality Coprocessor (RSP/RDP) avec **Z-Buffer 16-bit** `320×240` et Controller Pak (`.mpk`).
   - **Sega Mega Drive / Genesis (`zaimule-rust-md`)** : CPU Motorola 68000 16/32-bit, VDP `320×224` Dual-Plane + Sprites, synthétiseur **FM Yamaha YM2612 6 canaux** + PSG SN76489 et FeRAM 64 Ko.
-  - **Nintendo DS Dual-Screen (`zaimule-rust-nds`)** : Architecture double processeur **ARM946E-S + ARM7TDMI** synchronisée par FIFO IPC, double écran `256×384` et **Stylet Tactile interactif** à la souris.
+  - **Nintendo DS Dual-Screen (`zaimule-rust-nds` & `libretro_host.rs`)** : Architecture double processeur **ARM946E-S + ARM7TDMI** pour homebrews + hôte dynamique réel **`LibretroHostCore`** (`libloading`) compatible **`melonds_libretro`** (`.dll`/`.dylib`/`.so`) avec installation 1-clic depuis Buildbot Libretro et **Stylet Tactile** interactif.
   - **PlayStation 1 (`zaimule-rust-ps1`)** : CPU MIPS R3000A 32-bit, coprocesseur géométrique **GTE (`COP2`)** avec projection 3D **PGXP Subpixel** anti-tremblement `320×240` et Carte Mémoire 128 Ko (`.mcd`).
   - **PlayStation Portable (`zaimule-rust-psp`)** : CPU MIPS R4000 **Allegrex 32-bit + Vector FPU (`VFPU` `VADD.Q`)** @ 333 MHz, Graphics Engine (`GU`) Widescreen **16:9 `480×272`**, Memory Stick PRO Duo 64 Ko (`.msd`) et Ad-Hoc WLAN.
   - **CHIP-8 / Super-CHIP (`zaimule-rust-chip8`)** : Interpréteur déterministe 35 opcodes avec support d'import de ROMs locales.
-  - **Pont Libretro C-ABI (`libretro.rs`)** : Inspecteur PE/ELF/Mach-O, convertisseurs `0RGB1555`, `RGB565` & `XRGB8888 → RGBA8888` et registre pour **mGBA**, **Snes9x**, **melonDS**, **SwanStation**, **Mupen64Plus-Next**, **Genesis Plus GX** et **PPSSPP**.
+  - **Pont Libretro C-ABI (`libretro.rs` & `libretro_host.rs`)** : Inspecteur & chargeur dynamique natif `.dll`/`.dylib`/`.so` (`retro_run`, `retro_serialize`), convertisseurs `0RGB1555`, `RGB565` & `XRGB8888 → RGBA8888` avec `pitch` et registre pour **mGBA**, **Snes9x**, **melonDS**, **SwanStation**, **Mupen64Plus-Next**, **Genesis Plus GX** et **PPSSPP**.
 - **⚡ Ingénierie, Upscaling & ROM Hacking Studio (Héritage Yuzu & Mesen)**
   - **Upscalers Temps Réel (`ui/upscaler.js`)** : **Scale2x / EPX**, **xBRZ 2x** (vectorisation directionnelle par distance luma YUV) et **CRT Phosphor Bloom**, combinables avec 5 shaders matériels (CRT Scanlines, Trinitron Courbé, Game Boy DMG, Matrice LCD, Pixel-Perfect).
   - **Profils d'Overclock CPU & PGXP par Jeu (`overrides.rs`)** : Cadence CPU (`100% Natif`, `150%`, `200% Turbo`), précision sous-pixel PGXP 3D et résolution hiérarchique `GlobalSettings → Console → GameProfileOverride`.
@@ -55,7 +58,7 @@ Au lancement, l'appli regarde sur GitHub si une version plus récente est publi�
   - **TAS Studio Timeline & Classements Fantômes (`macros.rs`)** : Éditeur segment par segment (RLE) des séquences TAS avec bascule de boutons à la volée, export de records déterministes vérifiés par CRC32 et mode **Défi Fantôme TAS en direct**.
   - **Multi-Instance 2P / 4P Split-Screen & Arbre de Tournoi (`link.rs` & `netplay.rs`)** : Câble Link 2P et **Quad-Link 4P (grille 2×2)** en lockstep, salons P2P Rollback UDP (`ZML2`) avec découverte **STUN UDP Hole-Punching**, chat avec partage 1-clic de Save State, et arbre de tournoi à élimination directe avec mode Spectateur.
 - **🔐 Persistance Atomique Anti-Corruption, Cloud Pack & Rewind 60s (`storage.rs` & `rewind.rs`)**
-  - **Sauvegardes Atomiques & Archive Portable `.zaimule-pack`** : Écriture `.tmp → fs::rename`, rotation automatique `.srm.bak1`..`.srm.bak3`, isolation des JSON corrompus en `.json.bad` et synchronisation Cloud en 1 fichier `.zaimule-pack` (SRAM RLE + 6 Save States + Cheats + Macros TAS + Keymapper).
+  - **Sauvegardes Atomiques & Archive Portable `.zaimule-pack`** : Écriture `.tmp → fs::rename`, rotation automatique `.srm.bak1`..`.srm.bak3`, isolation des JSON corrompus en `.json.bad`, persistance disque de la bibliothèque (`library.json`) et synchronisation Cloud en 1 fichier `.zaimule-pack` (SRAM RLE + 6 Save States + Cheats + Macros TAS + Keymapper).
   - **Rembobinage Temporel (Rewind 60s)** : Tampon circulaire compressé en RLE permettant de rembobiner l'action en direct (`Backspace`) avec vérification CRC32.
 
 | Action | Raccourci |
@@ -76,9 +79,9 @@ Au lancement, l'appli regarde sur GitHub si une version plus récente est publi�
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 
-# Exécuter les 56 tests unitaires et d'intégration Rust (11 cœurs natifs, mappers NES, RTC MBC3, Link 2P/4P, TAS Timeline, Watchpoints, STUN/ZML2, persistance atomique)
+# Exécuter les 66 tests unitaires et d'intégration Rust (11 cœurs natifs, scanner jeuxyuzu/RomStation, streaming ZIP64, hôte C-ABI Libretro, mappers NES, RTC MBC3, Link 2P/4P, TAS Timeline, Watchpoints, STUN/ZML2, persistance atomique)
 cargo test --workspace --locked
 
-# Exécuter les 21 tests unitaires JavaScript (UI ES Modules : Scale2x/xBRZ/Bloom, APU FM/SPC700, Keymapper, Recorder, Bibliothèque)
+# Exécuter les 22 tests unitaires JavaScript (UI ES Modules : Switch/NDS, Scale2x/xBRZ/Bloom, APU FM/SPC700, Keymapper, Recorder, Bibliothèque)
 node --test "tests/ui/*.test.js"
 ```

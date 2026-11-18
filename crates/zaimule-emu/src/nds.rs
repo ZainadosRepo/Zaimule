@@ -6,7 +6,7 @@
 //! - Embedded playable homebrew ROM (`build_nds_dual_phantom_rom`)
 
 use crate::traits::{CpuDebugSnapshot, EmulatorBackend, FrameStepResult};
-use zaimule_core::catalog::ConsoleKind;
+use zaimule_core::catalog::{extract_nds_game_code, ConsoleKind};
 use zaimule_core::keymap::{BTN_A, BTN_B, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_UP};
 
 pub const NDS_WIDTH: u16 = 256;
@@ -26,8 +26,12 @@ pub struct NdsCore {
     pub stylus_down: bool,
     pub cycles: u64,
     pub frame_number: u64,
-    /// Cartridge ROM image
+    /// Cartridge ROM image (truncated to 64 KiB header window for commercial Nitro dumps awaiting Libretro)
     pub rom: Vec<u8>,
+    /// True only for the embedded Dual Phantom DS homebrew; false for commercial Nitro ROMs
+    pub is_embedded_homebrew: bool,
+    /// 4-char Nintendo DS cartridge game code (e.g. `CPUF`, `CPUE`, `ADPE`)
+    pub cart_code: String,
     /// Main RAM (`64 KiB` window mapped at `0x0200_0000`)
     pub main_ram: Vec<u8>,
     /// Engine A + Engine B VRAM (`64 KiB` mapped at `0x0600_0000`)
@@ -65,6 +69,8 @@ impl NdsCore {
             cycles: 0,
             frame_number: 0,
             rom: Vec::new(),
+            is_embedded_homebrew: true,
+            cart_code: "ADPE".into(),
             main_ram: vec![0; 0x10000],
             vram: vec![0; 0x10000],
             sram: vec![0; 0x8000],
@@ -152,6 +158,82 @@ impl NdsCore {
             self.arm7_regs[15] = 0x0380_0100 + ((self.arm7_regs[15].wrapping_add(4)) & 0x3C);
             self.ipc_sync = 0x0100 | ((self.frame_number as u16) & 0x0F);
         }
+    }
+
+    fn render_diagnostic_screen_rgba(&self) -> Vec<u8> {
+        let w = NDS_WIDTH as usize;
+        let h = NDS_HEIGHT as usize;
+        let mut rgba = vec![0u8; w * h * 4];
+        let code_bytes = self.cart_code.as_bytes();
+        let pulse = (self.frame_number / 18).is_multiple_of(2);
+
+        for y in 0..h {
+            for x in 0..w {
+                let idx = (y * w + x) * 4;
+
+                if (190..194).contains(&y) {
+                    // Nintendo DS Hinge Divider Bar
+                    rgba[idx..idx + 4].copy_from_slice(&[30, 41, 59, 255]);
+                    continue;
+                }
+
+                if y < 190 {
+                    // Top screen: clean diagnostic standby frame showing Nitro cartridge telemetry
+                    let is_border = !(8..w - 8).contains(&x) || !(8..182).contains(&y);
+                    if is_border {
+                        rgba[idx..idx + 4].copy_from_slice(&[30, 64, 96, 255]);
+                    } else if (28..56).contains(&y) && (24..232).contains(&x) {
+                        // Top Amber/Sky cartridge header badge
+                        let bit = code_bytes.get((x - 24) / 52).copied().unwrap_or(0x4E);
+                        let stripe =
+                            (x ^ (bit as usize)).is_multiple_of(7) && (34..50).contains(&y);
+                        let color = if stripe {
+                            [245, 186, 66, 255]
+                        } else {
+                            [18, 36, 56, 255]
+                        };
+                        rgba[idx..idx + 4].copy_from_slice(&color);
+                    } else if (84..116).contains(&y) && (36..220).contains(&x) {
+                        // Waiting indicator card for melonDS C-ABI runtime
+                        let accent = if pulse {
+                            [56, 189, 248, 255]
+                        } else {
+                            [45, 212, 191, 255]
+                        };
+                        let box_edge = y == 84 || y == 115 || x == 36 || x == 219;
+                        if box_edge {
+                            rgba[idx..idx + 4].copy_from_slice(&accent);
+                        } else {
+                            rgba[idx..idx + 4].copy_from_slice(&[14, 24, 38, 255]);
+                        }
+                    } else {
+                        rgba[idx..idx + 4].copy_from_slice(&[9, 14, 24, 255]);
+                    }
+                } else {
+                    // Bottom touchscreen diagnostic grid + responsive stylus cursor
+                    let by = y - 194;
+                    let grid = x.is_multiple_of(24) || by.is_multiple_of(24);
+                    if grid {
+                        rgba[idx..idx + 4].copy_from_slice(&[18, 32, 46, 255]);
+                    } else {
+                        rgba[idx..idx + 4].copy_from_slice(&[8, 13, 22, 255]);
+                    }
+
+                    let dx_s = (x as i32 - self.stylus_x as i32).abs();
+                    let dy_s = (by as i32 - self.stylus_y as i32).abs();
+                    if (dx_s == 0 && dy_s <= 8) || (dy_s == 0 && dx_s <= 8) {
+                        let color = if self.stylus_down {
+                            [245, 186, 66, 255]
+                        } else {
+                            [56, 189, 248, 255]
+                        };
+                        rgba[idx..idx + 4].copy_from_slice(&color);
+                    }
+                }
+            }
+        }
+
+        rgba
     }
 
     fn render_dual_screen_rgba(&self) -> Vec<u8> {
@@ -251,21 +333,53 @@ impl EmulatorBackend for NdsCore {
         if rom.is_empty() {
             return Err("ROM Nintendo DS vide".into());
         }
-        self.rom = rom.to_vec();
+        let is_homebrew = rom.len() >= 12 && &rom[0..12] == b"DUALPHANTOM\0";
+        self.is_embedded_homebrew = is_homebrew;
+        self.cart_code = extract_nds_game_code(rom).unwrap_or_else(|| "NTR?".into());
+        if is_homebrew {
+            self.rom = rom.to_vec();
+        } else {
+            let keep = rom.len().min(64 * 1024);
+            self.rom = rom[..keep].to_vec();
+        }
         self.arm9_regs = [0; 16];
         self.arm9_regs[13] = 0x0380_3F00;
-        self.arm9_regs[15] = 0x0200_0000;
+        self.arm9_regs[15] = if is_homebrew {
+            0x0200_0020
+        } else {
+            0x0200_0000
+        };
         self.arm7_regs = [0; 16];
         self.arm7_regs[13] = 0x0380_FD80;
         self.arm7_regs[15] = 0x0380_0100;
         self.cycles = 0;
         self.frame_number = 0;
+        self.scan_pulse = 0;
+        self.score = 0;
         self.seed_vram_tiles();
         Ok(())
     }
 
     fn step_frame(&mut self, buttons_mask: u16) -> FrameStepResult {
         self.frame_number += 1;
+
+        if !self.is_embedded_homebrew {
+            self.cycles = self.cycles.wrapping_add(16);
+            self.arm7_regs[0] = ((self.stylus_x as u32) << 8) | (self.stylus_y as u32);
+            self.arm7_regs[1] = u32::from(self.stylus_down);
+            return FrameStepResult {
+                console: ConsoleKind::Nds,
+                frame_number: self.frame_number,
+                width: NDS_WIDTH,
+                height: NDS_HEIGHT,
+                rgba: self.render_diagnostic_screen_rgba(),
+                audio_level: 0.0,
+                audio_freq_hz: 0,
+                serial_out_byte: None,
+                cpu: self.debug_snapshot(),
+            };
+        }
+
         self.step_arm9_and_arm7(512);
 
         let speed: u8 = if (buttons_mask & BTN_B) != 0 { 3 } else { 2 };
@@ -392,7 +506,7 @@ impl EmulatorBackend for NdsCore {
     fn load_sram(&mut self, data: &[u8]) -> Result<(), String> {
         let len = data.len().min(self.sram.len());
         self.sram[..len].copy_from_slice(&data[..len]);
-        if len >= 4 {
+        if self.is_embedded_homebrew && len >= 4 {
             self.score =
                 u32::from_le_bytes([self.sram[0], self.sram[1], self.sram[2], self.sram[3]]);
         }
@@ -407,19 +521,31 @@ impl EmulatorBackend for NdsCore {
     }
 
     fn debug_snapshot(&self) -> CpuDebugSnapshot {
+        let flags_str = if !self.is_embedded_homebrew {
+            "NEED_MELONDS_CABI".into()
+        } else if self.stylus_down {
+            "PEN_DOWN+IPC".into()
+        } else {
+            "ARM9+ARM7_OK".into()
+        };
+
         CpuDebugSnapshot {
-            arch: "NDS ARM946E-S + ARM7".into(),
+            arch: if self.is_embedded_homebrew {
+                "NDS ARM946E-S + ARM7".into()
+            } else {
+                format!("NDS Nitro [{}] · melonDS C-ABI requis", self.cart_code)
+            },
             pc_hex: format!("0x{:08X}", self.arm9_regs[15]),
             sp_hex: format!("0x{:08X}", self.arm9_regs[13]),
             reg_a_hex: format!("R0:0x{:04X}", self.arm9_regs[0] & 0xFFFF),
             reg_bc_hex: format!("ARM7:0x{:04X}", self.arm7_regs[15] & 0xFFFF),
             reg_de_hex: format!("STY:{},{}", self.stylus_x, self.stylus_y),
-            reg_hl_hex: format!("IPC:0x{:04X}", self.ipc_sync),
-            flags_str: if self.stylus_down {
-                "PEN_DOWN+IPC".into()
+            reg_hl_hex: if self.is_embedded_homebrew {
+                format!("IPC:0x{:04X}", self.ipc_sync)
             } else {
-                "ARM9+ARM7_OK".into()
+                format!("CART:{}", self.cart_code)
             },
+            flags_str,
             ly_scanline: (self.frame_number % 192) as u8,
             serial_sb_hex: format!("0x{:02X}", self.nifi_data),
             serial_sc_hex: "0x81".into(),
@@ -431,7 +557,7 @@ impl EmulatorBackend for NdsCore {
     fn apply_ram_cheat(&mut self, addr: u16, val: u8) {
         let idx = (addr as usize) & 0xFFFF;
         self.main_ram[idx] = val;
-        if addr == 0xA004 || addr == 0xC108 {
+        if self.is_embedded_homebrew && (addr == 0xA004 || addr == 0xC108) {
             self.score = self.score.max(val as u32);
         }
     }
@@ -463,11 +589,11 @@ pub fn build_nds_dual_phantom_rom() -> Vec<u8> {
     rom[0x0000..0x000C].copy_from_slice(b"DUALPHANTOM\0");
     rom[0x000C..0x0010].copy_from_slice(b"ADPE");
 
-    // ARM9 entry loop at offset 0x0000 (mapped to 0x0200_0000):
-    // 0x0200_0000: ADD R2, R2, #1 (0xE282_2001)
-    // 0x0200_0004: B 0x0200_0000  (0xEAFF_FFFD)
-    rom[0x0000..0x0004].copy_from_slice(&0xE282_2001u32.to_le_bytes());
-    rom[0x0004..0x0008].copy_from_slice(&0xEAFF_FFFDu32.to_le_bytes());
+    // ARM9 entry loop at offset 0x0020 (mapped to 0x0200_0020), preserving header at 0x0000..0x0010:
+    // 0x0200_0020: ADD R2, R2, #1 (0xE282_2001)
+    // 0x0200_0024: B 0x0200_0020  (0xEAFF_FFFD)
+    rom[0x0020..0x0024].copy_from_slice(&0xE282_2001u32.to_le_bytes());
+    rom[0x0024..0x0028].copy_from_slice(&0xEAFF_FFFDu32.to_le_bytes());
     rom
 }
 
@@ -488,5 +614,28 @@ mod tests {
         );
         assert!(step.cpu.score >= 35);
         assert_eq!(step.cpu.flags_str, "PEN_DOWN+IPC");
+    }
+
+    #[test]
+    fn commercial_nitro_nds_header_enters_diagnostic_standby_without_faking_gameplay() {
+        let mut rom = vec![0u8; 0x1000];
+        rom[0x0000..0x000A].copy_from_slice(b"POKEMON PL");
+        rom[0x000C..0x0010].copy_from_slice(b"CPUF");
+        rom[0x015C] = 0x56;
+        rom[0x015D] = 0xCF;
+
+        let mut core = NdsCore::new();
+        core.load_rom(&rom).unwrap();
+        assert!(!core.is_embedded_homebrew);
+        assert_eq!(core.cart_code, "CPUF");
+
+        core.set_touch_stylus(164, 78, true);
+        let step = core.step_frame(BTN_RIGHT | BTN_A);
+        assert_eq!(step.width, NDS_WIDTH);
+        assert_eq!(step.height, NDS_HEIGHT);
+        assert_eq!(step.cpu.flags_str, "NEED_MELONDS_CABI");
+        assert_eq!(step.cpu.reg_hl_hex, "CART:CPUF");
+        assert_eq!(step.cpu.score, 0);
+        assert_eq!(step.audio_freq_hz, 0);
     }
 }

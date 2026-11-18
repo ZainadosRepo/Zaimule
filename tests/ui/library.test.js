@@ -100,3 +100,52 @@ test("formatHardwareProfileLabel formats Yuzu CPU overclock and PGXP state", () 
   assert.equal(formatHardwareProfileLabel(200, false), "200% Turbo · PGXP OFF");
 });
 
+test("formatFileSize supports multi-GB Switch images and filterCatalogEntries matches SWITCH & titleId", () => {
+  assert.equal(formatFileSize(4 * 1024 * 1024 * 1024), "4.00 Go");
+  const switchAndNds = [
+    ...SAMPLE_ENTRIES,
+    {
+      id: "nsw-zelda",
+      title: "Tears of the Kingdom",
+      console: "SWITCH",
+      engineKind: "externalLauncher",
+      coreId: "yuzu-external",
+      region: "NSP",
+      crc32Hex: "CAFE1234",
+      titleId: "0100F2C0115B6000",
+      favorite: false,
+      linkCableReady: false
+    },
+    {
+      id: "nds-platinum",
+      title: "Pokémon Version Platine",
+      console: "NDS",
+      engineKind: "libretroAbi",
+      coreId: "melonds_libretro",
+      region: "EUR · FR",
+      crc32Hex: "A1B2C3D4",
+      titleId: "CPUF",
+      favorite: false,
+      linkCableReady: true
+    }
+  ];
+
+  const bySwitch = filterCatalogEntries(switchAndNds, { consoleFilter: "SWITCH" });
+  assert.equal(bySwitch.length, 1);
+  assert.equal(bySwitch[0].id, "nsw-zelda");
+
+  const byTitleId = filterCatalogEntries(switchAndNds, { query: "0100f2c0115b6000" });
+  assert.equal(byTitleId.length, 1);
+  assert.equal(byTitleId[0].id, "nsw-zelda");
+
+  const byNdsCode = filterCatalogEntries(switchAndNds, { query: "cpuf" });
+  assert.equal(byNdsCode.length, 1);
+  assert.equal(byNdsCode[0].id, "nds-platinum");
+
+  const counts = computeConsoleCounts(switchAndNds);
+  assert.equal(counts.ALL, 6);
+  assert.equal(counts.SWITCH, 1);
+  assert.equal(counts.NDS, 1);
+});
+
+

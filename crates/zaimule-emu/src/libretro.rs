@@ -3,6 +3,7 @@
 //! and dynamic core descriptor registry with official Buildbot endpoints.
 
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use zaimule_core::catalog::{compute_crc32, format_crc32_hex, ConsoleKind};
 
 /// Required C-ABI entry points mandated by the Libretro API (`libretro.h` v1).
@@ -43,8 +44,44 @@ pub struct LibretroCoreDescriptor {
     pub supports_savestates: bool,
     pub supports_sram: bool,
     pub installed: bool,
+    #[serde(default)]
+    pub is_native_binary: bool,
+    #[serde(default)]
+    pub library_path: Option<String>,
     pub verified_crc32_hex: Option<String>,
     pub status_label: String,
+}
+
+impl LibretroCoreDescriptor {
+    /// Returns the dynamic library file name matching the current host OS.
+    pub fn current_platform_library_name(&self) -> &str {
+        if cfg!(target_os = "windows") {
+            &self.library_windows
+        } else if cfg!(target_os = "macos") {
+            &self.library_macos
+        } else {
+            &self.library_linux
+        }
+    }
+
+    /// Returns the official Libretro Buildbot `.zip` download URL for the current OS & architecture.
+    pub fn current_platform_buildbot_url(&self) -> String {
+        if cfg!(target_os = "windows") {
+            self.buildbot_windows_url.clone()
+        } else if cfg!(target_os = "macos") {
+            if cfg!(target_arch = "x86_64") {
+                self.buildbot_macos_url
+                    .replace("/osx/arm64/", "/osx/x86_64/")
+            } else {
+                self.buildbot_macos_url.clone()
+            }
+        } else {
+            format!(
+                "https://buildbot.libretro.com/nightly/linux/x86_64/latest/{}.zip",
+                self.library_linux
+            )
+        }
+    }
 }
 
 /// Result of inspecting a dynamic library binary (`.dll`, `.dylib`, `.so`) for Libretro C-ABI compliance.
@@ -142,6 +179,63 @@ pub fn inspect_libretro_binary(binary_bytes: &[u8]) -> Result<LibretroInspection
     })
 }
 
+/// Validates and loads a genuine native Libretro shared library (`.dll` / `.dylib` / `.so`) using `libloading`,
+/// confirming all required `libretro.h` C-ABI symbols resolve cleanly.
+pub fn verify_real_libretro_library(path: &Path) -> Result<LibretroInspectionReport, String> {
+    if !path.is_file() {
+        return Err(format!("fichier cœur introuvable : {}", path.display()));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if bytes.windows(23).any(|w| w == b"ZAIMULE_LIBRETRO_ABI_V1") {
+        return Err(
+            "il s'agit d'un descripteur local (stub), pas d'une bibliothèque C-ABI native".into(),
+        );
+    }
+    let abi_format = detect_dynamic_library_abi(&bytes)?.to_string();
+    let crc32_hex = format_crc32_hex(compute_crc32(&bytes));
+
+    // Safety: caller passed a candidate dynamic library on disk verified above as native PE/Mach-O/ELF.
+    let lib = unsafe { libloading::Library::new(path) }.map_err(|e| {
+        format!(
+            "impossible de charger la bibliothèque dynamique {} : {e}",
+            path.display()
+        )
+    })?;
+
+    let symbol_names: [&[u8]; 9] = [
+        b"retro_init\0",
+        b"retro_deinit\0",
+        b"retro_api_version\0",
+        b"retro_get_system_info\0",
+        b"retro_get_system_av_info\0",
+        b"retro_load_game\0",
+        b"retro_run\0",
+        b"retro_serialize\0",
+        b"retro_unserialize\0",
+    ];
+    let mut resolved = 0usize;
+    for sym in symbol_names {
+        let ok = unsafe { lib.get::<*const ()>(sym) }.is_ok();
+        if ok {
+            resolved += 1;
+        }
+    }
+    if resolved < 7 {
+        return Err(format!(
+            "cœur Libretro incomplet ({resolved}/{} symboles résolus dans {})",
+            symbol_names.len(),
+            path.display()
+        ));
+    }
+
+    Ok(LibretroInspectionReport {
+        abi_format,
+        crc32_hex,
+        symbols_found: resolved,
+        symbols_total: symbol_names.len(),
+    })
+}
+
 /// Builds a deterministic C-ABI stub image containing all required Libretro export symbols
 /// so a core slot can be provisioned and verified locally on any platform.
 pub fn build_verified_libretro_stub(core_id: &str) -> Vec<u8> {
@@ -183,8 +277,10 @@ pub fn default_libretro_cores() -> Vec<LibretroCoreDescriptor> {
             supports_savestates: true,
             supports_sram: true,
             installed: false,
+            is_native_binary: false,
+            library_path: None,
             verified_crc32_hex: None,
-            status_label: "Pont C-ABI Prêt · Cliquer pour Provisionner".into(),
+            status_label: "Non téléchargé · Cliquer pour installer (.dll/.so)".into(),
         },
         LibretroCoreDescriptor {
             core_id: "snes9x_libretro".into(),
@@ -203,8 +299,10 @@ pub fn default_libretro_cores() -> Vec<LibretroCoreDescriptor> {
             supports_savestates: true,
             supports_sram: true,
             installed: false,
+            is_native_binary: false,
+            library_path: None,
             verified_crc32_hex: None,
-            status_label: "Pont C-ABI Prêt · Cliquer pour Provisionner".into(),
+            status_label: "Non téléchargé · Cliquer pour installer (.dll/.so)".into(),
         },
         LibretroCoreDescriptor {
             core_id: "melonds_libretro".into(),
@@ -223,8 +321,10 @@ pub fn default_libretro_cores() -> Vec<LibretroCoreDescriptor> {
             supports_savestates: true,
             supports_sram: true,
             installed: false,
+            is_native_binary: false,
+            library_path: None,
             verified_crc32_hex: None,
-            status_label: "Pont C-ABI Prêt · Cliquer pour Provisionner".into(),
+            status_label: "Non téléchargé · Requis pour Pokémon Platine / NDS".into(),
         },
         LibretroCoreDescriptor {
             core_id: "swanstation_libretro".into(),
@@ -243,8 +343,10 @@ pub fn default_libretro_cores() -> Vec<LibretroCoreDescriptor> {
             supports_savestates: true,
             supports_sram: true,
             installed: false,
+            is_native_binary: false,
+            library_path: None,
             verified_crc32_hex: None,
-            status_label: "Pont C-ABI Prêt · Cliquer pour Provisionner".into(),
+            status_label: "Non téléchargé · Cliquer pour installer (.dll/.so)".into(),
         },
         LibretroCoreDescriptor {
             core_id: "mupen64plus_next_libretro".into(),
@@ -263,8 +365,10 @@ pub fn default_libretro_cores() -> Vec<LibretroCoreDescriptor> {
             supports_savestates: true,
             supports_sram: true,
             installed: false,
+            is_native_binary: false,
+            library_path: None,
             verified_crc32_hex: None,
-            status_label: "Pont C-ABI Prêt · Cliquer pour Provisionner".into(),
+            status_label: "Non téléchargé · Cliquer pour installer (.dll/.so)".into(),
         },
         LibretroCoreDescriptor {
             core_id: "genesis_plus_gx_libretro".into(),
@@ -283,8 +387,10 @@ pub fn default_libretro_cores() -> Vec<LibretroCoreDescriptor> {
             supports_savestates: true,
             supports_sram: true,
             installed: false,
+            is_native_binary: false,
+            library_path: None,
             verified_crc32_hex: None,
-            status_label: "Pont C-ABI Prêt · Cliquer pour Provisionner".into(),
+            status_label: "Non téléchargé · Cliquer pour installer (.dll/.so)".into(),
         },
         LibretroCoreDescriptor {
             core_id: "ppsspp_libretro".into(),
@@ -303,8 +409,10 @@ pub fn default_libretro_cores() -> Vec<LibretroCoreDescriptor> {
             supports_savestates: true,
             supports_sram: true,
             installed: false,
+            is_native_binary: false,
+            library_path: None,
             verified_crc32_hex: None,
-            status_label: "Pont C-ABI Prêt · Cliquer pour Provisionner".into(),
+            status_label: "Non téléchargé · Cliquer pour installer (.dll/.so)".into(),
         },
     ]
 }

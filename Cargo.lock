@@ -5072,8 +5072,10 @@ dependencies = [
 
 [[package]]
 name = "zaimule"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tauri",
@@ -5087,16 +5089,20 @@ dependencies = [
 
 [[package]]
 name = "zaimule-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
+ "crc32fast",
+ "flate2",
  "serde",
  "serde_json",
+ "walkdir",
 ]
 
 [[package]]
 name = "zaimule-emu"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
+ "libloading",
  "serde",
  "serde_json",
  "zaimule-core",

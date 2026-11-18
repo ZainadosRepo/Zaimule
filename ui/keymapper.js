@@ -14,6 +14,8 @@ export const BTN_START = 1 << 6;
 export const BTN_SELECT = 1 << 7;
 export const BTN_L = 1 << 8;
 export const BTN_R = 1 << 9;
+export const BTN_X = 1 << 10;
+export const BTN_Y = 1 << 11;
 
 export const DEFAULT_KEY_BINDINGS = {
   ArrowUp: BTN_UP,
@@ -30,6 +32,8 @@ export const DEFAULT_KEY_BINDINGS = {
   Space: BTN_A,
   KeyK: BTN_B,
   ShiftLeft: BTN_B,
+  KeyI: BTN_X,
+  KeyO: BTN_Y,
   Enter: BTN_START,
   Backspace: BTN_SELECT
 };

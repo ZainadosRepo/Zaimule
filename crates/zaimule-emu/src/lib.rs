@@ -7,6 +7,7 @@ pub mod debugger;
 pub mod gb;
 pub mod gba;
 pub mod libretro;
+pub mod libretro_host;
 pub mod link;
 pub mod megadrive;
 pub mod n64;

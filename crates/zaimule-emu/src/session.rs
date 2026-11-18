@@ -11,8 +11,9 @@ use crate::gb::{build_gb_pocket_arena_rom, GameBoyCore};
 use crate::gba::{build_gba_golden_horizon_rom, GbaCore};
 use crate::libretro::{
     build_verified_libretro_stub, default_libretro_cores, inspect_libretro_binary,
-    LibretroCoreDescriptor,
+    verify_real_libretro_library, LibretroCoreDescriptor,
 };
+use crate::libretro_host::LibretroHostCore;
 use crate::link::{step_quad_link_frame, LinkCableTelemetry};
 use crate::megadrive::{build_md_supersonic_rom, MegaDriveCore};
 use crate::n64::{build_n64_star_wing_rom, N64Core};
@@ -24,15 +25,24 @@ use crate::snes::{build_snes_valkyrie_mode7_rom, SnesCore};
 use crate::traits::{EmulatorBackend, FrameStepResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use zaimule_core::archive::{extract_zip_entry_to_file, list_zip_entries, read_zip_entry_prefix};
 use zaimule_core::bios::{default_bios_registry, BiosEntry};
 use zaimule_core::catalog::{
-    compute_crc32, default_catalog, detect_console, extract_rom_title, format_crc32_hex,
-    ConsoleKind, CoreEngineKind, GameEntry,
+    compute_crc32, default_catalog, detect_console, extract_nds_game_code, extract_rom_title,
+    extract_switch_title_id, format_crc32_hex, inspect_rom_header_and_stats, ConsoleKind,
+    CoreEngineKind, GameEntry,
 };
 use zaimule_core::cheats::{
     default_achievements, default_cheat_codes, default_memory_watchpoints, parse_cheat_code,
     parse_watchpoint_address, scan_ram_for_exact_byte, AchievementEntry, CheatCodeEntry,
     MemoryWatchpoint,
+};
+use zaimule_core::external::{
+    detect_switch_keys_status, discover_external_emulators, launch_external_process,
+    search_external_libretro_core, ExternalEmulatorStatus, SwitchKeysStatus,
 };
 use zaimule_core::keymap::{apply_turbo_mask, default_keymapper_widgets, KeymapWidget};
 use zaimule_core::macros::{
@@ -50,9 +60,14 @@ use zaimule_core::patch::{
     CommunityModPackage, ModLayerEntry,
 };
 use zaimule_core::rewind::{rle_compress, rle_decompress, RewindBuffer, SaveStateSlotInfo};
+use zaimule_core::scanner::{
+    discover_known_game_folders, inspect_path_to_entries, scan_directory_for_roms,
+    DirectoryScanReport, DiscoveredFolder,
+};
 use zaimule_core::storage::{
     decode_portable_pack, encode_portable_pack, inspect_sram_hex, write_sram_byte_and_rehash,
-    PersistedSaveState, SramHexInspection, ZaimulePortablePack, PORTABLE_PACK_MAGIC,
+    PersistedLibrary, PersistedSaveState, SramHexInspection, ZaimulePortablePack,
+    PORTABLE_PACK_MAGIC,
 };
 
 /// Snapshot of the entire Zaimule station sent to the UI.
@@ -85,6 +100,16 @@ pub struct StationBootstrap {
     pub rewind_snapshots_count: usize,
     pub rewind_memory_bytes: usize,
     pub warning: Option<String>,
+    #[serde(default)]
+    pub discovered_folders: Vec<DiscoveredFolder>,
+    #[serde(default)]
+    pub rom_directories: Vec<String>,
+    #[serde(default)]
+    pub external_emulators: Vec<ExternalEmulatorStatus>,
+    #[serde(default)]
+    pub switch_keys: SwitchKeysStatus,
+    #[serde(default)]
+    pub last_scan_report: Option<DirectoryScanReport>,
 }
 
 /// Combined frame step response for single, dual (2P), or quad (4P Tournament) viewport rendering.
@@ -121,6 +146,15 @@ pub struct EmulatorSession {
     pub tournament_bracket: TournamentBracket,
     pub udp_node: UdpNetplayNode,
     pub libretro_cores: Vec<LibretroCoreDescriptor>,
+    pub libretro_core_paths: HashMap<String, PathBuf>,
+    pub system_dir: PathBuf,
+    pub save_dir: PathBuf,
+    pub rom_cache_dir: PathBuf,
+    pub discovered_folders: Vec<DiscoveredFolder>,
+    pub external_emulators: Vec<ExternalEmulatorStatus>,
+    pub switch_keys: SwitchKeysStatus,
+    pub last_scan_report: Option<DirectoryScanReport>,
+    pub active_launched_rom_path: Option<PathBuf>,
     pub link_telemetry: LinkCableTelemetry,
     pub rewind_buffer: RewindBuffer,
     pub save_states_ram: HashMap<(String, u8), (SaveStateSlotInfo, Vec<u8>)>,
@@ -129,6 +163,7 @@ pub struct EmulatorSession {
     pub last_score: u32,
     pub recent_inputs_trace: Vec<u8>,
     pub sram_dirty: bool,
+    core_loaded: bool,
     pub warning: Option<String>,
     core_p1: Box<dyn EmulatorBackend>,
     core_p2: Box<dyn EmulatorBackend>,
@@ -189,6 +224,7 @@ fn build_core_for(console: ConsoleKind, rom: &[u8]) -> Result<Box<dyn EmulatorBa
             c.load_rom(rom)?;
             Ok(Box::new(c))
         }
+        ConsoleKind::Switch => Ok(Box::new(GameBoyCore::new_empty())),
         _ => {
             let mut c = GameBoyCore::new();
             c.load_rom(rom)?;
@@ -197,9 +233,29 @@ fn build_core_for(console: ConsoleKind, rom: &[u8]) -> Result<Box<dyn EmulatorBa
     }
 }
 
+fn sanitize_cache_filename(raw: &str) -> String {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "rom.bin".into()
+    } else {
+        cleaned
+    }
+}
+
 impl EmulatorSession {
     /// Creates a clean production session with zero pre-populated test games or mock data.
     pub fn new_clean() -> Self {
+        let base_tmp = std::env::temp_dir().join("zaimule");
         Self {
             settings: GlobalSettings::default(),
             catalog: Vec::new(),
@@ -227,6 +283,15 @@ impl EmulatorSession {
             },
             udp_node: UdpNetplayNode::bind_ephemeral(),
             libretro_cores: default_libretro_cores(),
+            libretro_core_paths: HashMap::new(),
+            system_dir: base_tmp.join("system"),
+            save_dir: base_tmp.join("saves"),
+            rom_cache_dir: base_tmp.join("rom_cache"),
+            discovered_folders: Vec::new(),
+            external_emulators: Vec::new(),
+            switch_keys: SwitchKeysStatus::default(),
+            last_scan_report: None,
+            active_launched_rom_path: None,
             link_telemetry: LinkCableTelemetry::default(),
             rewind_buffer: RewindBuffer::new(240),
             save_states_ram: HashMap::new(),
@@ -235,6 +300,7 @@ impl EmulatorSession {
             last_score: 0,
             recent_inputs_trace: Vec::with_capacity(128),
             sram_dirty: false,
+            core_loaded: false,
             warning: None,
             core_p1: Box::new(GameBoyCore::new_empty()),
             core_p2: Box::new(GameBoyCore::new_empty()),
@@ -246,6 +312,7 @@ impl EmulatorSession {
     pub fn new() -> Self {
         let catalog = default_catalog();
         let active_game_id = catalog[0].id.clone();
+        let base_tmp = std::env::temp_dir().join("zaimule");
 
         let mut session = Self {
             settings: GlobalSettings::default(),
@@ -266,6 +333,15 @@ impl EmulatorSession {
             tournament_bracket: default_tournament_bracket(),
             udp_node: UdpNetplayNode::bind_ephemeral(),
             libretro_cores: default_libretro_cores(),
+            libretro_core_paths: HashMap::new(),
+            system_dir: base_tmp.join("system"),
+            save_dir: base_tmp.join("saves"),
+            rom_cache_dir: base_tmp.join("rom_cache"),
+            discovered_folders: Vec::new(),
+            external_emulators: Vec::new(),
+            switch_keys: SwitchKeysStatus::default(),
+            last_scan_report: None,
+            active_launched_rom_path: None,
             link_telemetry: LinkCableTelemetry::default(),
             rewind_buffer: RewindBuffer::new(240), // 240 snapshots @ 4Hz = 60s
             save_states_ram: HashMap::new(),
@@ -281,6 +357,7 @@ impl EmulatorSession {
             last_score: 0,
             recent_inputs_trace: Vec::with_capacity(128),
             sram_dirty: false,
+            core_loaded: true,
             warning: None,
             core_p1: Box::new(GameBoyCore::new()),
             core_p2: Box::new(GameBoyCore::new()),
@@ -289,6 +366,135 @@ impl EmulatorSession {
         };
         let _ = session.create_save_state(1, "Point de départ Arène".into(), 1_700_000_000_000);
         session
+    }
+
+    /// Configures persistent directories used by Libretro cores (`system`, `saves`, `rom_cache`).
+    pub fn configure_paths(
+        &mut self,
+        system_dir: PathBuf,
+        save_dir: PathBuf,
+        rom_cache_dir: PathBuf,
+    ) {
+        self.system_dir = system_dir;
+        self.save_dir = save_dir;
+        self.rom_cache_dir = rom_cache_dir;
+    }
+
+    /// Discovers local game folders (`Documents/jeuxyuzu`, `RomStation/games`), external emulators,
+    /// Switch `prod.keys`, and native `.dll`/`.dylib`/`.so` Libretro cores already present on disk.
+    pub fn refresh_external_environment(&mut self, app_cores_dir: Option<&Path>) {
+        self.discovered_folders = discover_known_game_folders();
+        self.external_emulators = discover_external_emulators(&self.settings.external_emulators);
+        self.switch_keys = detect_switch_keys_status(&self.external_emulators);
+
+        let mut registered = Vec::new();
+        for desc in &mut self.libretro_cores {
+            let lib_name = desc.current_platform_library_name().to_string();
+            let app_candidate = app_cores_dir.map(|d| d.join(&lib_name));
+            let found_path = app_candidate
+                .filter(|p| p.is_file())
+                .or_else(|| search_external_libretro_core(&lib_name));
+
+            if let Some(path) = found_path {
+                if let Ok(report) = verify_real_libretro_library(&path) {
+                    desc.installed = true;
+                    desc.is_native_binary = true;
+                    desc.library_path = Some(path.to_string_lossy().to_string());
+                    desc.verified_crc32_hex = Some(report.crc32_hex);
+                    desc.status_label = format!(
+                        "✓ C-ABI Natif · {} ({}/{} symboles)",
+                        report.abi_format, report.symbols_found, report.symbols_total
+                    );
+                    registered.push((desc.core_id.clone(), path));
+                    continue;
+                }
+            }
+
+            if let Some(cores_dir) = app_cores_dir {
+                let stub_path = cores_dir.join(format!("{}.bin", desc.core_id));
+                if stub_path.is_file() && !desc.installed {
+                    desc.installed = true;
+                    desc.is_native_binary = false;
+                    desc.status_label =
+                        format!("Descripteur local · Cœur natif ({lib_name}) requis pour jouer");
+                }
+            }
+        }
+
+        for (core_id, path) in registered {
+            self.libretro_core_paths.insert(core_id, path);
+        }
+    }
+
+    /// Releases active CPU/Libretro core handles if the active game uses `core_id`
+    /// so the underlying `.dll`/`.dylib`/`.so` can be overwritten cleanly on Windows.
+    pub fn unload_active_core_if_matches(&mut self, core_id: &str) {
+        if !self.active_game_id.is_empty() && self.active_game().core_id == core_id {
+            self.core_p1 = Box::new(GameBoyCore::new_empty());
+            self.core_p2 = Box::new(GameBoyCore::new_empty());
+            self.core_p3 = Box::new(GameBoyCore::new_empty());
+            self.core_p4 = Box::new(GameBoyCore::new_empty());
+            self.sram_dirty = false;
+            self.core_loaded = false;
+        }
+    }
+
+    /// Registers a verified native `.dll`/`.dylib`/`.so` Libretro core on disk and reloads the active game if it uses it.
+    pub fn register_real_libretro_core(
+        &mut self,
+        core_id: &str,
+        path: &Path,
+    ) -> Result<StationBootstrap, String> {
+        let report = verify_real_libretro_library(path)?;
+        let Some(core) = self
+            .libretro_cores
+            .iter_mut()
+            .find(|c| c.core_id == core_id)
+        else {
+            return Err(format!("cœur Libretro inconnu : {core_id}"));
+        };
+
+        core.installed = true;
+        core.is_native_binary = true;
+        core.library_path = Some(path.to_string_lossy().to_string());
+        core.verified_crc32_hex = Some(report.crc32_hex.clone());
+        core.status_label = format!(
+            "✓ C-ABI Natif · {} ({}/{} symboles · CRC {})",
+            report.abi_format, report.symbols_found, report.symbols_total, report.crc32_hex
+        );
+        self.libretro_core_paths
+            .insert(core_id.to_string(), path.to_path_buf());
+
+        let active_uses_core =
+            !self.active_game_id.is_empty() && self.active_game().core_id == core_id;
+        if active_uses_core {
+            let active_id = self.active_game_id.clone();
+            let _ = self.select_game(&active_id);
+        }
+
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Registers a user-chosen external emulator executable path (Yuzu, Eden, Ryujinx, melonDS, etc.).
+    pub fn set_external_emulator_path(
+        &mut self,
+        emu_id: &str,
+        exe_path: &str,
+    ) -> Result<StationBootstrap, String> {
+        let trimmed = exe_path.trim();
+        let path = Path::new(trimmed);
+        if !path.is_file() {
+            return Err(format!(
+                "exécutable introuvable sur disque : {}",
+                path.display()
+            ));
+        }
+        self.settings
+            .external_emulators
+            .insert(emu_id.to_string(), trimmed.to_string());
+        self.external_emulators = discover_external_emulators(&self.settings.external_emulators);
+        self.switch_keys = detect_switch_keys_status(&self.external_emulators);
+        Ok(self.bootstrap_snapshot())
     }
 
     pub fn active_game(&self) -> &GameEntry {
@@ -314,6 +520,10 @@ impl EmulatorSession {
                     embedded_rom_key: None,
                     cover_accent: "#1E1B1A".into(),
                     cover_symbol: String::new(),
+                    rom_path: None,
+                    archive_entry: None,
+                    title_id: None,
+                    fast_fingerprint: false,
                 })
             })
     }
@@ -338,18 +548,7 @@ impl EmulatorSession {
             memory_watchpoints: self.memory_watchpoints.clone(),
             achievements: self.achievements.clone(),
             save_slots: self.list_save_slots_for(&self.active_game_id),
-            sram_hex_inspection: if self.active_game_id.is_empty() {
-                SramHexInspection {
-                    total_bytes: 0,
-                    non_zero_bytes: 0,
-                    crc32_hex: "00000000".into(),
-                    base_offset: 0,
-                    hex_rows: Vec::new(),
-                    score_slot_value: 0,
-                }
-            } else {
-                inspect_sram_hex(self.core_p1.sram(), 0, 4)
-            },
+            sram_hex_inspection: self.inspect_active_sram_hex(0),
             keymapper_widgets: self.keymapper_widgets.clone(),
             macros: self.macros.clone(),
             tas_timeline,
@@ -366,6 +565,11 @@ impl EmulatorSession {
             rewind_snapshots_count: self.rewind_buffer.len(),
             rewind_memory_bytes: self.rewind_buffer.memory_usage_bytes(),
             warning: self.warning.clone(),
+            discovered_folders: self.discovered_folders.clone(),
+            rom_directories: self.settings.rom_directories.clone(),
+            external_emulators: self.external_emulators.clone(),
+            switch_keys: self.switch_keys.clone(),
+            last_scan_report: self.last_scan_report.clone(),
         }
     }
 
@@ -404,26 +608,517 @@ impl EmulatorSession {
         }
     }
 
+    fn read_header_prefix_for_game(&self, game: &GameEntry) -> Vec<u8> {
+        let Some(ref raw_path) = game.rom_path else {
+            return Vec::new();
+        };
+        let path = Path::new(raw_path);
+        if !path.is_file() {
+            return Vec::new();
+        }
+        if let Some(ref entry_name) = game.archive_entry {
+            if let Ok(entries) = list_zip_entries(path) {
+                if let Some(entry) = entries.into_iter().find(|e| e.name == *entry_name) {
+                    if let Ok(prefix) = read_zip_entry_prefix(path, &entry, 64 * 1024) {
+                        return prefix;
+                    }
+                }
+            }
+            return Vec::new();
+        }
+        if let Ok(mut file) = File::open(path) {
+            let mut buf = vec![0u8; 64 * 1024];
+            if let Ok(n) = file.read(&mut buf) {
+                buf.truncate(n);
+                return buf;
+            }
+        }
+        Vec::new()
+    }
+
     pub fn base_rom_for_game(&self, game_id: &str, console: ConsoleKind) -> Vec<u8> {
         if let Some(custom) = self.custom_roms.get(game_id) {
             return custom.clone();
         }
+        if let Some(game) = self.catalog.iter().find(|g| g.id == game_id) {
+            if game.rom_path.is_some() {
+                let prefix = self.read_header_prefix_for_game(game);
+                if !prefix.is_empty() {
+                    return prefix;
+                }
+            }
+        }
         Self::unpatched_rom_for_console(console)
     }
 
-    /// Switches the active game and instantiates the appropriate Rust core across all 4 Link ports.
+    /// Resolves a launchable on-disk ROM path for `game_id`, extracting compressed `.zip` entries
+    /// (e.g. RomStation `PokemonPlatine.zip` -> `.nds`) atomically into `rom_cache_dir`.
+    pub fn resolve_rom_path_for_launch(&mut self, game_id: &str) -> Result<PathBuf, String> {
+        let Some(game) = self.catalog.iter().find(|g| g.id == game_id).cloned() else {
+            return Err(format!("jeu introuvable : {game_id}"));
+        };
+
+        if let Some(ref raw_path) = game.rom_path {
+            let src_path = PathBuf::from(raw_path);
+            if !src_path.is_file() {
+                return Err(format!(
+                    "fichier jeu introuvable sur disque : {}",
+                    src_path.display()
+                ));
+            }
+            if let Some(ref entry_name) = game.archive_entry {
+                let safe_name = sanitize_cache_filename(entry_name);
+                let cached = self
+                    .rom_cache_dir
+                    .join(format!("{}_{}", game.id, safe_name));
+                let size_ok = cached
+                    .metadata()
+                    .map(|m| m.is_file() && m.len() == game.size_bytes && m.len() > 0)
+                    .unwrap_or(false);
+                if !size_ok {
+                    let entries = list_zip_entries(&src_path)?;
+                    let Some(meta) = entries.into_iter().find(|e| e.name == *entry_name) else {
+                        return Err(format!(
+                            "entrée '{entry_name}' introuvable dans {}",
+                            src_path.display()
+                        ));
+                    };
+                    extract_zip_entry_to_file(&src_path, &meta, &cached)?;
+                }
+                if game.id == self.active_game_id {
+                    self.active_launched_rom_path = Some(cached.clone());
+                }
+                return Ok(cached);
+            }
+            if game.id == self.active_game_id {
+                self.active_launched_rom_path = Some(src_path.clone());
+            }
+            return Ok(src_path);
+        }
+
+        if let Some(custom_bytes) = self.custom_roms.get(game_id) {
+            let ext = match game.console {
+                ConsoleKind::Nds => "nds",
+                ConsoleKind::Gba => "gba",
+                ConsoleKind::Snes => "sfc",
+                ConsoleKind::Nes => "nes",
+                ConsoleKind::Gb => "gb",
+                ConsoleKind::Gbc => "gbc",
+                ConsoleKind::Ps1 => "bin",
+                ConsoleKind::N64 => "z64",
+                ConsoleKind::Psp => "iso",
+                ConsoleKind::Megadrive => "md",
+                _ => "rom",
+            };
+            let dest = self.rom_cache_dir.join(format!("{game_id}.{ext}"));
+            let same_len = dest
+                .metadata()
+                .map(|m| m.is_file() && m.len() == custom_bytes.len() as u64)
+                .unwrap_or(false);
+            if !same_len {
+                std::fs::create_dir_all(&self.rom_cache_dir)
+                    .map_err(|e| format!("{}: {e}", self.rom_cache_dir.display()))?;
+                std::fs::write(&dest, custom_bytes)
+                    .map_err(|e| format!("{}: {e}", dest.display()))?;
+            }
+            return Ok(dest);
+        }
+
+        Err("ce jeu embarqué n'a pas de fichier ROM externe sur disque".into())
+    }
+
+    /// Synchronizes secondary Link-Cable/Quad cores lazily only when multi-play is enabled.
+    fn sync_secondary_link_cores(&mut self) {
+        if !self.link_telemetry.enabled && !self.link_telemetry.quad_mode {
+            self.core_p2 = Box::new(GameBoyCore::new_empty());
+            self.core_p3 = Box::new(GameBoyCore::new_empty());
+            self.core_p4 = Box::new(GameBoyCore::new_empty());
+            return;
+        }
+        if self.active_game_id.is_empty() {
+            return;
+        }
+        let game = self.active_game().clone();
+        if game.console == ConsoleKind::Switch
+            || self.libretro_core_paths.contains_key(&game.core_id)
+        {
+            self.core_p2 = Box::new(GameBoyCore::new_empty());
+            self.core_p3 = Box::new(GameBoyCore::new_empty());
+            self.core_p4 = Box::new(GameBoyCore::new_empty());
+            return;
+        }
+
+        let rom = self.base_rom_for_game(&game.id, game.console);
+        self.core_p2 = build_core_for(game.console, &rom)
+            .unwrap_or_else(|_| Box::new(GameBoyCore::new_empty()));
+        if self.link_telemetry.quad_mode {
+            self.core_p3 = build_core_for(game.console, &rom)
+                .unwrap_or_else(|_| Box::new(GameBoyCore::new_empty()));
+            self.core_p4 = build_core_for(game.console, &rom)
+                .unwrap_or_else(|_| Box::new(GameBoyCore::new_empty()));
+        } else {
+            self.core_p3 = Box::new(GameBoyCore::new_empty());
+            self.core_p4 = Box::new(GameBoyCore::new_empty());
+        }
+    }
+
+    /// Merges scanned/imported catalog entries cleanly without duplicate entries.
+    pub fn merge_scanned_entries(&mut self, entries: Vec<GameEntry>) -> Option<String> {
+        let mut first_id = None;
+        for mut entry in entries.into_iter().rev() {
+            if first_id.is_none() {
+                first_id = Some(entry.id.clone());
+            }
+            if let Some(pos) = self.catalog.iter().position(|g| {
+                g.id == entry.id
+                    || (entry.rom_path.is_some()
+                        && g.rom_path == entry.rom_path
+                        && g.archive_entry == entry.archive_entry)
+            }) {
+                let prev = self.catalog.remove(pos);
+                entry.playtime_seconds = prev.playtime_seconds;
+                entry.favorite = prev.favorite;
+                self.catalog.insert(0, entry);
+            } else {
+                self.catalog.insert(0, entry);
+            }
+        }
+        if let Some(latest) = self.catalog.first() {
+            first_id = Some(latest.id.clone());
+        }
+        first_id
+    }
+
+    /// Scans a directory on disk (`Documents/jeuxyuzu`, `RomStation/games`, etc.) and merges discovered ROMs.
+    pub fn scan_directory_and_merge(&mut self, dir: &Path) -> DirectoryScanReport {
+        let report = scan_directory_for_roms(dir);
+        if dir.is_dir() {
+            let dir_str = dir.to_string_lossy().to_string();
+            if !self
+                .settings
+                .rom_directories
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(&dir_str))
+            {
+                self.settings.rom_directories.push(dir_str);
+            }
+        }
+        let first_id = self.merge_scanned_entries(report.imported_entries.clone());
+        self.last_scan_report = Some(report.clone());
+        if self.active_game_id.is_empty() {
+            if let Some(id) = first_id {
+                let _ = self.select_game(&id);
+            }
+        }
+        report
+    }
+
+    /// Scans all auto-discovered local game directories (`Documents/jeuxyuzu`, `RomStation/games`, etc.).
+    pub fn scan_known_folders_and_merge(&mut self) -> DirectoryScanReport {
+        self.discovered_folders = discover_known_game_folders();
+        let mut combined = DirectoryScanReport {
+            scanned_root: "Dossiers auto-détectés".into(),
+            ..Default::default()
+        };
+        let folder_paths: Vec<PathBuf> = self
+            .discovered_folders
+            .iter()
+            .map(|f| PathBuf::from(&f.path))
+            .collect();
+        for p in folder_paths {
+            let rep = self.scan_directory_and_merge(&p);
+            combined.imported_entries.extend(rep.imported_entries);
+            combined.skipped_files += rep.skipped_files;
+            combined
+                .unsupported_archives
+                .extend(rep.unsupported_archives);
+            combined.errors.extend(rep.errors);
+        }
+        self.last_scan_report = Some(combined.clone());
+        combined
+    }
+
+    /// Imports arbitrary file or folder paths dropped onto the window or chosen via native dialog.
+    pub fn import_paths(&mut self, paths: &[PathBuf]) -> Result<DirectoryScanReport, String> {
+        let mut combined = DirectoryScanReport {
+            scanned_root: "Importation directe".into(),
+            ..Default::default()
+        };
+
+        for p in paths {
+            if p.is_dir() {
+                let rep = self.scan_directory_and_merge(p);
+                combined.imported_entries.extend(rep.imported_entries);
+                combined.skipped_files += rep.skipped_files;
+                combined
+                    .unsupported_archives
+                    .extend(rep.unsupported_archives);
+                combined.errors.extend(rep.errors);
+            } else if p.is_file() {
+                match inspect_path_to_entries(p) {
+                    Ok(rep) => {
+                        combined.imported_entries.extend(rep.imported_entries);
+                        combined.skipped_files += rep.skipped_files;
+                        combined
+                            .unsupported_archives
+                            .extend(rep.unsupported_archives);
+                        combined.errors.extend(rep.errors);
+                    }
+                    Err(err) => combined.errors.push(err),
+                }
+            } else {
+                combined
+                    .errors
+                    .push(format!("chemin introuvable : {}", p.display()));
+            }
+        }
+
+        let first_id = self.merge_scanned_entries(combined.imported_entries.clone());
+        self.last_scan_report = Some(combined.clone());
+        if let Some(id) = first_id {
+            let _ = self.select_game(&id);
+        }
+
+        if combined.imported_entries.is_empty() && !combined.unsupported_archives.is_empty() {
+            return Err(format!(
+                "Archive .7z/.rar détectée ({}). Extrayez-la ou utilisez un fichier .zip / .nds / .nsp / .xci directement.",
+                combined.unsupported_archives[0]
+            ));
+        }
+
+        Ok(combined)
+    }
+
+    /// Removes a game entry from the user library and clears active cores if it was selected.
+    pub fn remove_game(&mut self, game_id: &str) -> Result<StationBootstrap, String> {
+        let before = self.catalog.len();
+        self.catalog.retain(|g| g.id != game_id);
+        self.custom_roms.remove(game_id);
+        if self.catalog.len() == before {
+            return Err(format!("jeu introuvable : {game_id}"));
+        }
+        if self.active_game_id == game_id {
+            self.active_game_id.clear();
+            self.active_launched_rom_path = None;
+            self.rewind_buffer.clear();
+            self.sram_dirty = false;
+            self.core_loaded = false;
+            self.core_p1 = Box::new(GameBoyCore::new_empty());
+            self.core_p2 = Box::new(GameBoyCore::new_empty());
+            self.core_p3 = Box::new(GameBoyCore::new_empty());
+            self.core_p4 = Box::new(GameBoyCore::new_empty());
+        }
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Builds a serializable `PersistedLibrary` snapshot for atomic `library.json` storage.
+    pub fn to_persisted_library(&self) -> PersistedLibrary {
+        PersistedLibrary {
+            active_game_id: self.active_game_id.clone(),
+            catalog: self.catalog.clone(),
+            rom_directories: self.settings.rom_directories.clone(),
+        }
+    }
+
+    /// Restores catalog and configured directories from `library.json`.
+    pub fn restore_persisted_library(&mut self, lib: PersistedLibrary) {
+        for dir in lib.rom_directories {
+            if !self
+                .settings
+                .rom_directories
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(&dir))
+            {
+                self.settings.rom_directories.push(dir);
+            }
+        }
+        self.catalog = lib.catalog;
+        if !lib.active_game_id.is_empty() && self.catalog.iter().any(|g| g.id == lib.active_game_id)
+        {
+            let _ = self.select_game(&lib.active_game_id);
+        }
+    }
+
+    /// Prepares executable + ROM paths for launching the active title in an external emulator.
+    pub fn prepare_external_launch(
+        &mut self,
+        preferred_emu_id: Option<&str>,
+    ) -> Result<(PathBuf, PathBuf, String, Option<PathBuf>, String), String> {
+        if self.active_game_id.is_empty() {
+            return Err("sélectionnez d'abord un jeu dans la bibliothèque".into());
+        }
+        if self.external_emulators.is_empty() {
+            self.external_emulators =
+                discover_external_emulators(&self.settings.external_emulators);
+            self.switch_keys = detect_switch_keys_status(&self.external_emulators);
+        }
+
+        let game = self.active_game().clone();
+        let chosen = if let Some(req_id) = preferred_emu_id {
+            let Some(emu) = self.external_emulators.iter().find(|e| e.id == req_id) else {
+                return Err(format!("émulateur externe inconnu : {req_id}"));
+            };
+            if !emu.installed || emu.executable_path.is_none() {
+                return Err(format!(
+                    "{} n'a pas été détecté automatiquement. Indiquez son exécutable dans l'onglet Cœurs & BIOS.",
+                    emu.name
+                ));
+            }
+            if !emu.supported_consoles.contains(&game.console) {
+                return Err(format!(
+                    "{} ne prend pas en charge {}",
+                    emu.name,
+                    game.console.label()
+                ));
+            }
+            emu.clone()
+        } else {
+            let Some(emu) = self
+                .external_emulators
+                .iter()
+                .find(|e| e.installed && e.supported_consoles.contains(&game.console))
+                .cloned()
+            else {
+                let hint = if game.console == ConsoleKind::Switch {
+                    "Aucun émulateur Nintendo Switch (Yuzu, Eden, Sudachi, Citron, Suyu ou Ryujinx) détecté. Indiquez son .exe dans l'onglet Cœurs & BIOS."
+                } else {
+                    "Aucun émulateur externe compatible (melonDS, DeSmuME ou RetroArch) détecté dans Cœurs & BIOS."
+                };
+                return Err(hint.into());
+            };
+            emu
+        };
+
+        let exe_path = PathBuf::from(chosen.executable_path.unwrap_or_default());
+        let rom_path = self.resolve_rom_path_for_launch(&game.id)?;
+        let retroarch_core = if chosen.id == "retroarch" {
+            self.libretro_core_paths.get(&game.core_id).cloned()
+        } else {
+            None
+        };
+        let key_note = if game.console == ConsoleKind::Switch && !self.switch_keys.prod_keys_found {
+            " · Attention : prod.keys non détecté dans les dossiers standard".to_string()
+        } else {
+            String::new()
+        };
+
+        Ok((exe_path, rom_path, chosen.id, retroarch_core, key_note))
+    }
+
+    /// Launches the active game in a matching external standalone emulator process.
+    pub fn launch_active_external_emulator(
+        &mut self,
+        preferred_emu_id: Option<&str>,
+    ) -> Result<String, String> {
+        let (exe_path, rom_path, emu_id, ra_core, note) =
+            self.prepare_external_launch(preferred_emu_id)?;
+        let status = launch_external_process(&exe_path, &rom_path, &emu_id, ra_core.as_deref())?;
+        Ok(format!("{status}{note}"))
+    }
+
+    /// Switches the active game and instantiates the appropriate core safely without loading multi-GB files into RAM.
     pub fn select_game(&mut self, game_id: &str) -> Result<StationBootstrap, String> {
         let Some(game) = self.catalog.iter().find(|g| g.id == game_id).cloned() else {
             return Err(format!("jeu introuvable dans la bibliothèque : {game_id}"));
         };
         self.active_game_id = game.id.clone();
+        self.active_launched_rom_path = game.rom_path.as_ref().map(PathBuf::from);
         self.rewind_buffer.clear();
-        let rom = self.base_rom_for_game(&game.id, game.console);
+        self.sram_dirty = false;
+        self.core_loaded = false;
 
+        // Always drop previous backends cleanly before initializing the next one
+        self.core_p1 = Box::new(GameBoyCore::new_empty());
+        self.core_p2 = Box::new(GameBoyCore::new_empty());
+        self.core_p3 = Box::new(GameBoyCore::new_empty());
+        self.core_p4 = Box::new(GameBoyCore::new_empty());
+
+        if game.console == ConsoleKind::Switch
+            || game.engine_kind == CoreEngineKind::ExternalLauncher
+        {
+            return Ok(self.bootstrap_snapshot());
+        }
+
+        if game.rom_path.is_some() {
+            if let Some(core_path) = self.libretro_core_paths.get(&game.core_id).cloned() {
+                let launch_rom = self.resolve_rom_path_for_launch(&game.id)?;
+                match LibretroHostCore::load(
+                    game.console,
+                    &core_path,
+                    &launch_rom,
+                    &self.system_dir,
+                    &self.save_dir,
+                ) {
+                    Ok(host) => {
+                        self.core_p1 = Box::new(host);
+                        self.core_loaded = true;
+                        self.warning = None;
+                        self.sync_secondary_link_cores();
+                        return Ok(self.bootstrap_snapshot());
+                    }
+                    Err(err) => {
+                        self.warning = Some(format!(
+                            "Impossible de démarrer {} via C-ABI : {err}",
+                            game.core_id
+                        ));
+                        if game.console != ConsoleKind::Nds {
+                            return Err(err);
+                        }
+                    }
+                }
+            }
+
+            if game.console == ConsoleKind::Nds {
+                let header = self.read_header_prefix_for_game(&game);
+                if header.is_empty() {
+                    return Err(
+                        "impossible de lire l'en-tête de la ROM Nintendo DS sur disque".into(),
+                    );
+                }
+                let mut nds = NdsCore::new();
+                nds.load_rom(&header)?;
+                self.core_p1 = Box::new(nds);
+                self.core_loaded = true;
+                self.sync_secondary_link_cores();
+                return Ok(self.bootstrap_snapshot());
+            }
+
+            let launch_rom = self.resolve_rom_path_for_launch(&game.id)?;
+            let bytes = if game.size_bytes <= 64 * 1024 * 1024 {
+                std::fs::read(&launch_rom).map_err(|e| format!("{}: {e}", launch_rom.display()))?
+            } else {
+                self.read_header_prefix_for_game(&game)
+            };
+            self.core_p1 = build_core_for(game.console, &bytes)?;
+            self.core_loaded = true;
+            self.sync_secondary_link_cores();
+            return Ok(self.bootstrap_snapshot());
+        }
+
+        if game.embedded_rom_key.is_none() {
+            if let Some(core_path) = self.libretro_core_paths.get(&game.core_id).cloned() {
+                if let Ok(launch_rom) = self.resolve_rom_path_for_launch(&game.id) {
+                    if let Ok(host) = LibretroHostCore::load(
+                        game.console,
+                        &core_path,
+                        &launch_rom,
+                        &self.system_dir,
+                        &self.save_dir,
+                    ) {
+                        self.core_p1 = Box::new(host);
+                        self.core_loaded = true;
+                        self.warning = None;
+                        self.sync_secondary_link_cores();
+                        return Ok(self.bootstrap_snapshot());
+                    }
+                }
+            }
+        }
+
+        let rom = self.base_rom_for_game(&game.id, game.console);
         self.core_p1 = build_core_for(game.console, &rom)?;
-        self.core_p2 = build_core_for(game.console, &rom)?;
-        self.core_p3 = build_core_for(game.console, &rom)?;
-        self.core_p4 = build_core_for(game.console, &rom)?;
+        self.core_loaded = true;
+        self.sync_secondary_link_cores();
         Ok(self.bootstrap_snapshot())
     }
 
@@ -440,8 +1135,28 @@ impl EmulatorSession {
         let title = extract_rom_title(file_name, console, rom_bytes);
         let crc = compute_crc32(rom_bytes);
         let crc_hex = format_crc32_hex(crc);
-        let id = format!("rom-{}", crc_hex.to_ascii_lowercase());
+        let is_dual_phantom = rom_bytes.len() >= 12 && &rom_bytes[0..12] == b"DUALPHANTOM\0";
 
+        let header = &rom_bytes[..rom_bytes.len().min(64 * 1024)];
+        let inspected =
+            inspect_rom_header_and_stats(file_name, header, rom_bytes.len() as u64, crc, false);
+        let title_id = match console {
+            ConsoleKind::Switch => extract_switch_title_id(file_name),
+            ConsoleKind::Nds => extract_nds_game_code(rom_bytes),
+            _ => None,
+        };
+        let (engine_kind, core_id) = match console {
+            ConsoleKind::Switch => (CoreEngineKind::ExternalLauncher, "yuzu-external".into()),
+            ConsoleKind::Nds if !is_dual_phantom => {
+                (CoreEngineKind::LibretroAbi, "melonds_libretro".into())
+            }
+            other if other.is_native_rust() => {
+                (CoreEngineKind::NativeRust, other.default_core_id().into())
+            }
+            other => (CoreEngineKind::LibretroAbi, other.default_core_id().into()),
+        };
+
+        let id = format!("rom-{}", crc_hex.to_ascii_lowercase());
         self.custom_roms.insert(id.clone(), rom_bytes.to_vec());
 
         if !self.catalog.iter().any(|g| g.id == id) {
@@ -451,22 +1166,30 @@ impl EmulatorSession {
                     id: id.clone(),
                     title,
                     console,
-                    engine_kind: if console.is_native_rust() {
-                        CoreEngineKind::NativeRust
-                    } else {
-                        CoreEngineKind::LibretroAbi
-                    },
-                    core_id: console.default_core_id().into(),
-                    region: "Import Local · CRC32 Vérifié".into(),
+                    engine_kind,
+                    core_id,
+                    region: inspected.region,
                     crc32_hex: crc_hex,
                     size_bytes: rom_bytes.len() as u64,
-                    sram_summary: "32 Ko SRAM Atomique (.tmp → .srm)".into(),
+                    sram_summary: if console == ConsoleKind::Switch {
+                        "Sauvegarde Yuzu / Eden / Ryujinx".into()
+                    } else {
+                        "32 Ko SRAM Atomique (.tmp → .srm)".into()
+                    },
                     playtime_seconds: 0,
                     favorite: true,
                     link_cable_ready: console.supports_link_cable(),
                     embedded_rom_key: None,
-                    cover_accent: "#283655".into(),
+                    cover_accent: if console == ConsoleKind::Switch {
+                        "#4A181D".into()
+                    } else {
+                        "#283655".into()
+                    },
                     cover_symbol: String::new(),
+                    rom_path: None,
+                    archive_entry: None,
+                    title_id,
+                    fast_fingerprint: false,
                 },
             );
         }
@@ -491,9 +1214,7 @@ impl EmulatorSession {
         self.custom_roms
             .insert(game.id.clone(), patched_rom.clone());
         self.core_p1.load_rom(&patched_rom)?;
-        self.core_p2.load_rom(&patched_rom)?;
-        self.core_p3.load_rom(&patched_rom)?;
-        self.core_p4.load_rom(&patched_rom)?;
+        self.sync_secondary_link_cores();
 
         let mod_id = format!("ips-{}", new_crc.to_ascii_lowercase());
         self.mod_layers.retain(|m| m.id != mod_id);
@@ -567,7 +1288,9 @@ impl EmulatorSession {
         else {
             return Err(format!("cœur Libretro inconnu : {core_id}"));
         };
+        let is_stub = binary.windows(23).any(|w| w == b"ZAIMULE_LIBRETRO_ABI_V1");
         core.installed = true;
+        core.is_native_binary = !is_stub;
         core.verified_crc32_hex = Some(report.crc32_hex.clone());
         core.status_label = format!(
             "✓ Installé · {} ({}/{} symboles C-ABI · CRC {})",
@@ -596,6 +1319,7 @@ impl EmulatorSession {
                 .connect_peer(&format!("127.0.0.1:{}", self.udp_node.local_port));
         }
         self.link_telemetry.enabled = true;
+        self.sync_secondary_link_cores();
         self.netplay_rooms.retain(|r| r.room_code != room_code);
         self.netplay_rooms.insert(
             0,
@@ -647,6 +1371,7 @@ impl EmulatorSession {
                 .connect_peer(&format!("127.0.0.1:{}", self.udp_node.local_port));
         }
         self.link_telemetry.enabled = true;
+        self.sync_secondary_link_cores();
         Ok(self.bootstrap_snapshot())
     }
 
@@ -806,7 +1531,7 @@ impl EmulatorSession {
             self.recent_inputs_trace.remove(0);
         }
         self.recent_inputs_trace.push((mask_p1 & 0xFF) as u8);
-        self.sram_dirty = !self.active_game_id.is_empty();
+        self.sram_dirty = self.has_persistable_sram();
 
         ViewportStepResponse {
             primary,
@@ -821,12 +1546,23 @@ impl EmulatorSession {
         }
     }
 
+    /// Enables or disables 2-Player Dual Link Cable Split-Screen mode.
+    pub fn set_dual_link_enabled(&mut self, enabled: bool) -> StationBootstrap {
+        self.link_telemetry.enabled = enabled;
+        if !enabled {
+            self.link_telemetry.quad_mode = false;
+        }
+        self.sync_secondary_link_cores();
+        self.bootstrap_snapshot()
+    }
+
     /// Enables or disables 4-Player Tournament Split-Screen (2x2 Quad-Link) mode.
     pub fn set_quad_link_mode(&mut self, quad_enabled: bool) -> StationBootstrap {
         self.link_telemetry.quad_mode = quad_enabled;
         if quad_enabled {
             self.link_telemetry.enabled = true;
         }
+        self.sync_secondary_link_cores();
         self.bootstrap_snapshot()
     }
 
@@ -951,6 +1687,24 @@ impl EmulatorSession {
         Ok(frame)
     }
 
+    /// Returns `true` when the active session runs a real stateful core with non-empty backup SRAM
+    /// (excluding Switch / external launchers and commercial NDS standby awaiting melonDS C-ABI).
+    pub fn has_persistable_sram(&self) -> bool {
+        if !self.core_loaded || self.active_game_id.is_empty() {
+            return false;
+        }
+        let game = self.active_game();
+        if game.console == ConsoleKind::Switch
+            || game.engine_kind == CoreEngineKind::ExternalLauncher
+        {
+            return false;
+        }
+        if self.core_p1.debug_snapshot().flags_str == "NEED_MELONDS_CABI" {
+            return false;
+        }
+        !self.core_p1.sram().is_empty()
+    }
+
     pub fn active_sram_bytes(&self) -> &[u8] {
         self.core_p1.sram()
     }
@@ -989,7 +1743,7 @@ impl EmulatorSession {
         }
         let pack = ZaimulePortablePack {
             magic: PORTABLE_PACK_MAGIC.into(),
-            version: "1.1.0".into(),
+            version: "1.2.0".into(),
             active_game_id: self.active_game_id.clone(),
             sram_rle,
             sram_uncompressed_len: sram_raw.len(),
@@ -1208,7 +1962,7 @@ impl EmulatorSession {
 
     /// Returns a 4-row hexadecimal + ASCII inspection snapshot of the active game's SRAM / Memory Card.
     pub fn inspect_active_sram_hex(&self, offset: usize) -> SramHexInspection {
-        if self.active_game_id.is_empty() {
+        if !self.has_persistable_sram() {
             return SramHexInspection {
                 total_bytes: 0,
                 non_zero_bytes: 0,
@@ -1228,8 +1982,8 @@ impl EmulatorSession {
         offset: usize,
         value: u8,
     ) -> Result<StationBootstrap, String> {
-        if self.active_game_id.is_empty() {
-            return Err("aucune ROM chargée".into());
+        if !self.has_persistable_sram() {
+            return Err("aucune mémoire SRAM active pour ce cœur".into());
         }
         let mut sram_vec = self.core_p1.sram().to_vec();
         let _ = write_sram_byte_and_rehash(&mut sram_vec, offset, value)?;
@@ -1579,5 +2333,96 @@ mod tests {
             .inspect_vram_and_disassembly()
             .disassembly
             .is_empty());
+    }
+
+    #[test]
+    fn session_scans_switch_jeuxyuzu_and_romstation_zip_pokemon_platinum() {
+        use std::fs;
+        use zaimule_core::archive::build_stored_zip_for_test;
+
+        let root = std::env::temp_dir().join(format!("zaimule-sess-real-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cache = root.join("cache");
+        let jeuxyuzu = root.join("Documents/jeuxyuzu");
+        let rs_games = root.join("RomStation/games");
+        fs::create_dir_all(&jeuxyuzu).unwrap();
+        fs::create_dir_all(&rs_games).unwrap();
+
+        let mut nsp = vec![0u8; 4096];
+        nsp[0..4].copy_from_slice(b"PFS0");
+        fs::write(
+            jeuxyuzu.join("Mario Kart 8 Deluxe [0100152000022000].nsp"),
+            &nsp,
+        )
+        .unwrap();
+
+        let mut xci = vec![0u8; 4096];
+        xci[0x0100..0x0104].copy_from_slice(b"HEAD");
+        fs::write(jeuxyuzu.join("Tears of the Kingdom.xci"), &xci).unwrap();
+
+        let mut nds = vec![0u8; 0x800];
+        nds[0x0000..0x000A].copy_from_slice(b"POKEMON PL");
+        nds[0x000C..0x0010].copy_from_slice(b"CPUF");
+        nds[0x015C] = 0x56;
+        nds[0x015D] = 0xCF;
+        let zip_bytes =
+            build_stored_zip_for_test(&[("Pokemon - Version Platine (France).nds", &nds)]);
+        fs::write(rs_games.join("PokemonPlatine.zip"), &zip_bytes).unwrap();
+
+        let mut session = EmulatorSession::new_clean();
+        session.configure_paths(root.join("sys"), root.join("sav"), cache.clone());
+
+        let rep_sw = session.scan_directory_and_merge(&jeuxyuzu);
+        assert_eq!(rep_sw.imported_entries.len(), 2);
+
+        let rep_rs = session.scan_directory_and_merge(&rs_games);
+        assert_eq!(rep_rs.imported_entries.len(), 1);
+        let plat_id = rep_rs.imported_entries[0].id.clone();
+
+        // Select Switch game -> zero OOM, standby backend, never overwrites SRAM
+        let sw_id = rep_sw.imported_entries[0].id.clone();
+        let sw_boot = session.select_game(&sw_id).unwrap();
+        assert_eq!(sw_boot.active_game_id, sw_id);
+        assert!(!session.has_persistable_sram());
+        let _ = session.step_viewport(0, 0, false);
+        assert!(!session.sram_dirty);
+
+        // Select Pokémon Platinum compressed in RomStation .zip -> enters honest diagnostic mode until melonds_libretro is installed
+        let plat_boot = session.select_game(&plat_id).unwrap();
+        assert_eq!(plat_boot.active_game_id, plat_id);
+        assert!(!session.has_persistable_sram());
+        let step = session.step_viewport(BTN_RIGHT, 0, false);
+        assert_eq!(step.primary.cpu.flags_str, "NEED_MELONDS_CABI");
+        assert_eq!(step.primary.cpu.score, 0);
+        assert!(!session.sram_dirty);
+
+        // Unloading core handle by core_id clears standby cleanly without disturbing non-matching IDs
+        session.unload_active_core_if_matches("mgba_libretro");
+        assert_eq!(
+            session.step_viewport(0, 0, false).primary.cpu.flags_str,
+            "NEED_MELONDS_CABI"
+        );
+        session.unload_active_core_if_matches("melonds_libretro");
+        assert!(!session.has_persistable_sram());
+
+        // Resolving ROM path for launch extracts the .nds out of RomStation .zip cleanly into cache
+        let resolved_nds = session.resolve_rom_path_for_launch(&plat_id).unwrap();
+        assert!(resolved_nds.is_file());
+        assert_eq!(fs::read(&resolved_nds).unwrap().len(), nds.len());
+
+        // PersistedLibrary roundtrip + delete
+        let persisted = session.to_persisted_library();
+        assert_eq!(persisted.catalog.len(), 3);
+        let mut restored_session = EmulatorSession::new_clean();
+        restored_session.configure_paths(root.join("sys"), root.join("sav"), cache);
+        restored_session.restore_persisted_library(persisted);
+        assert_eq!(restored_session.catalog.len(), 3);
+        assert_eq!(restored_session.active_game_id, plat_id);
+
+        let after_del = restored_session.remove_game(&plat_id).unwrap();
+        assert_eq!(after_del.catalog.len(), 2);
+        assert!(after_del.active_game_id.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

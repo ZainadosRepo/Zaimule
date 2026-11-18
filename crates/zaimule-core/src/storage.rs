@@ -2,7 +2,7 @@
 //! Writes to `.tmp` then renames atomically, moves corrupted JSON files aside to `.json.bad`,
 //! and rotates `.srm.bak1`..`.srm.bak3` backups for cartridge SRAM saves.
 
-use crate::catalog::{compute_crc32, format_crc32_hex};
+use crate::catalog::{compute_crc32, format_crc32_hex, GameEntry};
 use crate::cheats::CheatCodeEntry;
 use crate::keymap::KeymapWidget;
 use crate::macros::MacroSequence;
@@ -13,10 +13,18 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
-const MAX_JSON_BYTES: usize = 4 << 20; // 4 MiB
+const MAX_JSON_BYTES: usize = 16 << 20; // 16 MiB
 const MAX_SRAM_BYTES: usize = 16 << 20; // 16 MiB
 const MAX_STATE_BYTES: usize = 32 << 20; // 32 MiB
 pub const PORTABLE_PACK_MAGIC: &str = "ZAIMULE_PACK_V1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PersistedLibrary {
+    pub active_game_id: String,
+    pub catalog: Vec<GameEntry>,
+    pub rom_directories: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -128,6 +136,34 @@ pub fn save_json_atomic(path: &Path, value: &Value) -> Result<(), String> {
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
     fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Loads the persisted game library (`library.json`) atomically, returning `Default` if missing.
+pub fn load_library_atomic(path: &Path) -> Result<(PersistedLibrary, Option<String>), String> {
+    let loaded = load_json_atomic(path)?;
+    if loaded.value.is_null() {
+        return Ok((PersistedLibrary::default(), loaded.warning));
+    }
+    match serde_json::from_value::<PersistedLibrary>(loaded.value) {
+        Ok(lib) => Ok((lib, loaded.warning)),
+        Err(e) => {
+            let backup = path.with_extension("json.bad");
+            let _ = fs::rename(path, &backup);
+            Ok((
+                PersistedLibrary::default(),
+                Some(format!(
+                    "bibliothèque illisible ({e}), copie conservée dans {}",
+                    backup.display()
+                )),
+            ))
+        }
+    }
+}
+
+/// Saves the user's game library atomically via `.json.tmp`.
+pub fn save_library_atomic(path: &Path, library: &PersistedLibrary) -> Result<(), String> {
+    let value = serde_json::to_value(library).map_err(|e| e.to_string())?;
+    save_json_atomic(path, &value)
 }
 
 /// Saves binary cartridge battery SRAM (`.srm`) atomically via `.srm.tmp` and rotates `.srm.bak1`..`.srm.bak3`.
@@ -394,5 +430,40 @@ mod tests {
         assert_eq!(updated.score_slot_value, 0x99);
         assert_eq!(updated.non_zero_bytes, 5);
         assert!(updated.hex_rows[0].contains("5A 41 49 4D 99"));
+    }
+
+    #[test]
+    fn persisted_library_roundtrips_catalog_and_directories() {
+        use crate::catalog::{ConsoleKind, CoreEngineKind};
+        let path = temp_path("lib_roundtrip", "json");
+        let lib = PersistedLibrary {
+            active_game_id: "rom-platine".into(),
+            rom_directories: vec!["C:/Users/Test/Documents/jeuxyuzu".into()],
+            catalog: vec![GameEntry {
+                id: "rom-platine".into(),
+                title: "Pokémon Version Platine".into(),
+                console: ConsoleKind::Nds,
+                engine_kind: CoreEngineKind::LibretroAbi,
+                core_id: "melonds_libretro".into(),
+                region: "EUR · FR".into(),
+                crc32_hex: "AABBCCDD".into(),
+                size_bytes: 134_217_728,
+                sram_summary: "EEPROM NDS".into(),
+                playtime_seconds: 120,
+                favorite: true,
+                link_cable_ready: true,
+                embedded_rom_key: None,
+                cover_accent: "#1F2C38".into(),
+                cover_symbol: "NDS".into(),
+                rom_path: Some("C:/RomStation/app/games/PokemonPlatine.zip".into()),
+                archive_entry: Some("Pokemon - Version Platine (FR).nds".into()),
+                title_id: Some("CPUF".into()),
+                fast_fingerprint: false,
+            }],
+        };
+        save_library_atomic(&path, &lib).unwrap();
+        let (reloaded, warn) = load_library_atomic(&path).unwrap();
+        assert!(warn.is_none());
+        assert_eq!(reloaded, lib);
     }
 }

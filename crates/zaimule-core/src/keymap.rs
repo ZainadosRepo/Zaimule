@@ -13,6 +13,8 @@ pub const BTN_START: u16 = 1 << 6;
 pub const BTN_SELECT: u16 = 1 << 7;
 pub const BTN_L: u16 = 1 << 8;
 pub const BTN_R: u16 = 1 << 9;
+pub const BTN_X: u16 = 1 << 10;
+pub const BTN_Y: u16 = 1 << 11;
 
 /// Visual overlay control widget category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

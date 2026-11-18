@@ -144,7 +144,7 @@ impl GameBoyCore {
             rtc_regs: [0; 5],
             rtc_latch_arm: 0,
             vram: vec![0; 0x2000],
-            sram: vec![0; 0x8000],
+            sram: Vec::new(),
             wram: vec![0; 0x2000],
             oam: vec![0; 0xA0],
             io: vec![0; 0x80],
@@ -1155,6 +1155,9 @@ impl EmulatorBackend for GameBoyCore {
         self.halted = false;
         self.frame_number = 0;
         self.score = 0;
+        if self.sram.len() < 0x8000 {
+            self.sram.resize(0x8000, 0);
+        }
         self.init_vram_tiles_and_map();
         Ok(())
     }

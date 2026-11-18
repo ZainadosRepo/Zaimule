@@ -24,7 +24,8 @@ export function formatFileSize(bytes) {
   const b = Math.max(0, Number(bytes) || 0);
   if (b < 1024) return `${b} o`;
   if (b < 1024 * 1024) return `${(b / 1024).toFixed(0)} Ko`;
-  return `${(b / (1024 * 1024)).toFixed(1)} Mo`;
+  if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} Mo`;
+  return `${(b / (1024 * 1024 * 1024)).toFixed(2)} Go`;
 }
 
 export function filterCatalogEntries(entries, filterOptions = {}) {
@@ -60,7 +61,7 @@ export function filterCatalogEntries(entries, filterOptions = {}) {
     if (!normalizedQuery) return true;
 
     const haystack = normalizeSearchText(
-      `${item.title || ""} ${item.console || ""} ${item.crc32Hex || ""} ${item.region || ""} ${item.coreId || ""}`
+      `${item.title || ""} ${item.console || ""} ${item.crc32Hex || ""} ${item.titleId || ""} ${item.region || ""} ${item.coreId || ""}`
     );
     return haystack.includes(normalizedQuery);
   });

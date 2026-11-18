@@ -3,13 +3,16 @@
 //! visual keymapper & TAS macro engine, Yuzu-style per-game overrides, atomic persistence,
 //! and P2P netplay protocol.
 
+pub mod archive;
 pub mod bios;
 pub mod catalog;
 pub mod cheats;
+pub mod external;
 pub mod keymap;
 pub mod macros;
 pub mod netplay;
 pub mod overrides;
 pub mod patch;
 pub mod rewind;
+pub mod scanner;
 pub mod storage;

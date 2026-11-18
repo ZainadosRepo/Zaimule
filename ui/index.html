@@ -16,7 +16,7 @@
         <div class="brand-group" data-tauri-drag-region>
           <div class="brand-emblem">Z</div>
           <h1 class="brand-title">ZAIMULE</h1>
-          <span class="brand-version">1.1</span>
+          <span class="brand-version">1.2</span>
         </div>
 
         <nav class="nav-tabs" role="tablist" aria-label="Navigation principale">
@@ -74,7 +74,8 @@
       <input
         type="file"
         id="rom-file-input"
-        accept=".gb,.gbc,.gba,.nes,.sfc,.smc,.nds,.psx,.pbp,.iso,.cso,.z64,.n64,.md,.gen,.ch8,.rom,.bin"
+        accept=".nsp,.xci,.nsz,.xcz,.nro,.zip,.7z,.nds,.gba,.gb,.gbc,.nes,.sfc,.smc,.z64,.n64,.v64,.md,.gen,.smd,.psx,.pbp,.iso,.cso,.ch8,.rom,.bin"
+        multiple
         style="display: none;"
       />
       <input
@@ -200,6 +201,19 @@
               <span class="console-count mono" id="count-nds">0</span>
             </button>
 
+            <button class="console-btn" data-console="SWITCH">
+              <span class="console-btn-label">
+                <svg class="console-icon" viewBox="0 0 24 24">
+                  <rect x="3" y="4" width="7" height="16" rx="3" />
+                  <rect x="14" y="4" width="7" height="16" rx="3" />
+                  <circle cx="6.5" cy="9" r="1.1" />
+                  <circle cx="17.5" cy="14" r="1.1" />
+                </svg>
+                <span>Nintendo Switch</span>
+              </span>
+              <span class="console-count mono" id="count-switch">0</span>
+            </button>
+
             <button class="console-btn" data-console="PS1">
               <span class="console-btn-label">
                 <svg class="console-icon" viewBox="0 0 24 24">
@@ -277,11 +291,17 @@
               </div>
 
               <div class="toolbar-actions">
-                <button class="btn" id="btn-import-rom">
+                <button class="btn" id="btn-import-rom" title="Importer un ou plusieurs jeux (.nsp, .xci, .nds, .zip, .gba...)">
                   <svg viewBox="0 0 24 24">
                     <path d="M12 5v14M5 12h14" />
                   </svg>
                   Importer ROM
+                </button>
+                <button class="btn" id="btn-scan-folder" title="Scanner un dossier local (jeuxyuzu, RomStation/games...)">
+                  Dossier...
+                </button>
+                <button class="btn btn-ghost" id="btn-scan-known" title="Auto-détecter Documents/jeuxyuzu et RomStation">
+                  Scanner
                 </button>
                 <button class="btn btn-ghost" id="btn-import-ips">Patch .IPS</button>
                 <button class="btn btn-ghost" id="btn-export-pack" title="Exporter l'archive portable .zaimule-pack">
@@ -321,6 +341,9 @@
                 <span>Lancer dans le Viewport 60 Hz</span>
                 <span class="kbd-hint">A</span>
               </button>
+              <button class="btn" style="width: 100%; justify-content: center; margin-top: 6px; display: none;" id="btn-insp-external">
+                <span>Lancer en externe (melonDS / DeSmuME)</span>
+              </button>
             </div>
 
             <div class="inspector-tabs" role="tablist">
@@ -340,6 +363,14 @@
                   <span class="kv-label">Empreinte CRC32</span>
                   <span class="kv-val mono" id="insp-crc">—</span>
                 </div>
+                <div class="kv-row" id="insp-titleid-row" style="display: none;">
+                  <span class="kv-label">Title ID / Code</span>
+                  <span class="kv-val mono" id="insp-titleid">—</span>
+                </div>
+                <div class="kv-row" id="insp-path-row" style="display: none;">
+                  <span class="kv-label">Source disque</span>
+                  <span class="kv-val mono path-ellipsis" id="insp-path" style="max-width: 175px;">—</span>
+                </div>
                 <div class="kv-row">
                   <span class="kv-label">Support Sauvegarde</span>
                   <span class="kv-val mono" id="insp-sram">—</span>
@@ -349,7 +380,7 @@
                   <span class="kv-val mono" id="insp-playtime">—</span>
                 </div>
                 <div id="sram-hex-dump" class="hex-dump-box mono"></div>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:10px;">
+                <div id="sram-actions-row" style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:10px;">
                   <button class="btn mono" id="btn-sram-boost" style="font-size:11px; justify-content:center;" title="Écrire 0xFF en SRAM et recalculer le CRC32 atomique">
                     Boost Octet SRAM
                   </button>
@@ -447,6 +478,14 @@
                   <button class="btn" id="btn-toggle-quad">Tournoi 4P : OFF</button>
                   <button class="btn" id="btn-speed-cycle">Vitesse : 1.0x</button>
                 </div>
+              </div>
+
+              <div id="emu-external-banner" class="emu-external-banner" style="display: none;">
+                <div class="emu-banner-text">
+                  <strong id="emu-banner-title">Noyau natif requis pour ce jeu</strong>
+                  <span id="emu-banner-desc" class="mono"></span>
+                </div>
+                <div class="emu-banner-actions" id="emu-banner-actions"></div>
               </div>
 
               <div class="emu-screens-wrap" id="screens-wrap">
@@ -683,6 +722,15 @@
           </div>
         </div>
       </footer>
+
+      <div id="drop-overlay" class="drop-overlay" aria-hidden="true">
+        <div class="drop-overlay-box">
+          <strong>Déposer des jeux, dossiers ou cœurs Libretro</strong>
+          <span class="mono">.nsp · .xci · .nds · .zip · dossiers (jeuxyuzu / RomStation) · .dll</span>
+        </div>
+      </div>
+
+      <div id="app-toast" class="app-toast" role="status" aria-live="polite"></div>
     </div>
 
     <script type="module" src="./app.js"></script>

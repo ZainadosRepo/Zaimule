@@ -1,12 +1,13 @@
 [package]
 name = "zaimule-emu"
-version = "1.1.0"
+version = "1.2.0"
 description = "11 Native Rust emulator cores (Game Boy/GBC MBC3 RTC, GBA ARM7TDMI, NES Multi-Mapper, SNES 65C816/Mode 7, N64 MIPS VR4300 Z-Buffer 3D, Mega Drive Motorola 68000 + YM2612, NDS ARM9+ARM7 Dual-Screen, PS1 MIPS R3000A + GTE PGXP, PSP MIPS Allegrex + VFPU 16:9, CHIP-8) and 7-core Libretro C-ABI host bridge for Zaimule"
 authors = ["ZainadosRepo"]
 edition = "2021"
 publish = false
 
 [dependencies]
+libloading = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 zaimule-core = { path = "../zaimule-core" }

@@ -44,6 +44,10 @@ pub struct GlobalSettings {
     pub audio_latency_ms: u16,
     pub auto_backup_sram: bool,
     pub game_overrides: HashMap<String, GameProfileOverride>,
+    #[serde(default)]
+    pub rom_directories: Vec<String>,
+    #[serde(default)]
+    pub external_emulators: HashMap<String, String>,
 }
 
 impl Default for GlobalSettings {
@@ -61,6 +65,8 @@ impl Default for GlobalSettings {
             audio_latency_ms: 16,
             auto_backup_sram: true,
             game_overrides: HashMap::new(),
+            rom_directories: Vec::new(),
+            external_emulators: HashMap::new(),
         }
     }
 }
