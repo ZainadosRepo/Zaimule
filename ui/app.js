@@ -26,263 +26,17 @@ const appWindow = window.__TAURI__?.window?.getCurrentWindow?.();
 const apuAudio = new ApuAudioEngine();
 const viewportRecorder = new ViewportRecorder();
 
-const FALLBACK_CATALOG = [
-  {
-    id: "gb-pocket-arena",
-    title: "Pocket Monster Link Arena (DMG/GBC)",
-    console: "GBC",
-    engineKind: "nativeRust",
-    coreId: "zaimule-rust-gb",
-    region: "EUR · FR",
-    crc32Hex: "DCE0682B",
-    sizeBytes: 32768,
-    sramSummary: "32 Ko SRAM Atomique + Câble Link SIO",
-    playtimeSeconds: 15420,
-    favorite: true,
-    linkCableReady: true,
-    coverAccent: "#1e3a8a",
-    coverSymbol: "🐉"
-  },
-  {
-    id: "gba-golden-horizon",
-    title: "Golden Horizon : Alchemy Tactics (GBA)",
-    console: "GBA",
-    engineKind: "nativeRust",
-    coreId: "zaimule-rust-gba",
-    region: "EUR · FR (ARM7TDMI Inclus)",
-    crc32Hex: "89FA410C",
-    sizeBytes: 32768,
-    sramSummary: "64 Ko FlashRAM + Multi-Link 4P",
-    playtimeSeconds: 19800,
-    favorite: true,
-    linkCableReady: true,
-    coverAccent: "#b45309",
-    coverSymbol: "☀️"
-  },
-  {
-    id: "nes-chrono-knight",
-    title: "Chrono Knight 8-Bit Odyssey",
-    console: "NES",
-    engineKind: "nativeRust",
-    coreId: "zaimule-rust-nes",
-    region: "USA · NTSC",
-    crc32Hex: "44B109EE",
-    sizeBytes: 40976,
-    sramSummary: "8 Ko PRG-RAM Battery",
-    playtimeSeconds: 8760,
-    favorite: false,
-    linkCableReady: false,
-    coverAccent: "#7f1d1d",
-    coverSymbol: "⚔️"
-  },
-  {
-    id: "snes-alttp-fr",
-    title: "Valkyrie Trigger : Mode 7 Odyssey (SNES)",
-    console: "SNES",
-    engineKind: "nativeRust",
-    coreId: "zaimule-rust-snes",
-    region: "EUR · FR (65C816 + Mode 7 Inclus)",
-    crc32Hex: "A2D9107B",
-    sizeBytes: 32768,
-    sramSummary: "8 Ko LoROM SRAM + PPU Mode 7",
-    playtimeSeconds: 68100,
-    favorite: true,
-    linkCableReady: false,
-    coverAccent: "#14532d",
-    coverSymbol: "🕰️"
-  },
-  {
-    id: "n64-star-wing-64",
-    title: "Star Wing 64 : Lylat Z-Buffer (N64)",
-    console: "N64",
-    engineKind: "nativeRust",
-    coreId: "zaimule-rust-n64",
-    region: "EUR · FR (MIPS VR4300 + RCP 3D Inclus)",
-    crc32Hex: "64F09A1B",
-    sizeBytes: 65536,
-    sramSummary: "32 Ko Controller Pak (.mpk) + Z-Buffer 16-bit",
-    playtimeSeconds: 24600,
-    favorite: true,
-    linkCableReady: true,
-    coverAccent: "#065f46",
-    coverSymbol: "🦊"
-  },
-  {
-    id: "md-supersonic-blast",
-    title: "Supersonic Blast : 16-Bit FM (Mega Drive)",
-    console: "MEGADRIVE",
-    engineKind: "nativeRust",
-    coreId: "zaimule-rust-md",
-    region: "EUR · FR (Motorola 68000 + YM2612 Inclus)",
-    crc32Hex: "68000FA4",
-    sizeBytes: 65536,
-    sramSummary: "64 Ko FeRAM + Synthétiseur FM YM2612",
-    playtimeSeconds: 18300,
-    favorite: true,
-    linkCableReady: true,
-    coverAccent: "#1d4ed8",
-    coverSymbol: "🦔"
-  },
-  {
-    id: "nds-dual-phantom",
-    title: "Dual Screen Phantom Detective (NDS)",
-    console: "NDS",
-    engineKind: "nativeRust",
-    coreId: "zaimule-rust-nds",
-    region: "EUR · FR (ARM9+ARM7 + Stylet Inclus)",
-    crc32Hex: "55E081C2",
-    sizeBytes: 32768,
-    sramSummary: "512 Ko EEPROM + Stylet Tactile Dual-Screen",
-    playtimeSeconds: 19200,
-    favorite: true,
-    linkCableReady: true,
-    coverAccent: "#0c4a6e",
-    coverSymbol: "🔍"
-  },
-  {
-    id: "ps1-ff7-fr",
-    title: "Cyber Ridge GP Type-R4 & FF7 (PS1 3D)",
-    console: "PS1",
-    engineKind: "nativeRust",
-    coreId: "zaimule-rust-ps1",
-    region: "EUR · FR (MIPS R3000A + GTE 3D Inclus)",
-    crc32Hex: "C9104FA2",
-    sizeBytes: 32768,
-    sramSummary: "128 Ko Carte Mémoire Slot 1 (.mcd) + PGXP",
-    playtimeSeconds: 11400,
-    favorite: true,
-    linkCableReady: true,
-    coverAccent: "#312e81",
-    coverSymbol: "🏎️"
-  },
-  {
-    id: "psp-pulse-horizon",
-    title: "Pulse Horizon : Widescreen 333MHz (PSP)",
-    console: "PSP",
-    engineKind: "nativeRust",
-    coreId: "zaimule-rust-psp",
-    region: "EUR · FR (MIPS Allegrex + VFPU 16:9 Inclus)",
-    crc32Hex: "77E49C01",
-    sizeBytes: 65536,
-    sramSummary: "64 Ko Memory Stick PRO Duo (.msd) + Ad-Hoc WLAN",
-    playtimeSeconds: 21600,
-    favorite: true,
-    linkCableReady: true,
-    coverAccent: "#0284c7",
-    coverSymbol: "🛸"
-  },
-  {
-    id: "chip8-space-interceptor",
-    title: "Space Interceptor VIP (CHIP-8)",
-    console: "CHIP8",
-    engineKind: "nativeRust",
-    coreId: "zaimule-rust-chip8",
-    region: "Domaine Public",
-    crc32Hex: "30F17A99",
-    sizeBytes: 4096,
-    sramSummary: "État RAM Instantané RLE",
-    playtimeSeconds: 3600,
-    favorite: true,
-    linkCableReady: false,
-    coverAccent: "#064e3b",
-    coverSymbol: "🛸"
-  }
-];
-
 let state = {
-  activeGameId: "gb-pocket-arena",
-  catalog: FALLBACK_CATALOG,
-  modLayers: [
-    {
-      id: "fr_translation_v2.ips",
-      label: "Traduction Française Intégrale v2.1 (.ips)",
-      enabled: true
-    },
-    {
-      id: "pure_lcd_palette.ips",
-      label: "Correction Colorimétrique AGS-101 / Trinitron",
-      enabled: true
-    },
-    {
-      id: "fast_text_60fps.ips",
-      label: "Textes Instantanés & Déverrouillage 60 FPS",
-      enabled: false
-    }
-  ],
-  cheatCodes: [
-    {
-      id: "cheat-c104-ff",
-      label: "⚡ Tir Plasma Continu & Cadence Maximale",
-      codeText: "010104C1",
-      enabled: false
-    },
-    {
-      id: "cheat-c108-64",
-      label: "💎 Bonus Score Instantané (+100 pts SRAM)",
-      codeText: "016404A0",
-      enabled: false
-    }
-  ],
-  memoryWatchpoints: [
-    {
-      id: "wp-c100",
-      label: "Coordonnée X / Vélocité Joueur",
-      addr: 0xc100,
-      addrHex: "0xC100",
-      currentValue: 0x48,
-      previousValue: 0x48,
-      frozen: false,
-      frozenValue: 0x48
-    },
-    {
-      id: "wp-c104",
-      label: "État & Cadence Tir Plasma",
-      addr: 0xc104,
-      addrHex: "0xC104",
-      currentValue: 0x01,
-      previousValue: 0x00,
-      frozen: false,
-      frozenValue: 0x01
-    },
-    {
-      id: "wp-c108",
-      label: "Compteur Score / Énergie Arène",
-      addr: 0xc108,
-      addrHex: "0xC108",
-      currentValue: 0x64,
-      previousValue: 0x50,
-      frozen: false,
-      frozenValue: 0x64
-    }
-  ],
-  achievements: [
-    {
-      id: "ach-first-orb",
-      title: "Premier Contact Phosphore",
-      points: 10,
-      targetScore: 10,
-      unlocked: false,
-      badgeSymbol: "🟢"
-    },
-    {
-      id: "ach-plasma-hunter",
-      title: "Chasseur Plasma 60 FPS",
-      points: 25,
-      targetScore: 50,
-      unlocked: false,
-      badgeSymbol: "🔥"
-    },
-    {
-      id: "ach-link-master",
-      title: "Maître du Câble Link",
-      points: 50,
-      targetScore: 100,
-      unlocked: false,
-      badgeSymbol: "🏆"
-    }
-  ],
+  activeGameId: "",
+  catalog: [],
+  isEmulationRunning: false,
+  currentFrame: 0,
+  modLayers: [],
+  cheatCodes: [],
+  memoryWatchpoints: [],
+  achievements: [],
   saveSlots: [
-    { slot: 1, occupied: true, frame: 1, crc32Hex: "DCE0682B", label: "Point de départ Arène" },
+    { slot: 1, occupied: false, frame: 0, crc32Hex: "00000000", label: "Slot #1 Vide" },
     { slot: 2, occupied: false, frame: 0, crc32Hex: "00000000", label: "Slot #2 Vide" },
     { slot: 3, occupied: false, frame: 0, crc32Hex: "00000000", label: "Slot #3 Vide" },
     { slot: 4, occupied: false, frame: 0, crc32Hex: "00000000", label: "Slot #4 Vide" },
@@ -294,174 +48,26 @@ let state = {
     { id: "km-dpad-down", label: "S / ↓", keyCode: "KeyS", buttonMask: BTN_DOWN, xPct: 16, yPct: 78, turboHz: null },
     { id: "km-dpad-left", label: "Q / ←", keyCode: "KeyQ", buttonMask: BTN_LEFT, xPct: 8, yPct: 68, turboHz: null },
     { id: "km-dpad-right", label: "D / →", keyCode: "KeyD", buttonMask: BTN_RIGHT, xPct: 24, yPct: 68, turboHz: null },
-    { id: "km-btn-a", label: "J [A · Tir]", keyCode: "KeyJ", buttonMask: BTN_A, xPct: 82, yPct: 64, turboHz: 20 },
-    { id: "km-btn-b", label: "K [B · Dash]", keyCode: "KeyK", buttonMask: BTN_B, xPct: 70, yPct: 74, turboHz: null }
+    { id: "km-btn-a", label: "J [A]", keyCode: "KeyJ", buttonMask: BTN_A, xPct: 82, yPct: 64, turboHz: 20 },
+    { id: "km-btn-b", label: "K [B]", keyCode: "KeyK", buttonMask: BTN_B, xPct: 70, yPct: 74, turboHz: null }
   ],
-  macros: [
-    { id: "macro-shiny-reset", name: "✨ Soft-Reset Starter & Dialogue Rapide" },
-    { id: "macro-fast-battle", name: "⚔ Boucle Expédition & Tir Plasma" }
-  ],
-  tasTimeline: [
-    {
-      segmentIndex: 0,
-      startFrame: 0,
-      endFrame: 3,
-      durationFrames: 4,
-      buttonsMask: 0x0f,
-      buttonsLabel: "↑+↓+←+→"
-    },
-    {
-      segmentIndex: 1,
-      startFrame: 4,
-      endFrame: 21,
-      durationFrames: 18,
-      buttonsMask: 0x01,
-      buttonsLabel: "A"
-    }
-  ],
-  netplayRooms: [
-    {
-      roomCode: "PKMN-LINK-01",
-      title: "Colisée & Échange Câble Link (SIO 256 Kbps)",
-      hostName: "Zainados",
-      console: "GBC",
-      gameTitle: "Pocket Monster Link Arena",
-      pingMs: 9,
-      rollbackFrames: 1,
-      playersCurrent: 2,
-      playersMax: 2,
-      deepLinkUri: "zaimule://room/PKMN-LINK-01?crc=DCE0682B&core=zaimule-rust-gb"
-    },
-    {
-      roomCode: "SNES-CUP-88",
-      title: "Tournoi Rétro 60 FPS Sans File d'Attente",
-      hostName: "Kaelen_FR",
-      console: "SNES",
-      gameTitle: "Valkyrie Trigger: Epoch 1995",
-      pingMs: 14,
-      rollbackFrames: 1,
-      playersCurrent: 1,
-      playersMax: 2,
-      deepLinkUri: "zaimule://room/SNES-CUP-88?crc=A2D9107B&core=zaimule-rust-snes"
-    }
-  ],
+  macros: [],
+  tasTimeline: [],
+  netplayRooms: [],
   udpLocalPort: 54920,
-  stunCandidate: {
-    publicEndpoint: "198.51.100.42:54920",
-    natType: "Full-Cone UDP (Hole-Punch Ready)",
-    relayFallback: "wss://relay.zaimule.net/zml2"
-  },
-  netplayChat: [
-    {
-      id: "chat-welcome-1",
-      sender: "Zainados",
-      text: "Salon P2P ouvert ! STUN Hole-Punch actif (0 file d'attente).",
-      saveStateCrcHex: null
-    },
-    {
-      id: "chat-state-share",
-      sender: "Kaelen_FR",
-      text: "Cliché d'arène partagé (Boss Final prêt)",
-      saveStateCrcHex: "DCE0682B"
-    }
-  ],
-  communityMods: [
-    {
-      id: "mod-fr-integral-dx",
-      title: "🇫🇷 Traduction Française Intégrale DX v2.4 (.ips)",
-      author: "Équipe Zaimule FR",
-      targetConsole: "Multi-Consoles (GBC / GBA / SNES / PS1)",
-      description: "Patch binaire .IPS non-destructif : polices accentuées et dialogues traduits.",
-      installed: false
-    },
-    {
-      id: "mod-60fps-overdrive",
-      title: "⚡ Patch 60 FPS Déverrouillé & Sans Ralentissement (.ips)",
-      author: "Kaelen_TAS",
-      targetConsole: "PS1 / SNES / GBA",
-      description: "Supprime les diviseurs de VBlank 30 FPS et active le pipeline 60 Hz.",
-      installed: false
-    },
-    {
-      id: "mod-trinitron-palette",
-      title: "🎨 Pack Colorimétrique Sony PVM & AGS-101 (.ips)",
-      author: "Zainados",
-      targetConsole: "GBC / GBA / NDS",
-      description: "Recalibre les tables de palettes 15-bit RGB555.",
-      installed: false
-    }
-  ],
-  ghostLeaderboard: [
-    {
-      id: "ghost-wr-zainados",
-      gameId: "gb-pocket-arena",
-      gameTitle: "Pocket Monster Link Arena (DMG/GBC)",
-      console: "GBC",
-      playerName: "Zainados",
-      score: 185,
-      framesCount: 240,
-      traceCrc32Hex: "A482F19B",
-      verified: true
-    },
-    {
-      id: "ghost-wr-ps1-ridge",
-      gameId: "ps1-ff7-fr",
-      gameTitle: "Cyber Ridge GP Type-R4 & FF7 (PS1 3D)",
-      console: "PS1",
-      playerName: "Kaelen_FR",
-      score: 240,
-      framesCount: 240,
-      traceCrc32Hex: "7C91E03A",
-      verified: true
-    }
-  ],
+  stunCandidate: null,
+  netplayChat: [],
+  communityMods: [],
+  ghostLeaderboard: [],
   cpuOverclockPct: 100,
   pgxpSubpixel: true,
   sramHexInspection: {
-    totalBytes: 32768,
-    crc32Hex: "5A41494D",
+    totalBytes: 0,
+    crc32Hex: "00000000",
     offset: 0,
-    rows: [
-      "0x0000: 5A 41 49 4D 55 4C 45 30  00 00 00 00 00 00 00 00 | ZAIMULE0........",
-      "0x0010: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 | ................"
-    ]
+    rows: []
   },
-  tournamentBracket: {
-    tournamentId: "tourney-zaimule-cup",
-    title: "🏆 Coupe Zaimule 4P Rollback & Multi-SIO",
-    spectatorCount: 3,
-    spectatorModeActive: false,
-    champion: null,
-    matches: [
-      {
-        matchId: "semi-1",
-        roundLabel: "Demi-Finale #1",
-        playerA: "Zainados",
-        playerB: "Kaelen_FR",
-        scoreA: 2,
-        scoreB: 1,
-        winner: null
-      },
-      {
-        matchId: "semi-2",
-        roundLabel: "Demi-Finale #2",
-        playerA: "Nyx_TAS",
-        playerB: "Orpheus_64",
-        scoreA: 1,
-        scoreB: 2,
-        winner: null
-      },
-      {
-        matchId: "grand-final",
-        roundLabel: "Grande Finale 60 FPS",
-        playerA: "Vainqueur DF1",
-        playerB: "Vainqueur DF2",
-        scoreA: 0,
-        scoreB: 0,
-        winner: null
-      }
-    ]
-  },
+  tournamentBracket: null,
   libretroCores: [
     {
       coreId: "mgba_libretro",
@@ -535,19 +141,6 @@ let state = {
   recordedFrames: []
 };
 
-const fallbackSim = {
-  frame: 0,
-  px: 76,
-  py: 68,
-  orbX: 116,
-  orbY: 42,
-  shotActive: false,
-  shotX: 0,
-  shotY: 0,
-  score: 0,
-  history: []
-};
-
 const pressedKeys = new Set();
 
 async function invokeBackend(cmd, args = {}) {
@@ -558,7 +151,21 @@ async function invokeBackend(cmd, args = {}) {
 }
 
 function getSelectedGame() {
-  return state.catalog.find((g) => g.id === state.activeGameId) || state.catalog[0];
+  return state.catalog.find((g) => g.id === state.activeGameId) || state.catalog[0] || null;
+}
+
+function launchSelectedGame() {
+  const game = getSelectedGame();
+  if (!game) {
+    document.getElementById("rom-file-input")?.click();
+    return;
+  }
+  state.isEmulationRunning = true;
+  const fpsEl = document.getElementById("tel-fps");
+  if (fpsEl) fpsEl.textContent = `${(60 * state.speedMult).toFixed(1)} FPS`;
+  const ftEl = document.getElementById("tel-ft");
+  if (ftEl) ftEl.textContent = `${(16.6 / state.speedMult).toFixed(1)} ms`;
+  switchTab("view-emulator");
 }
 
 function getConnectedGamepad() {
@@ -575,7 +182,7 @@ function pollGamepadBitmask() {
   const pad = getConnectedGamepad();
   if (pad) {
     const el = document.getElementById("tel-pad");
-    if (el) el.textContent = `🎮 ${pad.id.slice(0, 18)}`;
+    if (el) el.textContent = pad.id.slice(0, 18);
     return computeBitmaskFromGamepad(pad);
   }
   return 0;
@@ -614,6 +221,12 @@ async function handleBigPictureNavigation(currentMask) {
   }
 
   if (activePane === "view-library") {
+    if (state.catalog.length === 0) {
+      if (action === "LAUNCH_GAME") {
+        launchSelectedGame();
+      }
+      return;
+    }
     const idx = state.catalog.findIndex((g) => g.id === state.activeGameId);
     if (action === "PREV_GAME" || action === "NEXT_GAME" || action === "PREV_ROW" || action === "NEXT_ROW") {
       const step = action === "PREV_GAME" ? -1 : action === "NEXT_GAME" ? 1 : action === "PREV_ROW" ? -3 : 3;
@@ -627,135 +240,12 @@ async function handleBigPictureNavigation(currentMask) {
         triggerGamepadRumble(getConnectedGamepad(), 35, 0.25, 0.4);
       }
     } else if (action === "LAUNCH_GAME") {
-      switchTab("view-emulator");
+      launchSelectedGame();
       triggerGamepadRumble(getConnectedGamepad(), 90, 0.5, 0.85);
     }
   } else if (action === "BACK_LIBRARY" && activePane !== "view-emulator") {
     switchTab("view-library");
   }
-}
-
-function stepBrowserFallback(maskP1) {
-  fallbackSim.frame += 1;
-  const speed = (maskP1 & BTN_B) !== 0 ? 2 : 1;
-  if (maskP1 & BTN_LEFT) fallbackSim.px = Math.max(8, fallbackSim.px - speed);
-  if (maskP1 & BTN_RIGHT) fallbackSim.px = Math.min(152, fallbackSim.px + speed);
-  if (maskP1 & BTN_UP) fallbackSim.py = Math.max(20, fallbackSim.py - speed);
-  if (maskP1 & BTN_DOWN) fallbackSim.py = Math.min(134, fallbackSim.py + speed);
-
-  let audioFreqHz = 0;
-  if ((maskP1 & BTN_A) !== 0 && !fallbackSim.shotActive) {
-    fallbackSim.shotActive = true;
-    fallbackSim.shotX = fallbackSim.px;
-    fallbackSim.shotY = fallbackSim.py - 6;
-    audioFreqHz = 880;
-  }
-  if (fallbackSim.shotActive) {
-    fallbackSim.shotY -= 4;
-    if (fallbackSim.shotY <= 16) fallbackSim.shotActive = false;
-  }
-
-  const hitPlayer =
-    Math.abs(fallbackSim.px - fallbackSim.orbX) <= 8 &&
-    Math.abs(fallbackSim.py - fallbackSim.orbY) <= 8;
-  const hitShot =
-    fallbackSim.shotActive &&
-    Math.abs(fallbackSim.shotX - fallbackSim.orbX) <= 8 &&
-    Math.abs(fallbackSim.shotY - fallbackSim.orbY) <= 8;
-
-  if (hitPlayer || hitShot) {
-    fallbackSim.score += hitShot ? 25 : 10;
-    fallbackSim.shotActive = false;
-    fallbackSim.orbX = 20 + ((fallbackSim.frame * 37) % 120);
-    fallbackSim.orbY = 26 + ((fallbackSim.frame * 53) % 96);
-    audioFreqHz = 1320;
-  }
-
-  let newlyUnlockedAchievement = null;
-  for (const ach of state.achievements) {
-    if (!ach.unlocked && fallbackSim.score >= ach.targetScore) {
-      ach.unlocked = true;
-      newlyUnlockedAchievement = `${ach.badgeSymbol} ${ach.title} (+${ach.points} pts)`;
-    }
-  }
-
-  if ((fallbackSim.frame & 15) === 0) {
-    fallbackSim.history.push({
-      frame: fallbackSim.frame,
-      px: fallbackSim.px,
-      py: fallbackSim.py,
-      orbX: fallbackSim.orbX,
-      orbY: fallbackSim.orbY,
-      score: fallbackSim.score
-    });
-    if (fallbackSim.history.length > 240) fallbackSim.history.shift();
-  }
-
-  const width = 160;
-  const height = 144;
-  const rgba = new Uint8ClampedArray(width * height * 4);
-  const pal = [
-    [12, 20, 16],
-    [34, 74, 48],
-    [82, 164, 98],
-    [214, 245, 190]
-  ];
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      let c = 0;
-      if (y < 14) c = 1;
-      else if (((x + fallbackSim.frame) & 15) === 0 || ((y + fallbackSim.frame) & 15) === 0) c = 1;
-      if (Math.abs(x - fallbackSim.orbX) + Math.abs(y - fallbackSim.orbY) <= 5) c = 3;
-      if (fallbackSim.shotActive && Math.abs(x - fallbackSim.shotX) <= 1 && Math.abs(y - fallbackSim.shotY) <= 3) c = 3;
-      if (Math.abs(x - fallbackSim.px) <= 5 && Math.abs(y - fallbackSim.py) <= 5) c = 3;
-      const idx = (y * width + x) * 4;
-      rgba[idx] = pal[c][0];
-      rgba[idx + 1] = pal[c][1];
-      rgba[idx + 2] = pal[c][2];
-      rgba[idx + 3] = 255;
-    }
-  }
-
-  return {
-    primary: {
-      frameNumber: fallbackSim.frame,
-      width,
-      height,
-      rgba,
-      audioFreqHz,
-      cpu: {
-        arch: "Sharp LR35902",
-        pcHex: `0x01${(0x50 + (fallbackSim.frame & 0x3f)).toString(16).toUpperCase()}`,
-        spHex: "0xFFFE",
-        regAHex: `0x${(fallbackSim.score & 0xff).toString(16).padStart(2, "0").toUpperCase()}`,
-        regBcHex: `0x${fallbackSim.px.toString(16).padStart(2, "0")}${fallbackSim.py.toString(16).padStart(2, "0")}`.toUpperCase(),
-        regDeHex: `0x${fallbackSim.orbX.toString(16).padStart(2, "0")}${fallbackSim.orbY.toString(16).padStart(2, "0")}`.toUpperCase(),
-        regHlHex: "0xC100",
-        cycles: fallbackSim.frame * 70224,
-        serialSbHex: `0x${(fallbackSim.px ^ 0x5a).toString(16).toUpperCase()}`,
-        serialScHex: "0x81",
-        score: fallbackSim.score
-      }
-    },
-    secondary: state.dualLinkMode
-      ? {
-          frameNumber: fallbackSim.frame,
-          width,
-          height,
-          rgba,
-          audioFreqHz: 0,
-          cpu: { score: fallbackSim.score }
-        }
-      : null,
-    linkTelemetry: {
-      enabled: state.dualLinkMode,
-      packetsTransferred: state.dualLinkMode ? fallbackSim.frame : 0,
-      lastP1ToP2Hex: `0x${(fallbackSim.px & 0xff).toString(16).toUpperCase()}`
-    },
-    rewindSnapshotsCount: fallbackSim.history.length,
-    rewindMemoryBytes: fallbackSim.history.length * 640,
-    newlyUnlockedAchievement
-  };
 }
 
 function renderSidebarCounts() {
@@ -779,6 +269,59 @@ function renderSidebarCounts() {
   setTxt("count-link", counts.LINK);
 }
 
+const EDITORIAL_COVER_PALETTE = {
+  GBC: {
+    bg: "#1F2A33",
+    spine: "DMG-GBC",
+    svg: `<svg viewBox="0 0 64 64"><circle cx="32" cy="32" r="20"/><circle cx="32" cy="32" r="7"/><line x1="12" y1="32" x2="25" y2="32"/><line x1="39" y1="32" x2="52" y2="32"/></svg>`
+  },
+  GBA: {
+    bg: "#3A271C",
+    spine: "AGB-GBA",
+    svg: `<svg viewBox="0 0 64 64"><circle cx="32" cy="32" r="18"/><path d="M32 8v10M32 46v10M8 32h10M46 32h10M15 15l7 7M42 42l7 7M49 15l-7 7M22 42l-7 7"/></svg>`
+  },
+  NES: {
+    bg: "#3B1F1E",
+    spine: "HVC-NES",
+    svg: `<svg viewBox="0 0 64 64"><polygon points="32,10 50,22 50,44 32,54 14,44 14,22"/><line x1="32" y1="10" x2="32" y2="54"/><line x1="14" y1="28" x2="50" y2="28"/></svg>`
+  },
+  SNES: {
+    bg: "#1F2F27",
+    spine: "SHVC-SFC",
+    svg: `<svg viewBox="0 0 64 64"><circle cx="32" cy="32" r="22"/><polyline points="32,16 32,32 43,39"/><circle cx="32" cy="32" r="3"/></svg>`
+  },
+  N64: {
+    bg: "#1C2E2B",
+    spine: "NUS-N64",
+    svg: `<svg viewBox="0 0 64 64"><polygon points="32,12 52,46 12,46"/><polygon points="32,24 44,46 20,46"/><line x1="32" y1="12" x2="32" y2="46"/></svg>`
+  },
+  MEGADRIVE: {
+    bg: "#1D283A",
+    spine: "HAA-MD",
+    svg: `<svg viewBox="0 0 64 64"><circle cx="32" cy="32" r="20"/><circle cx="32" cy="32" r="12"/><path d="M12 32h40"/></svg>`
+  },
+  NDS: {
+    bg: "#1F2C38",
+    spine: "NTR-NDS",
+    svg: `<svg viewBox="0 0 64 64"><rect x="16" y="10" width="32" height="19" rx="2"/><rect x="16" y="35" width="32" height="19" rx="2"/><circle cx="32" cy="44.5" r="4"/></svg>`
+  },
+  PS1: {
+    bg: "#25232E",
+    spine: "PAL-SCES",
+    svg: `<svg viewBox="0 0 64 64"><circle cx="32" cy="32" r="22"/><circle cx="32" cy="32" r="6"/><path d="M18 18l8 8M38 38l8 8"/></svg>`
+  },
+  PSP: {
+    bg: "#1E2D3B",
+    spine: "UCES-UMD",
+    svg: `<svg viewBox="0 0 64 64"><ellipse cx="32" cy="32" rx="22" ry="12"/><circle cx="32" cy="32" r="6"/><line x1="10" y1="32" x2="54" y2="32"/></svg>`
+  },
+  CHIP8: {
+    bg: "#262925",
+    spine: "COSMAC-8",
+    svg: `<svg viewBox="0 0 64 64"><rect x="14" y="14" width="36" height="36" rx="2"/><rect x="24" y="24" width="16" height="16"/></svg>`
+  }
+};
+
 function renderCatalogGrid() {
   const grid = document.getElementById("games-grid");
   if (!grid) return;
@@ -796,32 +339,74 @@ function renderCatalogGrid() {
   const filtered = filterCatalogEntries(state.catalog, opts);
   grid.innerHTML = "";
 
-  for (const game of filtered) {
-    const card = document.createElement("div");
-    card.className = `game-card${game.id === state.activeGameId ? " selected" : ""}`;
-    const isRust = game.engineKind === "nativeRust";
-    card.innerHTML = `
-      <div class="game-cover" style="background: linear-gradient(135deg, ${game.coverAccent || "#1e3a8a"} 0%, #0f172a 100%)">
-        <div class="cover-top">
-          <span class="console-tag mono">${game.console}</span>
-          <span class="core-tag mono ${isRust ? "core-rust" : "core-libretro"}">
-            ${isRust ? "🦀 Rust Native" : "🧩 Libretro"}
-          </span>
+  if (filtered.length === 0) {
+    const emptyEl = document.createElement("div");
+    emptyEl.className = "empty-catalog-state";
+    if (state.catalog.length === 0) {
+      emptyEl.innerHTML = `
+        <div class="empty-catalog-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 7h8M9 14h6M12 11v6"/></svg>
         </div>
-        <div class="cover-art-symbol">${game.coverSymbol || "🕹️"}</div>
-        <div class="cover-bottom mono">
-          <span style="color: var(--phosphor-green)">✓ ${game.crc32Hex}</span>
-          <span style="color: var(--text-muted)">${formatFileSize(game.sizeBytes)}</span>
+        <div class="empty-catalog-title">Aucune cartouche ou image disque dans la bibliothèque</div>
+        <div class="empty-catalog-desc">Importez un fichier ROM (.gb, .gbc, .gba, .nes, .sfc, .z64, .md, .nds, .bin, .iso, .ch8) ou glissez-déposez-le dans la fenêtre.</div>
+        <button class="btn btn-primary" id="btn-empty-import-rom" type="button">Importer une ROM</button>
+      `;
+      emptyEl.querySelector("#btn-empty-import-rom")?.addEventListener("click", () => {
+        document.getElementById("rom-file-input")?.click();
+      });
+    } else {
+      emptyEl.innerHTML = `
+        <div class="empty-catalog-title">Aucune ROM ne correspond au filtre actif</div>
+        <div class="empty-catalog-desc">Modifiez votre recherche ou sélectionnez « Toutes les consoles ».</div>
+      `;
+    }
+    grid.appendChild(emptyEl);
+    return;
+  }
+
+  for (const game of filtered) {
+    const consoleKey = String(game.console || "GBC").toUpperCase();
+    const spec = EDITORIAL_COVER_PALETTE[consoleKey] || EDITORIAL_COVER_PALETTE.GBC;
+    const isRust = game.engineKind === "nativeRust";
+    const hasSpine = consoleKey === "PS1";
+
+    const card = document.createElement("article");
+    card.className = `game-card${game.id === state.activeGameId ? " selected" : ""}`;
+    card.dataset.console = consoleKey;
+    card.setAttribute("role", "listitem");
+    card.tabIndex = 0;
+
+    card.innerHTML = `
+      <div class="game-jacket-stage">
+        <div class="game-cover" style="--cover-bg: ${spec.bg};">
+          ${
+            hasSpine
+              ? `<div class="cover-spine"><span class="cover-spine-label">${spec.spine}</span></div>`
+              : ""
+          }
+          <div class="cover-top">
+            <span class="console-tag mono">${game.console}</span>
+            <span class="core-tag mono ${isRust ? "core-rust" : "core-libretro"}">
+              ${isRust ? "RUST" : "C-ABI"}
+            </span>
+          </div>
+          <div class="cover-art-graphic" aria-hidden="true">${spec.svg}</div>
+          <span class="cover-action-prompt">[A] Lancer</span>
+          <div class="cover-bottom mono">
+            <span>${game.crc32Hex}</span>
+            <span>${formatFileSize(game.sizeBytes)}</span>
+          </div>
         </div>
       </div>
       <div class="game-body">
-        <div class="game-title">${game.title}</div>
+        <div class="game-title" title="${game.title}">${game.title}</div>
         <div class="game-meta">
-          <span>${game.region}</span>
+          <span>${game.region.split("(")[0].trim()}</span>
           <span class="mono">${formatPlaytime(game.playtimeSeconds)}</span>
         </div>
       </div>
     `;
+
     card.addEventListener("click", async () => {
       state.activeGameId = game.id;
       const boot = await invokeBackend("select_game", { gameId: game.id });
@@ -832,7 +417,7 @@ function renderCatalogGrid() {
       state.activeGameId = game.id;
       const boot = await invokeBackend("select_game", { gameId: game.id });
       if (boot) applyBootstrap(boot);
-      switchTab("view-emulator");
+      launchSelectedGame();
     });
     grid.appendChild(card);
   }
@@ -840,25 +425,47 @@ function renderCatalogGrid() {
 
 function renderInspector() {
   const g = getSelectedGame();
-  document.getElementById("insp-title").textContent = g.title;
-  document.getElementById("insp-console").textContent = g.console;
-  document.getElementById("insp-core").textContent = g.coreId;
-  document.getElementById("insp-region").textContent = g.region;
-  document.getElementById("insp-crc").textContent = g.crc32Hex;
-  document.getElementById("insp-sram").textContent = g.sramSummary;
-  document.getElementById("insp-playtime").textContent = formatPlaytime(g.playtimeSeconds);
-  document.getElementById("active-emu-game").textContent = `${g.console} · ${g.title}`;
-  document.getElementById("tel-core").textContent = `${g.coreId} (${g.console})`;
+  if (g) {
+    document.getElementById("insp-title").textContent = g.title;
+    document.getElementById("insp-console").textContent = g.console;
+    document.getElementById("insp-core").textContent = g.coreId;
+    document.getElementById("insp-region").textContent = g.region.split("(")[0].trim();
+    document.getElementById("insp-crc").textContent = g.crc32Hex;
+    const crcTop = document.getElementById("insp-crc-top");
+    if (crcTop) crcTop.textContent = `CRC · ${g.crc32Hex}`;
+    document.getElementById("insp-sram").textContent = g.sramSummary;
+    document.getElementById("insp-playtime").textContent = formatPlaytime(g.playtimeSeconds);
+    document.getElementById("active-emu-game").textContent = `${g.console} · ${g.title}`;
+    document.getElementById("tel-core").textContent = `${g.coreId} (${g.console})`;
+  } else {
+    document.getElementById("insp-title").textContent = "Aucune ROM sélectionnée";
+    document.getElementById("insp-console").textContent = "—";
+    document.getElementById("insp-core").textContent = "—";
+    document.getElementById("insp-region").textContent = "—";
+    document.getElementById("insp-crc").textContent = "00000000";
+    const crcTop = document.getElementById("insp-crc-top");
+    if (crcTop) crcTop.textContent = "CRC · —";
+    document.getElementById("insp-sram").textContent = "Aucune mémoire active";
+    document.getElementById("insp-playtime").textContent = "0m";
+    document.getElementById("active-emu-game").textContent = "Aucune ROM active";
+    document.getElementById("tel-core").textContent = "En veille";
+  }
 
   const sramHexEl = document.getElementById("sram-hex-dump");
-  if (sramHexEl && state.sramHexInspection?.rows) {
-    sramHexEl.innerHTML = state.sramHexInspection.rows
-      .map((r) => `<div>${r}</div>`)
-      .join("");
+  if (sramHexEl) {
+    const sramRows = state.sramHexInspection?.hexRows || state.sramHexInspection?.rows || [];
+    if (sramRows.length > 0) {
+      sramHexEl.innerHTML = sramRows.map((r) => `<div>${r}</div>`).join("");
+    } else {
+      sramHexEl.innerHTML = `<div class="empty-list-hint">Aucune donnée SRAM chargée</div>`;
+    }
   }
   const sramCrcBadge = document.getElementById("sram-crc-badge");
-  if (sramCrcBadge && state.sramHexInspection?.crc32Hex) {
-    sramCrcBadge.textContent = `✓ CRC ${state.sramHexInspection.crc32Hex}`;
+  if (sramCrcBadge) {
+    sramCrcBadge.textContent =
+      state.sramHexInspection?.totalBytes > 0
+        ? `CRC ${state.sramHexInspection.crc32Hex}`
+        : "CRC —";
   }
 
   const ocBadge = document.getElementById("insp-overclock-badge");
@@ -867,81 +474,93 @@ function renderInspector() {
   }
   const ocBtn = document.getElementById("btn-overclock-cycle");
   if (ocBtn) {
-    ocBtn.textContent = `⚡ CPU : ${state.cpuOverclockPct}% ${state.cpuOverclockPct > 100 ? "Turbo" : "Natif"}`;
+    ocBtn.textContent = `CPU : ${state.cpuOverclockPct}% ${state.cpuOverclockPct > 100 ? "Turbo" : "Natif"}`;
   }
   const pgxpBtn = document.getElementById("btn-pgxp-toggle");
   if (pgxpBtn) {
-    pgxpBtn.textContent = `📐 PGXP 3D : ${state.pgxpSubpixel ? "ON" : "OFF"}`;
-    pgxpBtn.style.color = state.pgxpSubpixel ? "var(--phosphor-green)" : "var(--text-muted)";
+    pgxpBtn.textContent = `PGXP 3D : ${state.pgxpSubpixel ? "ON" : "OFF"}`;
+    pgxpBtn.style.color = state.pgxpSubpixel ? "var(--status-ok)" : "var(--text-secondary)";
   }
 
   const modsEl = document.getElementById("mods-list");
   if (modsEl) {
     modsEl.innerHTML = "";
-    for (const m of state.modLayers) {
-      const row = document.createElement("label");
-      row.className = "mod-item";
-      row.innerHTML = `
-        <span style="display:flex; align-items:center; gap:8px;">
-          <input type="checkbox" ${m.enabled ? "checked" : ""} />
-          <span>${m.label}</span>
-        </span>
-        <span class="mono" style="font-size:10.5px; color:${m.enabled ? "var(--phosphor-green)" : "var(--text-dim)"};">
-          ${m.enabled ? "ACTIF" : "OFF"}
-        </span>
-      `;
-      row.querySelector("input").addEventListener("change", async (e) => {
-        m.enabled = e.target.checked;
-        const boot = await invokeBackend("toggle_mod_layer", {
-          modId: m.id,
-          enabled: e.target.checked
+    if (state.modLayers.length === 0) {
+      modsEl.innerHTML = `<div class="empty-list-hint">Aucun patch .IPS actif</div>`;
+    } else {
+      for (const m of state.modLayers) {
+        const row = document.createElement("label");
+        row.className = "mod-item";
+        row.innerHTML = `
+          <span style="display:flex; align-items:center; gap:8px;">
+            <input type="checkbox" ${m.enabled ? "checked" : ""} />
+            <span>${m.label}</span>
+          </span>
+          <span class="mono" style="font-size:10.5px; color:${m.enabled ? "var(--status-ok)" : "var(--text-muted)"};">
+            ${m.enabled ? "ACTIF" : "OFF"}
+          </span>
+        `;
+        row.querySelector("input").addEventListener("change", async (e) => {
+          m.enabled = e.target.checked;
+          const boot = await invokeBackend("toggle_mod_layer", {
+            modId: m.id,
+            enabled: e.target.checked
+          });
+          if (boot) applyBootstrap(boot);
+          else renderInspector();
         });
-        if (boot) applyBootstrap(boot);
-        else renderInspector();
-      });
-      modsEl.appendChild(row);
+        modsEl.appendChild(row);
+      }
     }
   }
 
   const cheatsEl = document.getElementById("cheats-list");
   if (cheatsEl) {
     cheatsEl.innerHTML = "";
-    for (const c of state.cheatCodes) {
-      const row = document.createElement("label");
-      row.className = "mod-item";
-      row.innerHTML = `
-        <span style="display:flex; align-items:center; gap:8px;">
-          <input type="checkbox" ${c.enabled ? "checked" : ""} />
-          <span>${c.label}</span>
-        </span>
-        <span class="mono" style="font-size:10.5px; color:var(--gold);">${c.codeText}</span>
-      `;
-      row.querySelector("input").addEventListener("change", async (e) => {
-        c.enabled = e.target.checked;
-        const boot = await invokeBackend("toggle_cheat_code", {
-          cheatId: c.id,
-          enabled: e.target.checked
+    if (state.cheatCodes.length === 0) {
+      cheatsEl.innerHTML = `<div class="empty-list-hint">Aucun code GameShark / Action Replay</div>`;
+    } else {
+      for (const c of state.cheatCodes) {
+        const row = document.createElement("label");
+        row.className = "mod-item";
+        row.innerHTML = `
+          <span style="display:flex; align-items:center; gap:8px;">
+            <input type="checkbox" ${c.enabled ? "checked" : ""} />
+            <span>${c.label.replace(/^[^\w]+/, "")}</span>
+          </span>
+          <span class="mono" style="font-size:10.5px; color:var(--accent-primary);">${c.codeText}</span>
+        `;
+        row.querySelector("input").addEventListener("change", async (e) => {
+          c.enabled = e.target.checked;
+          const boot = await invokeBackend("toggle_cheat_code", {
+            cheatId: c.id,
+            enabled: e.target.checked
+          });
+          if (boot) applyBootstrap(boot);
+          else renderInspector();
         });
-        if (boot) applyBootstrap(boot);
-        else renderInspector();
-      });
-      cheatsEl.appendChild(row);
+        cheatsEl.appendChild(row);
+      }
     }
   }
 
   const achEl = document.getElementById("achievements-list");
   if (achEl) {
     achEl.innerHTML = "";
-    for (const a of state.achievements) {
-      const row = document.createElement("div");
-      row.className = "mod-item";
-      row.innerHTML = `
-        <span>${a.badgeSymbol} ${a.title}</span>
-        <span class="mono" style="font-size:10.5px; color:${a.unlocked ? "var(--phosphor-green)" : "var(--text-dim)"};">
-          ${a.unlocked ? `✓ +${a.points} pts` : `${a.points} pts`}
-        </span>
-      `;
-      achEl.appendChild(row);
+    if (state.achievements.length === 0) {
+      achEl.innerHTML = `<div class="empty-list-hint">Aucun succès enregistré pour cette session</div>`;
+    } else {
+      for (const a of state.achievements) {
+        const row = document.createElement("div");
+        row.className = "mod-item";
+        row.innerHTML = `
+          <span>${a.title}</span>
+          <span class="mono" style="font-size:10.5px; color:${a.unlocked ? "var(--status-ok)" : "var(--text-muted)"};">
+            ${a.unlocked ? `+${a.points} pts` : `${a.points} pts`}
+          </span>
+        `;
+        achEl.appendChild(row);
+      }
     }
   }
 
@@ -953,24 +572,25 @@ function renderInspector() {
       card.className = "slot-card";
       card.innerHTML = `
         <div class="slot-num mono">SLOT #${slot.slot}</div>
-        <div class="slot-time mono">${slot.occupied ? slot.label : "Vide (Cliquer pour sauver)"}</div>
+        <div class="slot-time mono">${slot.occupied ? slot.label : "Vide — Cliquer pour sauver"}</div>
       `;
       card.addEventListener("click", async () => {
+        if (!getSelectedGame()) return;
         if (slot.occupied) {
           const info = await invokeBackend("restore_save_state", { slot: slot.slot });
           document.getElementById("save-toast").textContent =
-            `✓ Slot #${slot.slot} chargé (${info?.crc32Hex || slot.crc32Hex})`;
+            `Slot #${slot.slot} chargé (${info?.crc32Hex || slot.crc32Hex})`;
         } else {
           const info = await invokeBackend("create_save_state", {
             slot: slot.slot,
-            label: `Frame #${fallbackSim.frame}`
+            label: `Frame #${state.currentFrame}`
           });
           if (info) {
             const boot = await invokeBackend("get_station_bootstrap");
             if (boot) applyBootstrap(boot);
           } else {
             slot.occupied = true;
-            slot.label = `Frame #${fallbackSim.frame}`;
+            slot.label = `Frame #${state.currentFrame}`;
             renderInspector();
           }
         }
@@ -1027,79 +647,93 @@ function renderKeymapperAndMacros() {
   const macrosList = document.getElementById("macros-list");
   if (macrosList) {
     macrosList.innerHTML = "";
-    for (const mac of state.macros) {
-      const isRunning = state.activeMacroId === mac.id;
-      const row = document.createElement("div");
-      row.className = "mod-item";
-      row.innerHTML = `
-        <span>${mac.name}</span>
-        <button class="btn mono" style="padding:3px 8px; font-size:11px;">
-          ${isRunning ? "⏹ Stop" : "▶ TAS"}
-        </button>
-      `;
-      row.querySelector("button").addEventListener("click", async () => {
-        const nextId = isRunning ? null : mac.id;
-        state.activeMacroId = nextId;
-        document.getElementById("macro-status").textContent = nextId ? "LECTURE TAS" : "PRÊT";
-        const boot = await invokeBackend("set_active_macro", { macroId: nextId });
-        if (boot) applyBootstrap(boot);
-        else renderKeymapperAndMacros();
-      });
-      macrosList.appendChild(row);
+    if (state.macros.length === 0) {
+      macrosList.innerHTML = `<div class="empty-list-hint">Aucune macro TAS enregistrée</div>`;
+    } else {
+      for (const mac of state.macros) {
+        const isRunning = state.activeMacroId === mac.id;
+        const row = document.createElement("div");
+        row.className = "mod-item";
+        row.innerHTML = `
+          <span>${mac.name}</span>
+          <button class="btn mono" style="padding:3px 8px; font-size:11px;">
+            ${isRunning ? "Stop" : "TAS"}
+          </button>
+        `;
+        row.querySelector("button").addEventListener("click", async () => {
+          const nextId = isRunning ? null : mac.id;
+          state.activeMacroId = nextId;
+          document.getElementById("macro-status").textContent = nextId ? "LECTURE TAS" : "PRÊT";
+          const boot = await invokeBackend("set_active_macro", { macroId: nextId });
+          if (boot) applyBootstrap(boot);
+          else renderKeymapperAndMacros();
+        });
+        macrosList.appendChild(row);
+      }
     }
   }
 
   const tasList = document.getElementById("tas-timeline-list");
   if (tasList) {
     tasList.innerHTML = "";
-    for (const seg of (state.tasTimeline || []).slice(0, 4)) {
-      const row = document.createElement("div");
-      row.className = "mod-item";
-      row.style.fontSize = "10.5px";
-      row.innerHTML = `
-        <span>F${seg.startFrame}..${seg.endFrame} (${seg.durationFrames}f) · <strong style="color:var(--gold)">${seg.buttonsLabel}</strong></span>
-        <button class="btn mono" style="padding:1px 6px; font-size:9.5px;">⚡ +A</button>
-      `;
-      row.querySelector("button").addEventListener("click", async () => {
-        const boot = await invokeBackend("toggle_tas_timeline_button", {
-          macroId: state.activeMacroId,
-          segmentIndex: seg.segmentIndex,
-          buttonBit: BTN_A
+    const segments = (state.tasTimeline || []).slice(0, 4);
+    if (segments.length === 0) {
+      tasList.innerHTML = `<div class="empty-list-hint">Aucun segment TAS</div>`;
+    } else {
+      for (const seg of segments) {
+        const row = document.createElement("div");
+        row.className = "mod-item";
+        row.style.fontSize = "10.5px";
+        row.innerHTML = `
+          <span>F${seg.startFrame}..${seg.endFrame} (${seg.durationFrames}f) · <strong style="color:var(--accent-secondary)">${seg.buttonsLabel}</strong></span>
+          <button class="btn mono" style="padding:1px 6px; font-size:9.5px;">+A</button>
+        `;
+        row.querySelector("button").addEventListener("click", async () => {
+          const boot = await invokeBackend("toggle_tas_timeline_button", {
+            macroId: state.activeMacroId,
+            segmentIndex: seg.segmentIndex,
+            buttonBit: BTN_A
+          });
+          if (boot) applyBootstrap(boot);
+          else {
+            seg.buttonsMask ^= BTN_A;
+            seg.buttonsLabel = seg.buttonsMask ? `0x${seg.buttonsMask.toString(16).toUpperCase()}` : "∅";
+            renderKeymapperAndMacros();
+          }
         });
-        if (boot) applyBootstrap(boot);
-        else {
-          seg.buttonsMask ^= BTN_A;
-          seg.buttonsLabel = seg.buttonsMask ? `0x${seg.buttonsMask.toString(16).toUpperCase()}` : "∅";
-          renderKeymapperAndMacros();
-        }
-      });
-      tasList.appendChild(row);
+        tasList.appendChild(row);
+      }
     }
   }
 
   const wpList = document.getElementById("watchpoints-list");
   if (wpList) {
     wpList.innerHTML = "";
-    for (const wp of state.memoryWatchpoints || []) {
-      const row = document.createElement("div");
-      row.className = "mod-item";
-      row.style.fontSize = "10.5px";
-      const hexVal = `0x${(wp.currentValue ?? 0).toString(16).padStart(2, "0").toUpperCase()}`;
-      row.innerHTML = `
-        <span><strong style="color:var(--cobalt)">${wp.addrHex}</strong> ${wp.label} : <strong style="color:var(--phosphor-green)">${hexVal}</strong></span>
-        <button class="btn mono" style="padding:1px 6px; font-size:9.5px; color:${wp.frozen ? "var(--gold)" : "var(--text-muted)"};">
-          ${wp.frozen ? "🔒 Gelé" : "🔓 Pin"}
-        </button>
-      `;
-      row.querySelector("button").addEventListener("click", async () => {
-        const boot = await invokeBackend("toggle_watchpoint_freeze", { watchId: wp.id });
-        if (boot) applyBootstrap(boot);
-        else {
-          wp.frozen = !wp.frozen;
-          renderKeymapperAndMacros();
-        }
-      });
-      wpList.appendChild(row);
+    const watchpoints = state.memoryWatchpoints || [];
+    if (watchpoints.length === 0) {
+      wpList.innerHTML = `<div class="empty-list-hint">Aucun watchpoint mémoire actif</div>`;
+    } else {
+      for (const wp of watchpoints) {
+        const row = document.createElement("div");
+        row.className = "mod-item";
+        row.style.fontSize = "10.5px";
+        const hexVal = `0x${(wp.currentValue ?? 0).toString(16).padStart(2, "0").toUpperCase()}`;
+        row.innerHTML = `
+          <span><strong style="color:var(--accent-primary)">${wp.addrHex}</strong> ${wp.label} : <strong style="color:var(--status-ok)">${hexVal}</strong></span>
+          <button class="btn mono" style="padding:1px 6px; font-size:9.5px; color:${wp.frozen ? "var(--accent-secondary)" : "var(--text-muted)"};">
+            ${wp.frozen ? "Gelé" : "Pin"}
+          </button>
+        `;
+        row.querySelector("button").addEventListener("click", async () => {
+          const boot = await invokeBackend("toggle_watchpoint_freeze", { watchId: wp.id });
+          if (boot) applyBootstrap(boot);
+          else {
+            wp.frozen = !wp.frozen;
+            renderKeymapperAndMacros();
+          }
+        });
+        wpList.appendChild(row);
+      }
     }
   }
 }
@@ -1110,40 +744,51 @@ function renderNetplayAndCores() {
     portBadge.textContent = `UDP ZML2 : 127.0.0.1:${state.udpLocalPort || 54920}`;
   }
   const stunBadge = document.getElementById("stun-endpoint-badge");
-  if (stunBadge && state.stunCandidate) {
-    stunBadge.textContent = `STUN Hole-Punch : ${state.stunCandidate.publicEndpoint} (${state.stunCandidate.natType})`;
+  if (stunBadge) {
+    stunBadge.textContent = state.stunCandidate
+      ? `STUN Hole-Punch : ${state.stunCandidate.publicEndpoint} (${state.stunCandidate.natType})`
+      : "STUN Hole-Punch : En attente";
   }
   const specBtn = document.getElementById("btn-toggle-spectator");
-  if (specBtn && state.tournamentBracket) {
-    const active = state.tournamentBracket.spectatorModeActive;
-    specBtn.textContent = `👁️ Spectateur (${state.tournamentBracket.spectatorCount}) : ${active ? "ACTIF" : "OFF"}`;
+  if (specBtn) {
+    const active = state.tournamentBracket?.spectatorModeActive || false;
+    const count =
+      state.tournamentBracket?.spectatorCount ??
+      state.tournamentBracket?.matches?.[0]?.spectatorsCount ??
+      0;
+    specBtn.textContent = `Spectateur (${count}) : ${active ? "ACTIF" : "OFF"}`;
   }
 
   const chatList = document.getElementById("netplay-chat-list");
   if (chatList) {
     chatList.innerHTML = "";
-    for (const msg of state.netplayChat || []) {
-      const sharedCrc = msg.sharedStateCrc32Hex || msg.saveStateCrcHex;
-      const sharedSlot = msg.sharedStateSlot || 1;
-      const row = document.createElement("div");
-      row.className = "mono";
-      row.style.cssText =
-        "display:flex; align-items:center; justify-content:space-between; font-size:11px; padding:3px 0; border-bottom:1px dashed rgba(255,255,255,0.05);";
-      row.innerHTML = `
-        <span><strong style="color:var(--gold)">[${msg.sender}]</strong> ${msg.text}</span>
-        ${
-          sharedCrc
-            ? `<button class="btn mono" style="padding:1px 6px; font-size:10px; border-color:var(--phosphor-green); color:var(--phosphor-green);">📥 Charger State #${sharedSlot} (${sharedCrc})</button>`
-            : ""
+    const msgs = state.netplayChat || [];
+    if (msgs.length === 0) {
+      chatList.innerHTML = `<div class="empty-list-hint">Aucun message dans le salon</div>`;
+    } else {
+      for (const msg of msgs) {
+        const sharedCrc = msg.sharedStateCrc32Hex || msg.saveStateCrcHex;
+        const sharedSlot = msg.sharedStateSlot || 1;
+        const row = document.createElement("div");
+        row.className = "mono";
+        row.style.cssText =
+          "display:flex; align-items:center; justify-content:space-between; font-size:11px; padding:4px 0; border-bottom:1px solid var(--border-subtle);";
+        row.innerHTML = `
+          <span><strong style="color:var(--accent-secondary)">[${msg.sender}]</strong> ${msg.text}</span>
+          ${
+            sharedCrc
+              ? `<button class="btn mono" style="padding:1px 6px; font-size:10px; border-color:var(--status-ok); color:var(--status-ok);">Charger State #${sharedSlot} (${sharedCrc})</button>`
+              : ""
+          }
+        `;
+        if (sharedCrc) {
+          row.querySelector("button")?.addEventListener("click", async () => {
+            await invokeBackend("restore_save_state", { slot: sharedSlot });
+            launchSelectedGame();
+          });
         }
-      `;
-      if (sharedCrc) {
-        row.querySelector("button")?.addEventListener("click", async () => {
-          await invokeBackend("restore_save_state", { slot: sharedSlot });
-          switchTab("view-emulator");
-        });
+        chatList.appendChild(row);
       }
-      chatList.appendChild(row);
     }
   }
 
@@ -1151,8 +796,9 @@ function renderNetplayAndCores() {
   if (netGrid) {
     netGrid.innerHTML = "";
 
-    if (state.tournamentBracket) {
+    if (state.tournamentBracket?.matches?.length > 0) {
       const t = state.tournamentBracket;
+      const specTotal = t.spectatorCount ?? t.matches?.[0]?.spectatorsCount ?? 0;
       const tourneyCard = document.createElement("div");
       tourneyCard.className = "panel-card";
       tourneyCard.id = "tournament-bracket-card";
@@ -1160,57 +806,44 @@ function renderNetplayAndCores() {
         <div class="section-title">
           <span>${t.title}</span>
           <span class="pill-badge pill-gold mono">
-            ${t.champion ? `👑 Champion : ${t.champion}` : `👁️ ${t.spectatorCount} Spectateurs`}
+            ${t.champion ? `Champion : ${t.champion}` : `${specTotal} Spectateurs`}
           </span>
         </div>
         <div class="bracket-matches"></div>
       `;
       const matchesWrap = tourneyCard.querySelector(".bracket-matches");
       for (const m of t.matches || []) {
+        const matchId = m.id ?? m.matchId;
         const mRow = document.createElement("div");
         mRow.className = "mod-item";
         mRow.innerHTML = `
           <div>
-            <div class="mono" style="font-size:10.5px; color:var(--cobalt)">${m.roundLabel}</div>
-            <div style="font-weight:700">${m.playerA} <span style="color:var(--gold)">vs</span> ${m.playerB}</div>
-            <div class="mono" style="font-size:10.5px; color:${m.winner ? "var(--phosphor-green)" : "var(--text-muted)"}">
-              ${m.winner ? `✓ Vainqueur : ${m.winner}` : `Score Live : ${m.scoreA} - ${m.scoreB}`}
+            <div class="mono" style="font-size:10.5px; color:var(--accent-primary)">${m.roundLabel}</div>
+            <div style="font-weight:600">${m.playerA} <span style="color:var(--text-muted)">vs</span> ${m.playerB}</div>
+            <div class="mono" style="font-size:10.5px; color:${m.winner ? "var(--status-ok)" : "var(--text-muted)"}">
+              ${m.winner ? `Vainqueur : ${m.winner}` : `Score Live : ${m.scoreA} - ${m.scoreB}`}
             </div>
           </div>
           <div style="display:flex; gap:4px;">
-            <button class="btn mono btn-win-a" style="padding:3px 7px; font-size:10px;">🏆 ${m.playerA}</button>
-            <button class="btn mono btn-win-b" style="padding:3px 7px; font-size:10px;">🏆 ${m.playerB}</button>
+            <button class="btn mono btn-win-a" style="padding:3px 7px; font-size:10px;">${m.playerA}</button>
+            <button class="btn mono btn-win-b" style="padding:3px 7px; font-size:10px;">${m.playerB}</button>
           </div>
         `;
         mRow.querySelector(".btn-win-a")?.addEventListener("click", async () => {
           const boot = await invokeBackend("advance_tournament_match", {
-            matchId: m.matchId,
+            matchId,
             scoreA: 3,
             scoreB: 1
           });
           if (boot) applyBootstrap(boot);
-          else {
-            m.winner = m.playerA;
-            if (m.matchId === "semi-1") t.matches[2].playerA = m.playerA;
-            else if (m.matchId === "semi-2") t.matches[2].playerB = m.playerA;
-            else if (m.matchId === "grand-final") t.champion = m.playerA;
-            renderNetplayAndCores();
-          }
         });
         mRow.querySelector(".btn-win-b")?.addEventListener("click", async () => {
           const boot = await invokeBackend("advance_tournament_match", {
-            matchId: m.matchId,
+            matchId,
             scoreA: 1,
             scoreB: 3
           });
           if (boot) applyBootstrap(boot);
-          else {
-            m.winner = m.playerB;
-            if (m.matchId === "semi-1") t.matches[2].playerA = m.playerB;
-            else if (m.matchId === "semi-2") t.matches[2].playerB = m.playerB;
-            else if (m.matchId === "grand-final") t.champion = m.playerB;
-            renderNetplayAndCores();
-          }
         });
         matchesWrap.appendChild(mRow);
       }
@@ -1222,14 +855,14 @@ function renderNetplayAndCores() {
       card.className = "panel-card";
       card.innerHTML = `
         <div class="section-title">
-          <span>🌐 ${r.title}</span>
+          <span>${r.title}</span>
           <span class="pill-badge pill-green mono">${r.pingMs} ms · Rollback ${r.rollbackFrames}f</span>
         </div>
         <div class="kv-row"><span class="kv-label">Jeu</span><span class="kv-val">${r.gameTitle} (${r.console})</span></div>
         <div class="kv-row"><span class="kv-label">Hôte &amp; Joueurs</span><span class="kv-val mono">${r.hostName} (${r.playersCurrent}/${r.playersMax})</span></div>
-        <div class="kv-row"><span class="kv-label">Invitation Deep-Link</span><span class="kv-val mono" style="color:var(--gold)">${r.deepLinkUri}</span></div>
+        <div class="kv-row"><span class="kv-label">Invitation Deep-Link</span><span class="kv-val mono" style="color:var(--accent-secondary)">${r.deepLinkUri}</span></div>
         <div style="margin-top:10px; display:flex; justify-content:flex-end;">
-          <button class="btn btn-gold mono" style="font-size:11px;">🔗 Synchroniser Salon &amp; Link 2P</button>
+          <button class="btn btn-primary mono" style="font-size:11px;">Synchroniser Salon &amp; Link 2P</button>
         </div>
       `;
       card.querySelector("button").addEventListener("click", async () => {
@@ -1241,7 +874,7 @@ function renderNetplayAndCores() {
         if (!state.dualLinkMode) {
           document.getElementById("btn-toggle-dual")?.click();
         }
-        switchTab("view-emulator");
+        launchSelectedGame();
       });
       netGrid.appendChild(card);
     }
@@ -1251,22 +884,32 @@ function renderNetplayAndCores() {
       card.className = "panel-card";
       card.innerHTML = `
         <div class="section-title">
-          <span>👻 Record Fantôme TAS · ${ghost.playerName}</span>
-          <span class="pill-badge pill-cobalt mono">🏆 ${ghost.score} pts · CRC ${ghost.traceCrc32Hex}</span>
+          <span>Record Fantôme TAS · ${ghost.playerName}</span>
+          <span class="pill-badge pill-cobalt mono">${ghost.score} pts · CRC ${ghost.traceCrc32Hex}</span>
         </div>
         <div class="kv-row"><span class="kv-label">Jeu &amp; Console</span><span class="kv-val">${ghost.gameTitle} (${ghost.console})</span></div>
-        <div class="kv-row"><span class="kv-label">Trace Déterministe</span><span class="kv-val mono" style="color:var(--phosphor-green)">✓ Vérifié (${ghost.framesCount} frames)</span></div>
+        <div class="kv-row"><span class="kv-label">Trace Déterministe</span><span class="kv-val mono" style="color:var(--status-ok)">Vérifié (${ghost.framesCount} frames)</span></div>
         <div style="margin-top:10px; display:flex; justify-content:flex-end;">
-          <button class="btn mono" style="font-size:11px; border-color:var(--cobalt); color:var(--cobalt);">⚔️ Défier Fantôme TAS en Direct</button>
+          <button class="btn mono" style="font-size:11px; border-color:var(--accent-primary); color:var(--accent-primary);">Défier Fantôme TAS</button>
         </div>
       `;
       card.querySelector("button").addEventListener("click", async () => {
         const boot = await invokeBackend("challenge_ghost_run", { ghostId: ghost.id });
         if (boot) applyBootstrap(boot);
         document.getElementById("macro-status").textContent = "DÉFI FANTÔME TAS";
-        switchTab("view-emulator");
+        launchSelectedGame();
       });
       netGrid.appendChild(card);
+    }
+
+    if (netGrid.children.length === 0) {
+      const emptyCard = document.createElement("div");
+      emptyCard.className = "panel-card";
+      emptyCard.innerHTML = `
+        <div class="section-title"><span>Salons P2P &amp; Fantômes TAS</span></div>
+        <div class="empty-list-hint">Aucun salon P2P ou fantôme TAS actif. Créez un salon ou rejoignez une URI zaimule://room/.</div>
+      `;
+      netGrid.appendChild(emptyCard);
     }
   }
 
@@ -1276,40 +919,47 @@ function renderNetplayAndCores() {
 
     const communityCard = document.createElement("div");
     communityCard.className = "panel-card";
-    communityCard.innerHTML = `<div class="section-title"><span>🧩 Hub Communautaire de Mods .IPS (Installation 1-Clic Non-Destructive)</span></div>`;
-    for (const mod of state.communityMods || []) {
-      const row = document.createElement("div");
-      row.className = "mod-item";
-      row.innerHTML = `
-        <div>
-          <div style="font-weight:700">${mod.title}</div>
-          <div style="font-size:11px; color:var(--text-muted)">${mod.description}</div>
-          <div class="mono" style="font-size:10.5px; color:var(--gold)">Par ${mod.author} · Cible : ${mod.targetConsole}</div>
-        </div>
-        <button class="btn mono" style="padding:4px 10px; font-size:11px;">
-          ${mod.installed ? "✓ Patch .IPS Actif" : "⚡ Installer .IPS 1-Clic"}
-        </button>
-      `;
-      row.querySelector("button").addEventListener("click", async () => {
-        const boot = await invokeBackend("install_community_ips_mod", { modId: mod.id });
-        if (boot) {
-          applyBootstrap(boot);
-        } else {
-          mod.installed = true;
-          state.modLayers.unshift({
-            id: `comm-${mod.id}`,
-            label: `${mod.title} (Hub Communautaire)`,
-            enabled: true
-          });
-          updateAllViews();
-        }
-      });
-      communityCard.appendChild(row);
+    communityCard.innerHTML = `<div class="section-title"><span>Patchs .IPS Non-Destructifs</span></div>`;
+    if ((state.communityMods || []).length === 0) {
+      const hint = document.createElement("div");
+      hint.className = "empty-list-hint";
+      hint.textContent = "Aucun patch .IPS préchargé. Utilisez « Patch .IPS » dans la barre supérieure pour charger un patch local.";
+      communityCard.appendChild(hint);
+    } else {
+      for (const mod of state.communityMods) {
+        const row = document.createElement("div");
+        row.className = "mod-item";
+        row.innerHTML = `
+          <div>
+            <div style="font-weight:600">${mod.title}</div>
+            <div style="font-size:11px; color:var(--text-muted)">${mod.description}</div>
+            <div class="mono" style="font-size:10.5px; color:var(--accent-secondary)">Par ${mod.author} · Cible : ${mod.targetConsole}</div>
+          </div>
+          <button class="btn mono" style="padding:4px 10px; font-size:11px;">
+            ${mod.installed ? "Patch .IPS Actif" : "Installer .IPS"}
+          </button>
+        `;
+        row.querySelector("button").addEventListener("click", async () => {
+          const boot = await invokeBackend("install_community_ips_mod", { modId: mod.id });
+          if (boot) {
+            applyBootstrap(boot);
+          } else {
+            mod.installed = true;
+            state.modLayers.unshift({
+              id: `comm-${mod.id}`,
+              label: mod.title,
+              enabled: true
+            });
+            updateAllViews();
+          }
+        });
+        communityCard.appendChild(row);
+      }
     }
 
     const libCard = document.createElement("div");
     libCard.className = "panel-card";
-    libCard.innerHTML = `<div class="section-title"><span>🧩 Hôte Dynamique Libretro C-ABI (libretro.h v1)</span></div>`;
+    libCard.innerHTML = `<div class="section-title"><span>Hôte Dynamique Libretro C-ABI (libretro.h v1)</span></div>`;
 
     for (const c of state.libretroCores) {
       const row = document.createElement("div");
@@ -1317,12 +967,12 @@ function renderNetplayAndCores() {
       const cid = c.coreId || c.id;
       row.innerHTML = `
         <div>
-          <div style="font-weight:700">${c.displayName}</div>
+          <div style="font-weight:600">${c.displayName}</div>
           <div class="mono" style="font-size:11px; color:var(--text-muted)">${c.libraryWindows} / ${c.libraryMacos}</div>
-          <div class="mono" style="font-size:10.5px; color:${c.installed ? "var(--phosphor-green)" : "var(--cobalt)"};">${c.statusLabel}</div>
+          <div class="mono" style="font-size:10.5px; color:${c.installed ? "var(--status-ok)" : "var(--accent-primary)"};">${c.statusLabel}</div>
         </div>
         <button class="btn mono" style="padding:4px 10px; font-size:11px;">
-          ${c.installed ? "✓ C-ABI Vérifié" : "⚡ Provisionner C-ABI"}
+          ${c.installed ? "C-ABI Vérifié" : "Provisionner C-ABI"}
         </button>
       `;
       row.querySelector("button").addEventListener("click", async () => {
@@ -1334,7 +984,7 @@ function renderNetplayAndCores() {
           applyBootstrap(boot);
         } else {
           c.installed = true;
-          c.statusLabel = "✓ Installé · 9/9 symboles C-ABI vérifiés";
+          c.statusLabel = "Installé · 9/9 symboles C-ABI vérifiés";
           renderNetplayAndCores();
         }
       });
@@ -1344,13 +994,13 @@ function renderNetplayAndCores() {
     const biosCard = document.createElement("div");
     biosCard.className = "panel-card";
     biosCard.innerHTML = `
-      <div class="section-title"><span>🔐 Registre Cryptographique des BIOS</span></div>
+      <div class="section-title"><span>Registre Cryptographique des BIOS</span></div>
       ${state.biosEntries
         .map(
           (b) => `
           <div class="mod-item">
             <div>
-              <div class="mono" style="font-weight:700">${b.fileName} (${b.console})</div>
+              <div class="mono" style="font-weight:600">${b.fileName} (${b.console})</div>
               <div style="font-size:11px; color:var(--text-muted)">${b.notes}</div>
             </div>
             <span class="pill-badge pill-green mono">CRC ${b.expectedCrc32Hex}</span>
@@ -1367,31 +1017,57 @@ function renderNetplayAndCores() {
 }
 
 function applyBootstrap(boot) {
-  state.activeGameId = boot.activeGameId;
-  state.catalog = boot.catalog || state.catalog;
-  state.modLayers = boot.modLayers || state.modLayers;
-  state.cheatCodes = boot.cheatCodes || state.cheatCodes;
-  state.memoryWatchpoints = boot.memoryWatchpoints || state.memoryWatchpoints;
-  state.achievements = boot.achievements || state.achievements;
-  state.saveSlots = boot.saveSlots || state.saveSlots;
-  state.keymapperWidgets = boot.keymapperWidgets || state.keymapperWidgets;
-  state.macros = boot.macros || state.macros;
-  state.tasTimeline = boot.tasTimeline || state.tasTimeline;
-  state.netplayRooms = boot.netplayRooms || state.netplayRooms;
+  state.activeGameId = boot.activeGameId ?? "";
+  state.catalog = Array.isArray(boot.catalog) ? boot.catalog : state.catalog;
+  state.modLayers = Array.isArray(boot.modLayers) ? boot.modLayers : state.modLayers;
+  state.cheatCodes = Array.isArray(boot.cheatCodes) ? boot.cheatCodes : state.cheatCodes;
+  state.memoryWatchpoints = Array.isArray(boot.memoryWatchpoints)
+    ? boot.memoryWatchpoints
+    : state.memoryWatchpoints;
+  state.achievements = Array.isArray(boot.achievements) ? boot.achievements : state.achievements;
+  state.saveSlots = Array.isArray(boot.saveSlots) ? boot.saveSlots : state.saveSlots;
+  state.keymapperWidgets = Array.isArray(boot.keymapperWidgets)
+    ? boot.keymapperWidgets
+    : state.keymapperWidgets;
+  state.macros = Array.isArray(boot.macros) ? boot.macros : state.macros;
+  state.tasTimeline = Array.isArray(boot.tasTimeline) ? boot.tasTimeline : state.tasTimeline;
+  state.netplayRooms = Array.isArray(boot.netplayRooms) ? boot.netplayRooms : state.netplayRooms;
   state.udpLocalPort = boot.udpLocalPort || state.udpLocalPort;
   state.stunCandidate = boot.stunCandidate || state.stunCandidate;
-  state.netplayChat = boot.netplayChat || state.netplayChat;
-  state.communityMods = boot.communityMods || state.communityMods;
-  state.ghostLeaderboard = boot.ghostLeaderboard || state.ghostLeaderboard;
-  state.cpuOverclockPct = boot.cpuOverclockPct || state.cpuOverclockPct;
+  state.netplayChat = Array.isArray(boot.netplayChat) ? boot.netplayChat : state.netplayChat;
+  state.communityMods = Array.isArray(boot.communityMods)
+    ? boot.communityMods
+    : state.communityMods;
+  state.ghostLeaderboard = Array.isArray(boot.ghostLeaderboard)
+    ? boot.ghostLeaderboard
+    : state.ghostLeaderboard;
+  const eff = boot.effectiveConfig;
+  state.cpuOverclockPct = eff?.cpuOverclockPct ?? boot.cpuOverclockPct ?? state.cpuOverclockPct;
   state.pgxpSubpixel =
-    boot.pgxpSubpixel !== undefined ? boot.pgxpSubpixel : state.pgxpSubpixel;
+    eff?.pgxpSubpixel !== undefined
+      ? eff.pgxpSubpixel
+      : boot.pgxpSubpixel !== undefined
+        ? boot.pgxpSubpixel
+        : state.pgxpSubpixel;
   state.sramHexInspection = boot.sramHexInspection || state.sramHexInspection;
   state.tournamentBracket = boot.tournamentBracket || state.tournamentBracket;
-  state.libretroCores = boot.libretroCores || state.libretroCores;
-  state.biosEntries = boot.biosEntries || state.biosEntries;
+  state.libretroCores = Array.isArray(boot.libretroCores)
+    ? boot.libretroCores
+    : state.libretroCores;
+  state.biosEntries = Array.isArray(boot.biosEntries) ? boot.biosEntries : state.biosEntries;
   state.linkTelemetry = boot.linkTelemetry || { enabled: false, packetsTransferred: 0 };
   updateAllViews();
+}
+
+function computeCrc32Hex(bytes) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) {
+    crc ^= bytes[i];
+    for (let b = 0; b < 8; b++) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return ((crc ^ 0xffffffff) >>> 0).toString(16).toUpperCase().padStart(8, "0");
 }
 
 function updateAllViews() {
@@ -1409,6 +1085,31 @@ function switchTab(targetId) {
   document.querySelectorAll(".view-pane").forEach((pane) => {
     pane.classList.toggle("active", pane.id === targetId);
   });
+}
+
+function renderStandbyCanvas() {
+  const canvas = document.getElementById("canvas-p1");
+  if (canvas) {
+    const ctx = canvas.getContext("2d");
+    const w = canvas.width || 160;
+    const h = canvas.height || 144;
+    ctx.fillStyle = "#110F0E";
+    ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = "#282422";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(8.5, 8.5, w - 17, h - 17);
+  }
+  const osc = document.getElementById("audio-oscilloscope-canvas");
+  if (osc) {
+    const ctx = osc.getContext("2d");
+    ctx.fillStyle = "#110F0E";
+    ctx.fillRect(0, 0, osc.width, osc.height);
+    ctx.strokeStyle = "#332E2B";
+    ctx.beginPath();
+    ctx.moveTo(0, osc.height / 2);
+    ctx.lineTo(osc.width, osc.height / 2);
+    ctx.stroke();
+  }
 }
 
 function paintRgbaFrame(canvasId, frame) {
@@ -1436,17 +1137,17 @@ function renderAudioOscilloscope(freqHz, frameNumber) {
   const ctx = osc.getContext("2d");
   const w = osc.width;
   const h = osc.height;
-  ctx.fillStyle = "#070a0f";
+  ctx.fillStyle = "#110F0E";
   ctx.fillRect(0, 0, w, h);
 
-  ctx.strokeStyle = "rgba(56, 189, 248, 0.18)";
+  ctx.strokeStyle = "#332E2B";
   ctx.beginPath();
   ctx.moveTo(0, h / 2);
   ctx.lineTo(w, h / 2);
   ctx.stroke();
 
   const samples = synthesizeMultiChannelSamples(freqHz || 220, frameNumber, 48);
-  ctx.strokeStyle = freqHz > 0 ? "#4ade80" : "#f0b429";
+  ctx.strokeStyle = freqHz > 0 ? "#7D9B76" : "#3B6EF5";
   ctx.lineWidth = 1.5;
   ctx.beginPath();
   for (let i = 0; i < samples.length; i++) {
@@ -1456,6 +1157,24 @@ function renderAudioOscilloscope(freqHz, frameNumber) {
     else ctx.lineTo(x, y);
   }
   ctx.stroke();
+}
+
+function detectConsoleFromExtension(lowerName) {
+  if (lowerName.endsWith(".nes")) return { console: "NES", coreId: "zaimule-rust-nes" };
+  if (lowerName.endsWith(".sfc") || lowerName.endsWith(".smc"))
+    return { console: "SNES", coreId: "zaimule-rust-snes" };
+  if (lowerName.endsWith(".z64") || lowerName.endsWith(".n64") || lowerName.endsWith(".v64"))
+    return { console: "N64", coreId: "zaimule-rust-n64" };
+  if (lowerName.endsWith(".md") || lowerName.endsWith(".gen") || lowerName.endsWith(".smd"))
+    return { console: "MEGADRIVE", coreId: "zaimule-rust-md" };
+  if (lowerName.endsWith(".gba")) return { console: "GBA", coreId: "zaimule-rust-gba" };
+  if (lowerName.endsWith(".nds")) return { console: "NDS", coreId: "zaimule-rust-nds" };
+  if (lowerName.endsWith(".cue") || lowerName.endsWith(".bin") || lowerName.endsWith(".psx"))
+    return { console: "PS1", coreId: "zaimule-rust-ps1" };
+  if (lowerName.endsWith(".iso") || lowerName.endsWith(".cso"))
+    return { console: "PSP", coreId: "zaimule-rust-psp" };
+  if (lowerName.endsWith(".ch8")) return { console: "CHIP8", coreId: "zaimule-rust-chip8" };
+  return { console: "GBC", coreId: "zaimule-rust-gb" };
 }
 
 async function handleImportedFile(file) {
@@ -1470,7 +1189,7 @@ async function handleImportedFile(file) {
       applyBootstrap(boot);
     }
     const toast = document.getElementById("save-toast");
-    if (toast) toast.textContent = `☁️ Archive ${file.name} synchronisée !`;
+    if (toast) toast.textContent = `Archive ${file.name} synchronisée`;
     return;
   }
 
@@ -1500,30 +1219,36 @@ async function handleImportedFile(file) {
     applyBootstrap(boot);
   } else {
     const newId = `rom-${Date.now()}`;
+    const detected = detectConsoleFromExtension(lower);
+    const crc32Hex = computeCrc32Hex(bytes);
     state.catalog.unshift({
       id: newId,
       title: file.name.replace(/\.[^.]+$/, ""),
-      console: lower.endsWith(".nes") ? "NES" : lower.endsWith(".ch8") ? "CHIP8" : "GBC",
+      console: detected.console,
       engineKind: "nativeRust",
-      coreId: lower.endsWith(".nes") ? "zaimule-rust-nes" : "zaimule-rust-gb",
-      region: "Import Local · CRC32 Vérifié",
-      crc32Hex: "A1F09C82",
+      coreId: detected.coreId,
+      region: "Import Local",
+      crc32Hex,
       sizeBytes: bytes.length,
       sramSummary: "32 Ko SRAM Atomique (.tmp → .srm)",
       playtimeSeconds: 0,
       favorite: true,
-      linkCableReady: true,
-      coverAccent: "#1e3a8a",
-      coverSymbol: "🕹️"
+      linkCableReady: true
     });
     state.activeGameId = newId;
     updateAllViews();
   }
-  switchTab("view-emulator");
+  launchSelectedGame();
 }
 
 function renderDebuggerPayload(dbg) {
-  if (!dbg) return;
+  const listEl = document.getElementById("disasm-list");
+  if (!dbg) {
+    if (listEl) {
+      listEl.innerHTML = `<div class="empty-list-hint">En attente d'exécution CPU</div>`;
+    }
+    return;
+  }
   if (dbg.vram) {
     paintRgbaFrame("vram-atlas-canvas", {
       width: dbg.vram.atlasWidth || 128,
@@ -1531,15 +1256,18 @@ function renderDebuggerPayload(dbg) {
       rgba: dbg.vram.tileAtlasRgba
     });
   }
-  const listEl = document.getElementById("disasm-list");
   if (listEl && Array.isArray(dbg.disassembly)) {
     listEl.innerHTML = "";
+    if (dbg.disassembly.length === 0) {
+      listEl.innerHTML = `<div class="empty-list-hint">Aucune instruction désassemblée</div>`;
+      return;
+    }
     for (const line of dbg.disassembly) {
       const row = document.createElement("div");
       row.className = `disasm-row${line.isPc ? " is-pc" : ""}${line.hasBreakpoint ? " has-bp" : ""}`;
       row.innerHTML = `
         <span>${line.hasBreakpoint ? "● " : line.isPc ? "▶ " : "  "}${line.addrHex}</span>
-        <span style="color:var(--text-main)">${line.mnemonic}</span>
+        <span style="color:var(--text-primary)">${line.mnemonic}</span>
       `;
       row.title = "Cliquer pour basculer un point d'arrêt (Breakpoint PC)";
       row.addEventListener("click", async () => {
@@ -1552,46 +1280,43 @@ function renderDebuggerPayload(dbg) {
 }
 
 async function refreshDebuggerDrawer() {
+  if (!state.isEmulationRunning || !getSelectedGame()) {
+    renderDebuggerPayload(null);
+    return;
+  }
   const dbg = await invokeBackend("get_vram_and_disassembly");
   if (dbg) {
     renderDebuggerPayload(dbg);
-    return;
   }
-  const fallbackDisasm = [
-    { addr: 0x0150, addrHex: "0x0150", mnemonic: "LDH A, ($FF00)", isPc: true, hasBreakpoint: true },
-    { addr: 0x0152, addrHex: "0x0152", mnemonic: "INC B", isPc: false, hasBreakpoint: false },
-    { addr: 0x0153, addrHex: "0x0153", mnemonic: "INC HL", isPc: false, hasBreakpoint: false },
-    { addr: 0x0154, addrHex: "0x0154", mnemonic: "SWAP A", isPc: false, hasBreakpoint: false },
-    { addr: 0x0156, addrHex: "0x0156", mnemonic: "JP $0150", isPc: false, hasBreakpoint: false }
-  ];
-  renderDebuggerPayload({
-    disassembly: fallbackDisasm,
-    vram: null
-  });
 }
 
 async function tickEmulationLoop() {
+  const buttonsP1 = computeBitmaskFromPressedCodes(pressedKeys) | pollGamepadBitmask();
+  await handleBigPictureNavigation(buttonsP1);
+
+  if (!state.isEmulationRunning || !getSelectedGame()) {
+    requestAnimationFrame(tickEmulationLoop);
+    return;
+  }
+
   if (state.debuggerPaused && !state.stepOnceRequested) {
     requestAnimationFrame(tickEmulationLoop);
     return;
   }
   state.stepOnceRequested = false;
 
-  const buttonsP1 = computeBitmaskFromPressedCodes(pressedKeys) | pollGamepadBitmask();
-  await handleBigPictureNavigation(buttonsP1);
-
   if (state.recordingMacro) {
     state.recordedFrames.push(buttonsP1);
   }
 
-  const resp =
-    (await invokeBackend("step_viewport", {
-      buttonsP1,
-      buttonsP2: 0,
-      turboActive: true
-    })) || stepBrowserFallback(buttonsP1);
+  const resp = await invokeBackend("step_viewport", {
+    buttonsP1,
+    buttonsP2: 0,
+    turboActive: true
+  });
 
   if (resp && resp.primary) {
+    state.currentFrame = resp.primary.frameNumber || state.currentFrame + 1;
     paintRgbaFrame("canvas-p1", resp.primary);
     if (resp.secondary) {
       paintRgbaFrame("canvas-p2", resp.secondary);
@@ -1618,14 +1343,14 @@ async function tickEmulationLoop() {
     if (resp.newlyUnlockedAchievement) {
       triggerGamepadRumble(getConnectedGamepad(), 140, 0.6, 0.95);
       document.getElementById("save-toast").textContent =
-        `🏆 Succès débloqué : ${resp.newlyUnlockedAchievement}`;
+        `Succès débloqué : ${resp.newlyUnlockedAchievement}`;
       const boot = await invokeBackend("get_station_bootstrap");
       if (boot) applyBootstrap(boot);
       else renderInspector();
     }
     const cpu = resp.primary.cpu;
     const score = cpu.score ?? 0;
-    document.getElementById("emu-score-pill").textContent = `🏆 Score : ${score}`;
+    document.getElementById("emu-score-pill").textContent = `Score : ${score}`;
     document.getElementById("p1-reg-readout").textContent = `${cpu.arch} · PC:${cpu.pcHex}`;
     document.getElementById("rewind-readout").textContent = `Frame #${resp.primary.frameNumber}`;
     document.getElementById("dbg-pc-sp").textContent = `${cpu.pcHex} / ${cpu.spHex}`;
@@ -1651,20 +1376,57 @@ function bindEvents() {
     btn.addEventListener("click", () => switchTab(btn.dataset.target));
   });
 
+  document.querySelectorAll(".inspector-tab-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const targetPane = btn.dataset.inspTab;
+      document.querySelectorAll(".inspector-tab-btn").forEach((b) => {
+        b.classList.toggle("active", b === btn);
+      });
+      document.querySelectorAll(".inspector-tab-pane").forEach((p) => {
+        p.classList.toggle("active", p.id === targetPane);
+      });
+    });
+  });
+
+  const toggleInspectorDrawer = () => {
+    const drawer = document.getElementById("inspector-drawer");
+    drawer?.classList.toggle("collapsed");
+  };
+  document.getElementById("btn-toggle-inspector")?.addEventListener("click", toggleInspectorDrawer);
+  document.getElementById("prompt-options")?.addEventListener("click", toggleInspectorDrawer);
+
+  document.getElementById("prompt-launch")?.addEventListener("click", () => {
+    launchSelectedGame();
+  });
+
+  document.getElementById("prompt-savestate")?.addEventListener("click", () => {
+    document.getElementById("btn-quick-save")?.click();
+  });
+
+  const cycleConsoleFilter = (dir = 1) => {
+    const btns = Array.from(document.querySelectorAll(".console-btn"));
+    if (btns.length === 0) return;
+    const curIdx = Math.max(0, btns.findIndex((b) => b.classList.contains("active")));
+    const nextBtn = btns[(curIdx + dir + btns.length) % btns.length];
+    nextBtn?.click();
+  };
+  document.getElementById("prompt-console-cycle")?.addEventListener("click", () => cycleConsoleFilter(1));
+
   document.getElementById("btn-big-picture")?.addEventListener("click", (e) => {
     state.bigPictureMode = !state.bigPictureMode;
     document.querySelector(".app-shell")?.classList.toggle("big-picture", state.bigPictureMode);
-    e.currentTarget.textContent = `🛋️ Big Picture : ${state.bigPictureMode ? "ACTIF" : "OFF"}`;
+    e.currentTarget.textContent = `Big Picture : ${state.bigPictureMode ? "ACTIF" : "OFF"}`;
     triggerGamepadRumble(getConnectedGamepad(), 70, 0.4, 0.7);
   });
 
-  const colorLabels = ["🎨 #0 Noir", "🎨 #1 Sombre", "🎨 #2 Clair", "🎨 #3 Or"];
+  const colorLabels = ["#0 Fond", "#1 Basalte", "#2 Argile", "#3 Pigment"];
   document.getElementById("btn-vram-color")?.addEventListener("click", (e) => {
     state.vramPaintColorIdx = (state.vramPaintColorIdx + 3) % 4;
     e.currentTarget.textContent = colorLabels[state.vramPaintColorIdx];
   });
 
   document.getElementById("vram-atlas-canvas")?.addEventListener("click", async (e) => {
+    if (!getSelectedGame()) return;
     const canvas = e.currentTarget;
     const rect = canvas.getBoundingClientRect();
     const atlasX = Math.max(
@@ -1685,13 +1447,13 @@ function bindEvents() {
     }
     const toast = document.getElementById("save-toast");
     if (toast) {
-      toast.textContent = `🎨 Pixel VRAM (${atlasX}, ${atlasY}) peint en couleur #${state.vramPaintColorIdx}`;
+      toast.textContent = `Pixel VRAM (${atlasX}, ${atlasY}) peint en couleur #${state.vramPaintColorIdx}`;
     }
   });
 
   const canvasP1 = document.getElementById("canvas-p1");
   const handleStylusEvent = async (ev, pressed) => {
-    if (!canvasP1) return;
+    if (!canvasP1 || !getSelectedGame()) return;
     const rect = canvasP1.getBoundingClientRect();
     const normX = Math.max(0, Math.min(1, (ev.clientX - rect.left) / Math.max(1, rect.width)));
     const normY = Math.max(0, Math.min(1, (ev.clientY - rect.top) / Math.max(1, rect.height)));
@@ -1720,16 +1482,16 @@ function bindEvents() {
     const text = inp?.value?.trim();
     if (!text) return;
     const boot = await invokeBackend("post_netplay_chat_message", {
-      sender: "Zainados",
+      sender: "Hôte",
       text,
-      shareSlot1State: false
+      shareSlot: null
     });
     if (boot) {
       applyBootstrap(boot);
     } else {
       state.netplayChat.unshift({
         id: `chat-${Date.now()}`,
-        sender: "Zainados",
+        sender: "Hôte",
         text,
         saveStateCrcHex: null
       });
@@ -1740,18 +1502,19 @@ function bindEvents() {
 
   document.getElementById("btn-share-state-chat")?.addEventListener("click", async () => {
     const g = getSelectedGame();
-    const text = `Cliché Save State Slot #1 (${g.title}) prêt pour synchronisation P2P !`;
+    if (!g) return;
+    const text = `Cliché Save State Slot #1 (${g.title}) partagé`;
     const boot = await invokeBackend("post_netplay_chat_message", {
-      sender: "Zainados",
+      sender: "Hôte",
       text,
-      shareSlot1State: true
+      shareSlot: 1
     });
     if (boot) {
       applyBootstrap(boot);
     } else {
       state.netplayChat.unshift({
         id: `chat-state-${Date.now()}`,
-        sender: "Zainados",
+        sender: "Hôte",
         text,
         saveStateCrcHex: g.crc32Hex
       });
@@ -1804,6 +1567,7 @@ function bindEvents() {
   });
 
   document.getElementById("btn-sram-boost")?.addEventListener("click", async () => {
+    if (!getSelectedGame()) return;
     const updated = await invokeBackend("write_sram_byte_live", {
       offset: 4,
       value: 0xff
@@ -1813,57 +1577,34 @@ function bindEvents() {
     } else if (updated) {
       state.sramHexInspection = updated;
       renderInspector();
-    } else if (state.sramHexInspection) {
-      state.sramHexInspection.crc32Hex = "FF90A12C";
-      state.sramHexInspection.rows[0] =
-        "0x0000: 5A 41 49 4D FF 4C 45 30  00 00 00 00 00 00 00 00 | ZAIM.LE0........";
-      renderInspector();
     }
     const toast = document.getElementById("save-toast");
-    if (toast) toast.textContent = "✏️ Octet SRAM 0x0004 = 0xFF écrit & CRC32 recalculé !";
+    if (toast) toast.textContent = "Octet SRAM 0x0004 = 0xFF écrit & CRC32 recalculé";
   });
 
   document.getElementById("btn-sram-transfer")?.addEventListener("click", async () => {
+    if (!getSelectedGame()) return;
     const boot = await invokeBackend("transfer_sram_p1_to_p2");
     if (boot) applyBootstrap(boot);
     const toast = document.getElementById("save-toast");
-    if (toast) toast.textContent = "🔄 Batterie SRAM / Carte Mémoire synchronisée J1 ➔ J2 !";
+    if (toast) toast.textContent = "Batterie SRAM / Carte Mémoire synchronisée J1 → J2";
   });
 
   document.getElementById("btn-toggle-spectator")?.addEventListener("click", async () => {
     const boot = await invokeBackend("toggle_tournament_spectator");
     if (boot) {
       applyBootstrap(boot);
-    } else if (state.tournamentBracket) {
-      state.tournamentBracket.spectatorModeActive =
-        !state.tournamentBracket.spectatorModeActive;
-      state.tournamentBracket.spectatorCount += state.tournamentBracket.spectatorModeActive
-        ? 1
-        : -1;
-      renderNetplayAndCores();
     }
   });
 
   document.getElementById("btn-submit-ghost")?.addEventListener("click", async () => {
     const g = getSelectedGame();
+    if (!g) return;
     const boot = await invokeBackend("submit_ghost_leaderboard_run", {
-      playerName: "Zainados"
+      playerName: "Joueur 1"
     });
     if (boot) {
       applyBootstrap(boot);
-    } else {
-      state.ghostLeaderboard.unshift({
-        id: `ghost-${Date.now()}`,
-        gameId: g.id,
-        gameTitle: g.title,
-        console: g.console,
-        playerName: "Zainados",
-        score: Math.max(10, fallbackSim.score),
-        framesCount: Math.max(60, fallbackSim.frame),
-        traceCrc32Hex: g.crc32Hex,
-        verified: true
-      });
-      renderNetplayAndCores();
     }
   });
 
@@ -1874,19 +1615,21 @@ function bindEvents() {
         new TextEncoder().encode(
           JSON.stringify({
             magic: "ZAIMULE_PACK_V1",
-            version: "1.0.0",
+            version: "1.1.0",
             activeGameId: state.activeGameId,
             cheatCodes: state.cheatCodes,
             macros: state.macros
           })
         )
       );
-    downloadBinaryFile(packBytes, `${state.activeGameId}-cloud.zaimule-pack`, "application/json");
+    const prefix = state.activeGameId || "zaimule";
+    downloadBinaryFile(packBytes, `${prefix}-cloud.zaimule-pack`, "application/json");
     const toast = document.getElementById("save-toast");
-    if (toast) toast.textContent = `☁️ Pack .zaimule-pack exporté (${packBytes.length} o)`;
+    if (toast) toast.textContent = `Pack .zaimule-pack exporté (${packBytes.length} o)`;
   });
 
   document.getElementById("btn-export-ips")?.addEventListener("click", async () => {
+    if (!getSelectedGame()) return;
     const ipsBytes =
       (await invokeBackend("export_ips_diff")) || [
         0x50, 0x41, 0x54, 0x43, 0x48, 0x00, 0x01, 0x34, 0x00, 0x04, 0x5a, 0x4d, 0x44, 0x58, 0x45,
@@ -1895,7 +1638,7 @@ function bindEvents() {
     downloadBinaryFile(ipsBytes, `${state.activeGameId}-dx.ips`, "application/octet-stream");
     state.modLayers.unshift({
       id: `ips-diff-${Date.now()}`,
-      label: `Création Diff ${state.activeGameId}-dx.ips (${ipsBytes.length} o)`,
+      label: `Diff ${state.activeGameId}-dx.ips (${ipsBytes.length} o)`,
       enabled: true
     });
     renderInspector();
@@ -1952,7 +1695,8 @@ function bindEvents() {
 
   document.getElementById("btn-add-watchpoint")?.addEventListener("click", async () => {
     const inp = document.getElementById("ram-scan-input");
-    const rawAddr = inp?.value?.trim() || "0xC110=7F";
+    const rawAddr = inp?.value?.trim();
+    if (!rawAddr) return;
     const boot = await invokeBackend("add_memory_watchpoint", {
       rawAddr,
       label: `Pin ${rawAddr.toUpperCase()}`,
@@ -1966,10 +1710,10 @@ function bindEvents() {
         label: `Pin ${rawAddr.toUpperCase()}`,
         addr: 0xc110,
         addrHex: rawAddr.split("=")[0].toUpperCase(),
-        currentValue: 0x7f,
-        previousValue: 0x7f,
+        currentValue: 0x00,
+        previousValue: 0x00,
         frozen: true,
-        frozenValue: 0x7f
+        frozenValue: 0x00
       });
       renderKeymapperAndMacros();
     }
@@ -1978,12 +1722,7 @@ function bindEvents() {
   document.getElementById("btn-scan-ram")?.addEventListener("click", async () => {
     const inp = document.getElementById("ram-scan-input");
     const targetValue = Number(inp?.value || 0) & 0xff;
-    const hits =
-      (await invokeBackend("scan_ram_byte", { targetValue })) || [
-        "0xC100",
-        "0xC101",
-        "0xC108"
-      ];
+    const hits = (await invokeBackend("scan_ram_byte", { targetValue })) || [];
     const outEl = document.getElementById("ram-scan-results");
     if (outEl) {
       outEl.textContent =
@@ -1995,9 +1734,10 @@ function bindEvents() {
 
   document.getElementById("btn-create-room")?.addEventListener("click", async () => {
     const g = getSelectedGame();
+    if (!g) return;
     const boot = await invokeBackend("create_netplay_room", {
       title: `Salon Live · ${g.title}`,
-      hostName: "Zainados",
+      hostName: "Hôte",
       peerAddr: null
     });
     if (boot) {
@@ -2006,7 +1746,7 @@ function bindEvents() {
       state.netplayRooms.unshift({
         roomCode: `ZM-${g.crc32Hex.slice(0, 4)}`,
         title: `Salon Live · ${g.title}`,
-        hostName: "Zainados",
+        hostName: "Hôte",
         console: g.console,
         gameTitle: g.title,
         pingMs: 4,
@@ -2025,32 +1765,33 @@ function bindEvents() {
     if (!uri) return;
     const boot = await invokeBackend("join_netplay_deep_link", { uri, peerAddr: null });
     if (boot) applyBootstrap(boot);
-    switchTab("view-emulator");
+    launchSelectedGame();
   });
 
   document.getElementById("btn-launch-selected")?.addEventListener("click", () => {
-    switchTab("view-emulator");
+    launchSelectedGame();
   });
   document.getElementById("btn-insp-play")?.addEventListener("click", () => {
-    switchTab("view-emulator");
+    launchSelectedGame();
   });
 
   document.getElementById("btn-audio-toggle")?.addEventListener("click", (e) => {
     const on = apuAudio.toggleEnabled();
-    e.currentTarget.textContent = `🔊 Audio APU : ${on ? "ON" : "MUET"}`;
+    e.currentTarget.textContent = `Audio APU : ${on ? "ON" : "MUET"}`;
   });
 
   document.getElementById("btn-record-video")?.addEventListener("click", (e) => {
+    if (!getSelectedGame()) return;
     const canvas = document.getElementById("canvas-p1");
     if (!viewportRecorder.isRecording) {
       viewportRecorder.start(canvas, state.activeGameId);
-      e.currentTarget.textContent = "⏹ Stop .WebM";
-      document.getElementById("save-toast").textContent = "🎥 Capture vidéo 60 FPS en cours...";
+      e.currentTarget.textContent = "Stop .WebM";
+      document.getElementById("save-toast").textContent = "Capture vidéo 60 FPS en cours...";
     } else {
       const res = viewportRecorder.stop();
-      e.currentTarget.textContent = "🎥 Clip .WebM";
+      e.currentTarget.textContent = "Clip .WebM";
       document.getElementById("save-toast").textContent =
-        `✓ Clip enregistré : ${res.fileName} (${res.durationText})`;
+        `Clip enregistré : ${res.fileName} (${res.durationText})`;
     }
   });
 
@@ -2065,22 +1806,22 @@ function bindEvents() {
             : "OFF";
     const label =
       state.upscalerMode === "SCALE2X"
-        ? "✨ Upscaler : Scale2x EPX"
+        ? "Upscaler : Scale2x EPX"
         : state.upscalerMode === "XBRZ"
-          ? "✨ Upscaler : xBRZ 2x"
+          ? "Upscaler : xBRZ 2x"
           : state.upscalerMode === "BLOOM"
-            ? "✨ Upscaler : CRT Bloom"
-            : "✨ Upscaler : Natif 1x";
+            ? "Upscaler : CRT Bloom"
+            : "Upscaler : Natif 1x";
     e.currentTarget.textContent = label;
   });
 
   const shaders = ["mode-crt", "mode-trinitron", "mode-dmg", "mode-lcd", "mode-clean"];
   const shaderLabels = [
-    "📺 Shader : CRT Scanlines",
-    "📺 Shader : Trinitron Courbé",
-    "📺 Shader : Game Boy DMG Vert",
-    "📺 Shader : Matrice LCD",
-    "📺 Shader : Pixel-Perfect"
+    "Shader : CRT Scanlines",
+    "Shader : Trinitron Courbé",
+    "Shader : Game Boy DMG Vert",
+    "Shader : Matrice LCD",
+    "Shader : Pixel-Perfect"
   ];
   let shaderIdx = 0;
   document.getElementById("btn-shader-cycle")?.addEventListener("click", (e) => {
@@ -2099,7 +1840,7 @@ function bindEvents() {
     document.getElementById("keymapper-p1")?.classList.toggle("visible", state.keymapperVisible);
     const btn = document.getElementById("btn-toggle-keymapper");
     if (btn) {
-      btn.textContent = `🎯 Keymapper : ${state.keymapperVisible ? "ON" : "OFF"}`;
+      btn.textContent = `Keymapper : ${state.keymapperVisible ? "ON" : "OFF"}`;
     }
   };
   document.getElementById("btn-toggle-keymapper")?.addEventListener("click", toggleKm);
@@ -2109,13 +1850,13 @@ function bindEvents() {
     if (!state.recordingMacro) {
       state.recordingMacro = true;
       state.recordedFrames = [];
-      e.currentTarget.textContent = "⏹ Arrêter & Sauver Macro";
+      e.currentTarget.textContent = "Arrêter & Sauver Macro";
       document.getElementById("macro-status").textContent = "ENREGISTREMENT...";
     } else {
       state.recordingMacro = false;
-      e.currentTarget.textContent = "● Enregistrer Macro Live";
+      e.currentTarget.textContent = "Enregistrer Macro Live";
       const frames = state.recordedFrames.length > 0 ? state.recordedFrames : [BTN_A];
-      const name = `⚡ Combo Live (${frames.length}f)`;
+      const name = `Combo Live (${frames.length}f)`;
       const boot = await invokeBackend("save_recorded_macro", { name, frames });
       if (boot) {
         applyBootstrap(boot);
@@ -2137,13 +1878,13 @@ function bindEvents() {
       document.getElementById("bezel-p4").style.display = "none";
       document.getElementById("screens-wrap").classList.remove("quad-mode");
       const quadBtn = document.getElementById("btn-toggle-quad");
-      if (quadBtn) quadBtn.textContent = "🏆 Tournoi 4P : OFF";
+      if (quadBtn) quadBtn.textContent = "Tournoi 4P : OFF";
     }
     document.getElementById("bezel-p2").style.display = state.dualLinkMode ? "flex" : "none";
     document.getElementById("screens-wrap").classList.toggle("dual-mode", state.dualLinkMode && !state.quadLinkMode);
-    e.currentTarget.textContent = `🔗 Link 2P : ${state.dualLinkMode ? "ACTIF" : "OFF"}`;
+    e.currentTarget.textContent = `Link 2P : ${state.dualLinkMode ? "ACTIF" : "OFF"}`;
     document.getElementById("link-status-pill").textContent = state.dualLinkMode
-      ? "🔗 Câble Link 2P Synchronisé"
+      ? "Câble Link 2P Synchronisé"
       : "Mode 1P Solo";
     await invokeBackend("set_dual_link_enabled", { enabled: state.dualLinkMode });
   });
@@ -2159,61 +1900,105 @@ function bindEvents() {
     document.getElementById("bezel-p2").style.display = state.quadLinkMode || state.dualLinkMode ? "flex" : "none";
     document.getElementById("bezel-p3").style.display = state.quadLinkMode ? "flex" : "none";
     document.getElementById("bezel-p4").style.display = state.quadLinkMode ? "flex" : "none";
-    e.currentTarget.textContent = `🏆 Tournoi 4P : ${state.quadLinkMode ? "ACTIF" : "OFF"}`;
+    e.currentTarget.textContent = `Tournoi 4P : ${state.quadLinkMode ? "ACTIF" : "OFF"}`;
     document.getElementById("link-status-pill").textContent = state.quadLinkMode
-      ? "🏆 Tournoi 4P Multi-SIO"
+      ? "Tournoi 4P Multi-SIO"
       : state.dualLinkMode
-        ? "🔗 Câble Link 2P Synchronisé"
+        ? "Câble Link 2P Synchronisé"
         : "Mode 1P Solo";
     await invokeBackend("set_quad_link_enabled", { enabled: state.quadLinkMode });
   });
 
   document.getElementById("btn-dbg-pause")?.addEventListener("click", (e) => {
     state.debuggerPaused = !state.debuggerPaused;
-    e.currentTarget.textContent = state.debuggerPaused ? "▶ Reprendre" : "⏸ Pause CPU";
+    e.currentTarget.textContent = state.debuggerPaused ? "Reprendre" : "Pause CPU";
   });
 
   document.getElementById("btn-dbg-step")?.addEventListener("click", () => {
     state.debuggerPaused = true;
     state.stepOnceRequested = true;
     const pauseBtn = document.getElementById("btn-dbg-pause");
-    if (pauseBtn) pauseBtn.textContent = "▶ Reprendre";
+    if (pauseBtn) pauseBtn.textContent = "Reprendre";
   });
 
   document.getElementById("btn-speed-cycle")?.addEventListener("click", (e) => {
     state.speedMult = state.speedMult === 1 ? 2 : state.speedMult === 2 ? 4 : 1;
-    e.currentTarget.textContent = `⚡ Vitesse : ${state.speedMult}.0x`;
-    document.getElementById("tel-fps").textContent = `${(60 * state.speedMult).toFixed(1)} FPS`;
-  });
-
-  document.getElementById("btn-quick-save")?.addEventListener("click", async () => {
-    const info = await invokeBackend("create_save_state", { slot: 1, label: "QuickSave F5" });
-    document.getElementById("save-toast").textContent = info
-      ? `✓ Sauvé Slot #1 (Frame #${info.frame} · CRC ${info.crc32Hex})`
-      : `✓ Sauvé Slot #1 (Frame #${fallbackSim.frame})`;
-  });
-
-  document.getElementById("btn-quick-load")?.addEventListener("click", async () => {
-    const info = await invokeBackend("restore_save_state", { slot: 1 });
-    document.getElementById("save-toast").textContent = info
-      ? `✓ Chargé Slot #1 (Frame #${info.frame})`
-      : `✓ Chargé Slot #1`;
-  });
-
-  document.getElementById("btn-rewind-step")?.addEventListener("click", async () => {
-    const res = await invokeBackend("rewind_frames", { stepsBack: 2 });
-    if (!res && fallbackSim.history.length > 0) {
-      const snap = fallbackSim.history.pop();
-      fallbackSim.frame = snap.frame;
-      fallbackSim.px = snap.px;
-      fallbackSim.py = snap.py;
-      fallbackSim.score = snap.score;
+    e.currentTarget.textContent = `Vitesse : ${state.speedMult}.0x`;
+    if (state.isEmulationRunning) {
+      document.getElementById("tel-fps").textContent = `${(60 * state.speedMult).toFixed(1)} FPS`;
     }
   });
 
+  document.getElementById("btn-quick-save")?.addEventListener("click", async () => {
+    if (!getSelectedGame()) return;
+    const info = await invokeBackend("create_save_state", { slot: 1, label: "QuickSave F5" });
+    document.getElementById("save-toast").textContent = info
+      ? `Sauvé Slot #1 (Frame #${info.frame} · CRC ${info.crc32Hex})`
+      : `Sauvé Slot #1 (Frame #${state.currentFrame})`;
+  });
+
+  document.getElementById("btn-quick-load")?.addEventListener("click", async () => {
+    if (!getSelectedGame()) return;
+    const info = await invokeBackend("restore_save_state", { slot: 1 });
+    document.getElementById("save-toast").textContent = info
+      ? `Chargé Slot #1 (Frame #${info.frame})`
+      : `Chargé Slot #1`;
+  });
+
+  document.getElementById("btn-rewind-step")?.addEventListener("click", async () => {
+    if (!getSelectedGame()) return;
+    await invokeBackend("rewind_frames", { stepsBack: 2 });
+  });
+
   window.addEventListener("keydown", async (e) => {
-    if (document.activeElement?.tagName === "INPUT") return;
+    if (document.activeElement?.tagName === "INPUT") {
+      if (e.key === "Escape") document.activeElement.blur();
+      return;
+    }
     pressedKeys.add(e.code);
+
+    const activePane = document.querySelector(".view-pane.active")?.id || "view-library";
+    if (e.key === "/") {
+      e.preventDefault();
+      document.getElementById("search-input")?.focus();
+      return;
+    }
+    if (e.code === "KeyY") {
+      e.preventDefault();
+      toggleInspectorDrawer();
+      return;
+    }
+    if (activePane === "view-library") {
+      if (e.code === "Enter") {
+        e.preventDefault();
+        launchSelectedGame();
+        return;
+      }
+      if (e.code === "BracketLeft") {
+        e.preventDefault();
+        cycleConsoleFilter(-1);
+        return;
+      }
+      if (e.code === "BracketRight") {
+        e.preventDefault();
+        cycleConsoleFilter(1);
+        return;
+      }
+      if ((e.code === "ArrowRight" || e.code === "ArrowLeft") && state.catalog.length > 0) {
+        e.preventDefault();
+        const step = e.code === "ArrowRight" ? 1 : -1;
+        const idx = state.catalog.findIndex((g) => g.id === state.activeGameId);
+        const nextGame = state.catalog[(Math.max(0, idx) + step + state.catalog.length) % state.catalog.length];
+        if (nextGame) {
+          state.activeGameId = nextGame.id;
+          const boot = await invokeBackend("select_game", { gameId: nextGame.id });
+          if (boot) applyBootstrap(boot);
+          else updateAllViews();
+        }
+        return;
+      }
+    }
+
     if (e.code === "F5") {
       e.preventDefault();
       document.getElementById("btn-quick-save")?.click();
@@ -2237,6 +2022,7 @@ function bindEvents() {
 
 async function init() {
   bindEvents();
+  renderStandbyCanvas();
   updateAllViews();
   const boot = await invokeBackend("get_station_bootstrap");
   if (boot) {

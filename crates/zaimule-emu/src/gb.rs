@@ -133,6 +133,54 @@ impl GameBoyCore {
         Self::default()
     }
 
+    pub fn new_empty() -> Self {
+        Self {
+            is_gbc: true,
+            is_embedded_homebrew: false,
+            rom: Vec::new(),
+            rom_bank: 1,
+            ram_bank: 0,
+            ram_enabled: false,
+            rtc_regs: [0; 5],
+            rtc_latch_arm: 0,
+            vram: vec![0; 0x2000],
+            sram: vec![0; 0x8000],
+            wram: vec![0; 0x2000],
+            oam: vec![0; 0xA0],
+            io: vec![0; 0x80],
+            hram: vec![0; 0x7F],
+            ie: 0,
+            ime: false,
+            halted: true,
+            a: 0,
+            f: 0,
+            b: 0,
+            c: 0,
+            d: 0,
+            e: 0,
+            h: 0,
+            l: 0,
+            sp: 0xFFFE,
+            pc: 0x0100,
+            cycles: 0,
+            div_counter: 0,
+            frame_number: 0,
+            buttons_state: 0,
+            player_x: 0,
+            player_y: 0,
+            peer_x: 0,
+            peer_y: 0,
+            orb_x: 0,
+            orb_y: 0,
+            shot_x: 0,
+            shot_y: 0,
+            shot_active: false,
+            score: 0,
+            audio_timer: 0,
+            audio_freq_hz: 0,
+        }
+    }
+
     // 16-bit register pairs
     #[inline]
     fn bc(&self) -> u16 {
@@ -462,7 +510,7 @@ impl GameBoyCore {
                 }
             }
         }
-        if self.halted {
+        if self.halted || self.rom.is_empty() {
             return 4;
         }
 
@@ -1104,6 +1152,7 @@ impl EmulatorBackend for GameBoyCore {
         self.ram_bank = 0;
         self.pc = 0x0100;
         self.sp = 0xFFFE;
+        self.halted = false;
         self.frame_number = 0;
         self.score = 0;
         self.init_vram_tiles_and_map();

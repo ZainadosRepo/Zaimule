@@ -3,7 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Zaimule — Station d'Émulation Multi-Consoles</title>
+    <meta
+      name="description"
+      content="Zaimule — Interface d'émulation multi-consoles haute précision."
+    />
+    <title>Zaimule</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
@@ -11,31 +15,52 @@
       <header class="titlebar" data-tauri-drag-region>
         <div class="brand-group" data-tauri-drag-region>
           <div class="brand-emblem">Z</div>
-          <span class="brand-title">ZAIMULE</span>
-          <span class="brand-sub">Rust Multi-Console Station · v1.0.0</span>
+          <h1 class="brand-title">ZAIMULE</h1>
+          <span class="brand-version">1.1</span>
         </div>
 
-        <nav class="nav-tabs" role="tablist">
+        <nav class="nav-tabs" role="tablist" aria-label="Navigation principale">
           <button class="nav-tab active" data-target="view-library" id="tab-library">
-            📚 Bibliothèque
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="3" y="3" width="7" height="9" rx="1" />
+              <rect x="14" y="3" width="7" height="9" rx="1" />
+              <rect x="3" y="15" width="7" height="6" rx="1" />
+              <rect x="14" y="15" width="7" height="6" rx="1" />
+            </svg>
+            Bibliothèque
           </button>
           <button class="nav-tab" data-target="view-emulator" id="tab-emulator">
-            🎮 Émulateur Live
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="2" y="4" width="20" height="15" rx="2" />
+              <line x1="8" y1="21" x2="16" y2="21" />
+            </svg>
+            Viewport
           </button>
           <button class="nav-tab" data-target="view-netplay" id="tab-netplay">
-            🌐 Salons, Fantômes &amp; Link
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="6" cy="12" r="3" />
+              <circle cx="18" cy="6" r="3" />
+              <circle cx="18" cy="18" r="3" />
+              <line x1="8.7" y1="10.7" x2="15.3" y2="7.3" />
+              <line x1="8.7" y1="13.3" x2="15.3" y2="16.7" />
+            </svg>
+            Réseau &amp; Link
           </button>
           <button class="nav-tab" data-target="view-cores" id="tab-cores">
-            🔬 Cœurs Rust, Mods &amp; BIOS
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="6" y="6" width="12" height="12" rx="1.5" />
+              <path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4" />
+            </svg>
+            Cœurs &amp; BIOS
           </button>
         </nav>
 
         <div class="titlebar-right">
-          <button class="btn mono" id="btn-big-picture" style="padding:3px 10px; font-size:11px;">
-            🛋️ Big Picture : OFF
+          <button class="btn btn-ghost mono" id="btn-big-picture" title="Mode Manette Plein Écran">
+            Big Picture : OFF
           </button>
           <span class="pill-badge pill-green mono" id="sram-pill">
-            <span class="dot-pulse"></span> SRAM Atomique OK
+            <span class="dot-pulse"></span> SRAM OK
           </span>
           <div class="win-controls">
             <button class="win-btn" id="win-min" title="Réduire">─</button>
@@ -45,7 +70,7 @@
         </div>
       </header>
 
-      <!-- Hidden File Inputs for ROM, IPS Patch & Portable Cloud Pack Import -->
+      <!-- Hidden File Inputs -->
       <input
         type="file"
         id="rom-file-input"
@@ -66,62 +91,171 @@
       />
 
       <main class="workspace">
-        <!-- ONGLET 1 : BIBLIOTHÈQUE -->
+        <!-- VUE 1 : BIBLIOTHÈQUE -->
         <section id="view-library" class="view-pane active">
-          <aside class="sidebar-consoles">
-            <div class="sidebar-heading">Consoles</div>
+          <aside class="sidebar-consoles" aria-label="Filtres par console">
+            <div class="sidebar-heading">
+              <span>Systèmes</span>
+              <span>[L / R]</span>
+            </div>
+
             <button class="console-btn active" data-console="ALL">
-              <span>✨ Toutes les ROMs</span>
+              <span class="console-btn-label">
+                <svg class="console-icon" viewBox="0 0 24 24">
+                  <rect x="3" y="3" width="7" height="7" rx="1" />
+                  <rect x="14" y="3" width="7" height="7" rx="1" />
+                  <rect x="3" y="14" width="7" height="7" rx="1" />
+                  <rect x="14" y="14" width="7" height="7" rx="1" />
+                </svg>
+                <span>Catalogue complet</span>
+              </span>
               <span class="console-count mono" id="count-all">0</span>
             </button>
+
             <button class="console-btn" data-console="GBC">
-              <span>🟢 Game Boy / GBC</span>
+              <span class="console-btn-label">
+                <svg class="console-icon" viewBox="0 0 24 24">
+                  <rect x="6" y="2" width="12" height="20" rx="2" />
+                  <rect x="8.5" y="4.5" width="7" height="6" rx="0.5" />
+                  <line x1="9" y1="15" x2="11" y2="15" />
+                  <circle cx="14.5" cy="14.5" r="0.8" />
+                </svg>
+                <span>Game Boy / GBC</span>
+              </span>
               <span class="console-count mono" id="count-gbc">0</span>
             </button>
+
             <button class="console-btn" data-console="GBA">
-              <span>🟣 Game Boy Advance</span>
+              <span class="console-btn-label">
+                <svg class="console-icon" viewBox="0 0 24 24">
+                  <rect x="2" y="6" width="20" height="12" rx="3" />
+                  <rect x="8" y="8.5" width="8" height="7" rx="0.5" />
+                  <line x1="4.5" y1="12" x2="6" y2="12" />
+                  <circle cx="18.5" cy="11.5" r="0.8" />
+                </svg>
+                <span>Game Boy Advance</span>
+              </span>
               <span class="console-count mono" id="count-gba">0</span>
             </button>
+
             <button class="console-btn" data-console="NES">
-              <span>🕹️ NES / Famicom</span>
+              <span class="console-btn-label">
+                <svg class="console-icon" viewBox="0 0 24 24">
+                  <rect x="3" y="7" width="18" height="10" rx="1.5" />
+                  <line x1="7" y1="12" x2="10" y2="12" />
+                  <line x1="8.5" y1="10.5" x2="8.5" y2="13.5" />
+                  <circle cx="15" cy="12.5" r="1" />
+                  <circle cx="17.5" cy="12.5" r="1" />
+                </svg>
+                <span>NES / Famicom</span>
+              </span>
               <span class="console-count mono" id="count-nes">0</span>
             </button>
+
             <button class="console-btn" data-console="SNES">
-              <span>🎮 Super Nintendo</span>
+              <span class="console-btn-label">
+                <svg class="console-icon" viewBox="0 0 24 24">
+                  <rect x="2" y="7" width="20" height="10" rx="5" />
+                  <line x1="6.5" y1="12" x2="9.5" y2="12" />
+                  <line x1="8" y1="10.5" x2="8" y2="13.5" />
+                  <circle cx="16" cy="10.5" r="0.8" />
+                  <circle cx="17.5" cy="12" r="0.8" />
+                </svg>
+                <span>Super Nintendo</span>
+              </span>
               <span class="console-count mono" id="count-snes">0</span>
             </button>
+
             <button class="console-btn" data-console="N64">
-              <span>🦊 Nintendo 64</span>
+              <span class="console-btn-label">
+                <svg class="console-icon" viewBox="0 0 24 24">
+                  <path d="M12 3L4 7.5v9L12 21l8-4.5v-9L12 3z" />
+                  <path d="M12 12l8-4.5M12 12v9M12 12L4 7.5" />
+                </svg>
+                <span>Nintendo 64</span>
+              </span>
               <span class="console-count mono" id="count-n64">0</span>
             </button>
+
             <button class="console-btn" data-console="MEGADRIVE">
-              <span>🦔 Sega Mega Drive</span>
+              <span class="console-btn-label">
+                <svg class="console-icon" viewBox="0 0 24 24">
+                  <rect x="3" y="5" width="18" height="14" rx="2" />
+                  <circle cx="12" cy="12" r="4" />
+                  <line x1="3" y1="9" x2="21" y2="9" />
+                </svg>
+                <span>Sega Mega Drive</span>
+              </span>
               <span class="console-count mono" id="count-megadrive">0</span>
             </button>
+
             <button class="console-btn" data-console="NDS">
-              <span>🖊️ Nintendo DS</span>
+              <span class="console-btn-label">
+                <svg class="console-icon" viewBox="0 0 24 24">
+                  <rect x="5" y="2.5" width="14" height="8.5" rx="1.2" />
+                  <rect x="5" y="13" width="14" height="8.5" rx="1.2" />
+                </svg>
+                <span>Nintendo DS</span>
+              </span>
               <span class="console-count mono" id="count-nds">0</span>
             </button>
+
             <button class="console-btn" data-console="PS1">
-              <span>💿 PlayStation 1</span>
+              <span class="console-btn-label">
+                <svg class="console-icon" viewBox="0 0 24 24">
+                  <circle cx="12" cy="12" r="9" />
+                  <circle cx="12" cy="12" r="2.5" />
+                </svg>
+                <span>PlayStation</span>
+              </span>
               <span class="console-count mono" id="count-ps1">0</span>
             </button>
+
             <button class="console-btn" data-console="PSP">
-              <span>🛸 PlayStation Portable</span>
+              <span class="console-btn-label">
+                <svg class="console-icon" viewBox="0 0 24 24">
+                  <rect x="2" y="6" width="20" height="12" rx="6" />
+                  <rect x="6.5" y="8" width="11" height="8" rx="0.5" />
+                </svg>
+                <span>PlayStation Portable</span>
+              </span>
               <span class="console-count mono" id="count-psp">0</span>
             </button>
+
             <button class="console-btn" data-console="CHIP8">
-              <span>🦀 CHIP-8 Homebrew</span>
+              <span class="console-btn-label">
+                <svg class="console-icon" viewBox="0 0 24 24">
+                  <rect x="4" y="4" width="16" height="16" rx="1.5" />
+                  <path d="M8 9h3v6H8zM13 9h3v6h-3z" />
+                </svg>
+                <span>CHIP-8</span>
+              </span>
               <span class="console-count mono" id="count-chip8">0</span>
             </button>
 
-            <div class="sidebar-heading" style="margin-top: 12px;">Filtres Moteur</div>
+            <div class="sidebar-heading" style="margin-top: 14px;">
+              <span>Architecture</span>
+            </div>
+
             <button class="console-btn" data-console="RUST_ONLY">
-              <span>🦀 Cœurs 100% Rust</span>
+              <span class="console-btn-label">
+                <svg class="console-icon" viewBox="0 0 24 24">
+                  <rect x="6" y="6" width="12" height="12" rx="1.5" />
+                  <path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3" />
+                </svg>
+                <span>Cœurs Natifs Rust</span>
+              </span>
               <span class="console-count mono" id="count-rust">0</span>
             </button>
+
             <button class="console-btn" data-console="LINK_READY">
-              <span>🔗 Câble Link 2P/4P</span>
+              <span class="console-btn-label">
+                <svg class="console-icon" viewBox="0 0 24 24">
+                  <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+                  <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+                </svg>
+                <span>Bus Link 2P / 4P</span>
+              </span>
               <span class="console-count mono" id="count-link">0</span>
             </button>
           </aside>
@@ -129,155 +263,197 @@
           <div class="library-center">
             <div class="library-toolbar">
               <div class="search-box">
-                <span>🔍</span>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="11" cy="11" r="7" />
+                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                </svg>
                 <input
                   type="text"
                   id="search-input"
                   class="search-input"
-                  placeholder="Rechercher un titre, console, région ou CRC32 (ou glissez une ROM ici)..."
+                  placeholder="Filtrer par titre, système, région ou empreinte CRC32..."
                 />
+                <span class="kbd-hint">/</span>
               </div>
+
               <div class="toolbar-actions">
-                <button class="btn" id="btn-import-rom">📂 Importer ROM</button>
-                <button class="btn" id="btn-import-ips">🧩 Patcher .IPS</button>
-                <button class="btn" id="btn-export-pack" title="Exporter SRAM + SaveStates + Macros + Cheats (.zaimule-pack)">☁️ Export Pack</button>
-                <button class="btn" id="btn-import-pack" title="Importer une archive portable .zaimule-pack">📥 Import Pack</button>
-                <button class="btn btn-gold" id="btn-launch-selected">▶ Lancer l'Émulation</button>
+                <button class="btn" id="btn-import-rom">
+                  <svg viewBox="0 0 24 24">
+                    <path d="M12 5v14M5 12h14" />
+                  </svg>
+                  Importer ROM
+                </button>
+                <button class="btn btn-ghost" id="btn-import-ips">Patch .IPS</button>
+                <button class="btn btn-ghost" id="btn-export-pack" title="Exporter l'archive portable .zaimule-pack">
+                  Exporter Pack
+                </button>
+                <button class="btn btn-ghost" id="btn-import-pack" title="Importer une archive .zaimule-pack">
+                  Importer Pack
+                </button>
+                <div class="toolbar-divider"></div>
+                <button class="btn" id="btn-toggle-inspector" title="Afficher/Masquer l'inspecteur [Y]">
+                  <span>Options</span>
+                  <span class="kbd-hint">Y</span>
+                </button>
+                <button class="btn btn-primary" id="btn-launch-selected">
+                  <span>Lancer</span>
+                  <span class="kbd-hint">A</span>
+                </button>
               </div>
             </div>
 
-            <div class="games-grid" id="games-grid"></div>
+            <div class="games-grid" id="games-grid" role="list"></div>
           </div>
 
-          <aside class="inspector-panel">
+          <aside class="inspector-panel" id="inspector-drawer" aria-label="Fiche technique">
             <div class="inspector-header">
-              <div class="inspector-title" id="insp-title">—</div>
-              <div class="inspector-sub">
-                <span class="pill-badge pill-gold mono" id="insp-console">GBC</span>
-                <span class="pill-badge pill-cobalt mono" id="insp-core">zaimule-rust-gb</span>
-                <span class="pill-badge pill-green mono" id="insp-region">EUR</span>
+              <div class="inspector-eyebrow">
+                <span>Fiche Technique</span>
+                <span id="insp-crc-top" class="mono">CRC32</span>
               </div>
-              <button class="btn btn-gold" style="width: 100%; justify-content: center;" id="btn-insp-play">
-                ▶ Jouer dans le Viewport 60 FPS
+              <div class="inspector-title" id="insp-title">Aucune ROM sélectionnée</div>
+              <div class="inspector-sub">
+                <span class="pill-badge pill-cobalt mono" id="insp-console">—</span>
+                <span class="pill-badge mono" id="insp-core">—</span>
+                <span class="pill-badge pill-green mono" id="insp-region">—</span>
+              </div>
+              <button class="btn btn-primary" style="width: 100%; justify-content: center;" id="btn-insp-play">
+                <span>Lancer dans le Viewport 60 Hz</span>
+                <span class="kbd-hint">A</span>
               </button>
             </div>
 
-            <div class="inspector-section">
-              <div class="section-title">
-                <span>🔐 Intégrité &amp; Batterie SRAM</span>
-                <span class="mono" style="color: var(--phosphor-green);" id="sram-crc-badge">✓ .tmp → .srm</span>
+            <div class="inspector-tabs" role="tablist">
+              <button class="inspector-tab-btn active" data-insp-tab="insp-pane-hw">Matériel</button>
+              <button class="inspector-tab-btn" data-insp-tab="insp-pane-mods">Patchs &amp; RAM</button>
+              <button class="inspector-tab-btn" data-insp-tab="insp-pane-states">États &amp; Succès</button>
+            </div>
+
+            <!-- SOUS-ONGLET 1 : MATÉRIEL & SRAM -->
+            <div class="inspector-tab-pane active" id="insp-pane-hw">
+              <div class="inspector-section">
+                <div class="section-title">
+                  <span>Intégrité &amp; Batterie SRAM</span>
+                  <span class="mono" style="color: var(--status-ok);" id="sram-crc-badge">CRC —</span>
+                </div>
+                <div class="kv-row">
+                  <span class="kv-label">Empreinte CRC32</span>
+                  <span class="kv-val mono" id="insp-crc">—</span>
+                </div>
+                <div class="kv-row">
+                  <span class="kv-label">Support Sauvegarde</span>
+                  <span class="kv-val mono" id="insp-sram">—</span>
+                </div>
+                <div class="kv-row">
+                  <span class="kv-label">Durée de session</span>
+                  <span class="kv-val mono" id="insp-playtime">—</span>
+                </div>
+                <div id="sram-hex-dump" class="hex-dump-box mono"></div>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:10px;">
+                  <button class="btn mono" id="btn-sram-boost" style="font-size:11px; justify-content:center;" title="Écrire 0xFF en SRAM et recalculer le CRC32 atomique">
+                    Boost Octet SRAM
+                  </button>
+                  <button class="btn mono" id="btn-sram-transfer" style="font-size:11px; justify-content:center;" title="Cloner la sauvegarde Batterie / Carte Mémoire J1 vers J2">
+                    Cloner J1 → J2
+                  </button>
+                </div>
               </div>
-              <div class="kv-row">
-                <span class="kv-label">Empreinte CRC32</span>
-                <span class="kv-val mono" id="insp-crc">—</span>
-              </div>
-              <div class="kv-row">
-                <span class="kv-label">Sauvegarde Batterie</span>
-                <span class="kv-val mono" id="insp-sram">—</span>
-              </div>
-              <div class="kv-row">
-                <span class="kv-label">Temps de jeu</span>
-                <span class="kv-val mono" id="insp-playtime">—</span>
-              </div>
-              <div id="sram-hex-dump" class="mono" style="margin-top:6px; padding:5px 7px; background:var(--bg-obsidian); border:1px solid var(--border-subtle); border-radius:4px; font-size:9.5px; color:var(--cobalt); max-height:58px; overflow-y:auto;"></div>
-              <div style="display:grid; grid-template-columns:1fr 1fr; gap:5px; margin-top:6px;">
-                <button class="btn mono" id="btn-sram-boost" style="font-size:10px; justify-content:center;" title="Écrire 0xFF en SRAM et recalculer le CRC32 atomique">
-                  ✏️ Boost Octet SRAM
-                </button>
-                <button class="btn mono" id="btn-sram-transfer" style="font-size:10px; justify-content:center; border-color:var(--gold); color:var(--gold);" title="Cloner la sauvegarde Batterie / Carte Mémoire J1 vers J2">
-                  🔄 Échange J1 ➔ J2
-                </button>
+
+              <div class="inspector-section">
+                <div class="section-title">
+                  <span>Cadence CPU &amp; Géométrie PGXP</span>
+                  <span class="mono" style="color: var(--accent-primary);" id="insp-overclock-badge">100% · PGXP ON</span>
+                </div>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
+                  <button class="btn mono" id="btn-overclock-cycle" style="font-size:11px; justify-content:center;">
+                    CPU : 100% Natif
+                  </button>
+                  <button class="btn mono" id="btn-pgxp-toggle" style="font-size:11px; justify-content:center;">
+                    PGXP 3D : ON
+                  </button>
+                </div>
               </div>
             </div>
 
-            <div class="inspector-section">
-              <div class="section-title">
-                <span>⚡ Profils Matériels &amp; PGXP (Yuzu)</span>
-                <span class="mono" style="color: var(--gold);" id="insp-overclock-badge">100% · PGXP ON</span>
+            <!-- SOUS-ONGLET 2 : PATCHS .IPS & CODES RAM -->
+            <div class="inspector-tab-pane" id="insp-pane-mods">
+              <div class="inspector-section">
+                <div class="section-title">
+                  <span>Couches .IPS</span>
+                  <span style="display:flex; gap:4px;">
+                    <button class="btn mono" id="btn-insp-ips" style="padding:2px 8px; font-size:10px;">+ .IPS</button>
+                    <button class="btn mono" id="btn-export-ips" style="padding:2px 8px; font-size:10px;" title="Exporter un patch .IPS binaire par diff ROM">Diff .IPS</button>
+                  </span>
+                </div>
+                <div id="mods-list"></div>
               </div>
-              <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
-                <button class="btn mono" id="btn-overclock-cycle" style="font-size:10.5px; justify-content:center;">
-                  ⚡ CPU : 100% Natif
-                </button>
-                <button class="btn mono" id="btn-pgxp-toggle" style="font-size:10.5px; justify-content:center; border-color:var(--phosphor-green); color:var(--phosphor-green);">
-                  📐 PGXP 3D : ON
-                </button>
+
+              <div class="inspector-section">
+                <div class="section-title">
+                  <span>Codes RAM / GameShark</span>
+                </div>
+                <div style="display:flex; gap:6px; margin-bottom:8px;">
+                  <input
+                    type="text"
+                    id="cheat-input"
+                    class="field-inline mono"
+                    placeholder="Ex: 016404A0 ou C104:01"
+                    style="flex:1;"
+                  />
+                  <button class="btn mono" id="btn-add-cheat" style="padding:4px 10px;">Ajouter</button>
+                </div>
+                <div id="cheats-list"></div>
               </div>
             </div>
 
-            <div class="inspector-section">
-              <div class="section-title">
-                <span>🧩 Mods &amp; Créateur .IPS (Yuzu)</span>
-                <span style="display:flex; gap:4px;">
-                  <button class="btn mono" id="btn-insp-ips" style="padding:2px 6px; font-size:10px;">+ .IPS</button>
-                  <button class="btn mono" id="btn-export-ips" style="padding:2px 6px; font-size:10px;" title="Générer et exporter un patch .IPS binaire par diff ROM">📤 Créer .IPS</button>
-                </span>
+            <!-- SOUS-ONGLET 3 : SAVE STATES & SUCCÈS -->
+            <div class="inspector-tab-pane" id="insp-pane-states">
+              <div class="inspector-section">
+                <div class="section-title">
+                  <span>Save States Atomiques (.zst)</span>
+                  <span class="mono">F5 / F8</span>
+                </div>
+                <div class="savestate-slots" id="savestate-slots"></div>
               </div>
-              <div id="mods-list"></div>
-            </div>
 
-            <div class="inspector-section">
-              <div class="section-title">
-                <span>🦈 Codes GameShark &amp; Scanner RAM</span>
+              <div class="inspector-section">
+                <div class="section-title">
+                  <span>Succès Déterministes</span>
+                </div>
+                <div id="achievements-list"></div>
               </div>
-              <div style="display:flex; gap:4px; margin-bottom:6px;">
-                <input
-                  type="text"
-                  id="cheat-input"
-                  class="search-input mono"
-                  placeholder="Ex: 016404A0 ou C104:01"
-                  style="background:var(--bg-elevated); padding:4px 8px; border-radius:4px; border:1px solid var(--border-subtle); font-size:11px;"
-                />
-                <button class="btn mono" id="btn-add-cheat" style="padding:4px 8px;">+ Code</button>
-              </div>
-              <div id="cheats-list"></div>
-            </div>
-
-            <div class="inspector-section">
-              <div class="section-title">
-                <span>🏆 Succès Rétro (RetroAchievements)</span>
-              </div>
-              <div id="achievements-list"></div>
-            </div>
-
-            <div class="inspector-section">
-              <div class="section-title">
-                <span>💾 Save States Atomiques (.zst)</span>
-                <span class="mono">F5 / F8</span>
-              </div>
-              <div class="savestate-slots" id="savestate-slots"></div>
             </div>
           </aside>
         </section>
 
-        <!-- ONGLET 2 : VIEWPORT ÉMULATEUR LIVE -->
+        <!-- VUE 2 : VIEWPORT ÉMULATEUR LIVE -->
         <section id="view-emulator" class="view-pane">
           <div class="emu-layout">
             <div class="emu-stage">
               <div class="emu-topbar">
                 <div style="display:flex; align-items:center; gap:8px;">
-                  <span class="pill-badge pill-gold mono" id="active-emu-game">GBC · Pocket Monster Link Arena</span>
+                  <span class="pill-badge pill-cobalt mono" id="active-emu-game">Aucune ROM active</span>
                   <span class="pill-badge pill-green mono" id="link-status-pill">Mode 1P Solo</span>
-                  <span class="pill-badge pill-cobalt mono" id="emu-score-pill">🏆 Score : 0</span>
+                  <span class="pill-badge mono" id="emu-score-pill">Score : 0</span>
                 </div>
 
                 <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-                  <button class="btn" id="btn-audio-toggle">🔊 Audio APU : ON</button>
-                  <button class="btn" id="btn-record-video">🎥 Clip .WebM</button>
-                  <button class="btn" id="btn-upscaler-cycle">✨ Upscaler : Natif 1x</button>
-                  <button class="btn" id="btn-shader-cycle">📺 Shader : CRT Scanlines</button>
-                  <button class="btn" id="btn-toggle-keymapper">🎯 Keymapper : OFF</button>
-                  <button class="btn" id="btn-toggle-dual">🔗 Link 2P : OFF</button>
-                  <button class="btn" id="btn-toggle-quad">🏆 Tournoi 4P : OFF</button>
-                  <button class="btn" id="btn-speed-cycle">⚡ Vitesse : 1.0x</button>
+                  <button class="btn" id="btn-audio-toggle">Audio APU : ON</button>
+                  <button class="btn" id="btn-record-video">Clip .WebM</button>
+                  <button class="btn" id="btn-upscaler-cycle">Upscaler : Natif 1x</button>
+                  <button class="btn" id="btn-shader-cycle">Shader : CRT Scanlines</button>
+                  <button class="btn" id="btn-toggle-keymapper">Keymapper : OFF</button>
+                  <button class="btn" id="btn-toggle-dual">Link 2P : OFF</button>
+                  <button class="btn" id="btn-toggle-quad">Tournoi 4P : OFF</button>
+                  <button class="btn" id="btn-speed-cycle">Vitesse : 1.0x</button>
                 </div>
               </div>
 
               <div class="emu-screens-wrap" id="screens-wrap">
                 <div class="crt-bezel">
                   <div class="bezel-header">
-                    <span class="mono">INSTANCE #1 (J1 · ZQSD / FLÈCHES + J/K / STYLET NDS)</span>
-                    <span class="mono" style="color:var(--phosphor-green);" id="p1-reg-readout">PC:0x0150</span>
+                    <span class="mono">UNITÉ #1 (J1 · ZQSD / FLÈCHES + J/K / STYLET NDS)</span>
+                    <span class="mono" style="color:var(--status-ok);" id="p1-reg-readout">En veille</span>
                   </div>
                   <div class="screen-container mode-crt" id="screen-1">
                     <canvas id="canvas-p1" class="game-canvas" width="160" height="144"></canvas>
@@ -289,8 +465,8 @@
 
                 <div class="crt-bezel" id="bezel-p2" style="display: none;">
                   <div class="bezel-header">
-                    <span class="mono">INSTANCE #2 (CÂBLE LINK P2 · SIO 0xFF01)</span>
-                    <span class="mono" style="color:var(--gold);" id="p2-link-readout">SYNC 256 Kbps</span>
+                    <span class="mono">UNITÉ #2 (BUS LINK P2 · SIO 0xFF01)</span>
+                    <span class="mono" style="color:var(--accent-primary);" id="p2-link-readout">SYNC 256 Kbps</span>
                   </div>
                   <div class="screen-container mode-crt" id="screen-2">
                     <canvas id="canvas-p2" class="game-canvas" width="160" height="144"></canvas>
@@ -301,8 +477,8 @@
 
                 <div class="crt-bezel" id="bezel-p3" style="display: none;">
                   <div class="bezel-header">
-                    <span class="mono">INSTANCE #3 (TOURNOI 4P · PORT MULTI-SIO #3)</span>
-                    <span class="mono" style="color:var(--cobalt);">RING P2➔P3</span>
+                    <span class="mono">UNITÉ #3 (MULTI-SIO #3)</span>
+                    <span class="mono" style="color:var(--accent-primary);">RING P2→P3</span>
                   </div>
                   <div class="screen-container mode-crt" id="screen-3">
                     <canvas id="canvas-p3" class="game-canvas" width="160" height="144"></canvas>
@@ -313,8 +489,8 @@
 
                 <div class="crt-bezel" id="bezel-p4" style="display: none;">
                   <div class="bezel-header">
-                    <span class="mono">INSTANCE #4 (TOURNOI 4P · PORT MULTI-SIO #4)</span>
-                    <span class="mono" style="color:var(--phosphor-green);">RING P4➔P1</span>
+                    <span class="mono">UNITÉ #4 (MULTI-SIO #4)</span>
+                    <span class="mono" style="color:var(--status-ok);">RING P4→P1</span>
                   </div>
                   <div class="screen-container mode-crt" id="screen-4">
                     <canvas id="canvas-p4" class="game-canvas" width="160" height="144"></canvas>
@@ -325,11 +501,11 @@
               </div>
 
               <div class="rewind-bar">
-                <button class="btn" id="btn-rewind-step">⏪ Rembobiner (Backspace)</button>
-                <span class="mono" style="font-size:11px; color:var(--text-muted);" id="rewind-info">
-                  Tampon Rewind 60s Actif · Tir Plasma [J/Espace] · Stylet Tactile NDS sur Écran Bas
+                <button class="btn" id="btn-rewind-step">Rembobiner (Backspace)</button>
+                <span class="mono" style="font-size:11px; color:var(--text-secondary);" id="rewind-info">
+                  Tampon Rewind 60s · Action [J / Espace] · Stylet Tactile NDS
                 </span>
-                <span class="mono" id="rewind-readout" style="margin-left:auto; color:var(--gold);">
+                <span class="mono" id="rewind-readout" style="margin-left:auto; color:var(--accent-primary);">
                   Frame #0
                 </span>
               </div>
@@ -338,89 +514,86 @@
             <aside class="bluestacks-dock">
               <div class="dock-card">
                 <div class="section-title">
-                  <span>🎯 Visual Keymapper</span>
-                  <span class="mono">Glisser-Déposer</span>
+                  <span>Keymapper Tactile</span>
+                  <span class="mono">20 Hz</span>
                 </div>
-                <p style="font-size:11.5px; color:var(--text-muted); margin-bottom:10px;">
-                  Activez l'overlay puis glissez les badges sur l'écran pour repositionner vos touches et le Turbo 20 Hz.
-                </p>
                 <button class="btn" style="width:100%; justify-content:center;" id="btn-dock-keymapper">
-                  Afficher / Éditer Keymapper
+                  Éditer la disposition
                 </button>
               </div>
 
               <div class="dock-card">
                 <div class="section-title">
-                  <span>🤖 Macros TAS &amp; Timeline Studio</span>
+                  <span>Séquenceur TAS</span>
                   <span class="mono" id="macro-status">PRÊT</span>
                 </div>
                 <div style="margin-bottom:8px;">
                   <button class="btn" style="width:100%; justify-content:center;" id="btn-record-macro">
-                    ● Enregistrer Macro Live
+                    Enregistrer Séquence Live
                   </button>
                 </div>
                 <div id="macros-list"></div>
-                <div id="tas-timeline-list" class="mono" style="margin-top:6px; border-top:1px solid var(--border-subtle); padding-top:6px;"></div>
+                <div id="tas-timeline-list" class="mono" style="margin-top:6px;"></div>
               </div>
 
               <div class="dock-card">
                 <div class="section-title">
-                  <span>💾 Clichés d'État Rapides</span>
+                  <span>Clichés Rapides</span>
                   <span class="mono">RLE + CRC32</span>
                 </div>
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
-                  <button class="btn" id="btn-quick-save">📥 Sauver (F5)</button>
-                  <button class="btn" id="btn-quick-load">📤 Charger (F8)</button>
+                  <button class="btn" id="btn-quick-save">Sauver (F5)</button>
+                  <button class="btn" id="btn-quick-load">Charger (F8)</button>
                 </div>
-                <div id="save-toast" class="mono" style="margin-top:8px; font-size:11px; color:var(--phosphor-green);">
-                  ✓ Slot #1 prêt (.zst)
+                <div id="save-toast" class="mono" style="margin-top:8px; font-size:11px; color:var(--status-ok);">
+                  Aucune ROM chargée
                 </div>
               </div>
 
               <div class="dock-card">
                 <div class="section-title">
-                  <span>🔬 Registres CPU, APU &amp; Watchpoints</span>
-                  <button class="btn mono" id="btn-add-watchpoint" style="padding:2px 6px; font-size:10px;" title="Épingler l'adresse RAM saisie dans les Watchpoints">+ Pin RAM</button>
+                  <span>Registres CPU &amp; APU</span>
+                  <button class="btn mono" id="btn-add-watchpoint" style="padding:2px 6px; font-size:10px;" title="Épingler l'adresse RAM">+ Pin RAM</button>
                 </div>
-                <div class="kv-row mono"><span class="kv-label">PC / SP</span><span id="dbg-pc-sp">0x0150 / 0xFFFE</span></div>
-                <div class="kv-row mono"><span class="kv-label">AF / BC</span><span id="dbg-af-bc">0x11B0 / 0x0013</span></div>
-                <div class="kv-row mono"><span class="kv-label">DE / HL</span><span id="dbg-de-hl">0x00D8 / 0x014D</span></div>
-                <div class="kv-row mono"><span class="kv-label">SIO / APU</span><span id="dbg-sio">0x00 / 0 Hz</span></div>
+                <div class="kv-row mono"><span class="kv-label">PC / SP</span><span id="dbg-pc-sp">— / —</span></div>
+                <div class="kv-row mono"><span class="kv-label">AF / BC</span><span id="dbg-af-bc">— / —</span></div>
+                <div class="kv-row mono"><span class="kv-label">DE / HL</span><span id="dbg-de-hl">— / —</span></div>
+                <div class="kv-row mono"><span class="kv-label">SIO / APU</span><span id="dbg-sio">— / —</span></div>
                 <canvas
                   id="audio-oscilloscope-canvas"
                   width="240"
                   height="38"
-                  style="width:100%; height:38px; background:#070a0f; border-radius:4px; border:1px solid var(--border-subtle); margin-top:6px;"
+                  style="width:100%; height:38px; background:var(--bg-inset); border-radius:3px; border:1px solid var(--border-subtle); margin-top:8px;"
                 ></canvas>
-                <div style="display:flex; gap:4px; margin-top:6px;">
+                <div style="display:flex; gap:4px; margin-top:8px;">
                   <input
                     type="text"
                     id="ram-scan-input"
-                    class="search-input mono"
+                    class="field-inline mono"
                     placeholder="Octet ou 0xC110=7F"
-                    style="background:var(--bg-elevated); padding:3px 6px; border-radius:4px; border:1px solid var(--border-subtle); font-size:11px;"
+                    style="flex:1;"
                   />
-                  <button class="btn mono" id="btn-scan-ram" style="padding:3px 8px; font-size:11px;">🔍 Scan</button>
+                  <button class="btn mono" id="btn-scan-ram" style="padding:3px 8px; font-size:11px;">Scan</button>
                 </div>
-                <div id="ram-scan-results" class="mono" style="margin-top:4px; font-size:10px; color:var(--cobalt);"></div>
-                <div id="watchpoints-list" class="mono" style="margin-top:6px; border-top:1px solid var(--border-subtle); padding-top:6px;"></div>
+                <div id="ram-scan-results" class="mono" style="margin-top:4px; font-size:10px; color:var(--accent-primary);"></div>
+                <div id="watchpoints-list" class="mono" style="margin-top:6px;"></div>
               </div>
 
               <div class="dock-card">
                 <div class="section-title">
-                  <span>🎨 ROM Hacking Studio (VRAM 2bpp)</span>
-                  <button class="btn mono" id="btn-vram-color" style="padding:2px 6px; font-size:10px;" title="Changer de couleur 2bpp pour peindre dans l'Atlas VRAM">🎨 #3 Or</button>
+                  <span>Atlas VRAM 2bpp</span>
+                  <button class="btn mono" id="btn-vram-color" style="padding:2px 6px; font-size:10px;">#3 Pigment</button>
                 </div>
                 <canvas
                   id="vram-atlas-canvas"
                   width="128"
                   height="64"
-                  title="Cliquer pour peindre un pixel 2bpp en VRAM temps réel"
-                  style="width:100%; height:72px; background:#090c10; border-radius:4px; border:1px solid var(--border-subtle); image-rendering:pixelated; margin-bottom:6px; cursor:crosshair;"
+                  title="Cliquer pour éditer un pixel 2bpp en VRAM"
+                  style="width:100%; height:72px; background:var(--bg-inset); border-radius:3px; border:1px solid var(--border-subtle); image-rendering:pixelated; margin-bottom:6px; cursor:crosshair;"
                 ></canvas>
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-bottom:6px;">
-                  <button class="btn mono" id="btn-dbg-pause" style="font-size:11px; justify-content:center;">⏸ Pause CPU</button>
-                  <button class="btn mono" id="btn-dbg-step" style="font-size:11px; justify-content:center;">⏭ Step Into</button>
+                  <button class="btn mono" id="btn-dbg-pause" style="font-size:11px; justify-content:center;">Pause CPU</button>
+                  <button class="btn mono" id="btn-dbg-step" style="font-size:11px; justify-content:center;">Step Into</button>
                 </div>
                 <div id="disasm-list" class="mono" style="max-height:130px; overflow-y:auto;"></div>
               </div>
@@ -428,74 +601,85 @@
           </div>
         </section>
 
-        <!-- ONGLET 3 : SALONS NETPLAY, CLASSEMENTS FANTÔMES & CÂBLE LINK -->
+        <!-- VUE 3 : SALONS NETPLAY, FANTÔMES & CÂBLE LINK -->
         <section id="view-netplay" class="view-pane" style="flex-direction:column; width:100%;">
-          <div style="padding:14px 20px; border-bottom:1px solid var(--border-subtle); display:flex; align-items:center; gap:10px; flex-wrap:wrap; background:var(--bg-panel);">
-            <span class="pill-badge pill-green mono" id="udp-port-badge">UDP ZML2 Socket : Actif</span>
-            <span class="pill-badge pill-cobalt mono" id="stun-endpoint-badge">STUN Hole-Punch : 198.51.100.42:54920</span>
+          <div class="subbar-strip">
+            <span class="pill-badge pill-green mono" id="udp-port-badge">UDP ZML2 : En attente</span>
+            <span class="pill-badge pill-cobalt mono" id="stun-endpoint-badge">STUN : En attente</span>
             <input
               type="text"
               id="deeplink-input"
-              class="search-input mono"
-              placeholder="Coller un lien zaimule://room/PKMN-LINK-01?crc=DCE0682B..."
-              style="max-width:300px; background:var(--bg-elevated); padding:6px 10px; border-radius:6px; border:1px solid var(--border-subtle);"
+              class="field-inline mono"
+              placeholder="zaimule://room/CODE?crc=..."
+              style="width:280px;"
             />
-            <button class="btn" id="btn-join-deeplink">🔗 Rejoindre Deep-Link</button>
-            <button class="btn" id="btn-toggle-spectator">👁️ Mode Spectateur : OFF</button>
-            <button class="btn" id="btn-submit-ghost" style="border-color:var(--cobalt); color:var(--cobalt);">👻 Publier Record &amp; Fantôme TAS</button>
-            <button class="btn btn-gold" id="btn-create-room">+ Créer Salon P2P &amp; Câble Link</button>
+            <button class="btn" id="btn-join-deeplink">Rejoindre Deep-Link</button>
+            <button class="btn" id="btn-toggle-spectator">Spectateur : OFF</button>
+            <button class="btn" id="btn-submit-ghost">Publier Trace TAS</button>
+            <button class="btn btn-primary" id="btn-create-room">+ Créer Salon P2P</button>
           </div>
-          <div style="padding:10px 20px; border-bottom:1px solid var(--border-subtle); display:flex; align-items:center; gap:8px; background:var(--bg-obsidian);">
-            <span class="mono" style="font-size:11px; color:var(--gold);">💬 Chat Salon &amp; SaveState :</span>
+          <div class="subbar-strip inset">
+            <span class="mono" style="font-size:11px; color:var(--text-secondary);">Canal P2P :</span>
             <input
               type="text"
               id="netplay-chat-input"
-              class="search-input mono"
-              placeholder="Envoyer un message ou partager un défi dans le salon P2P..."
-              style="max-width:380px; background:var(--bg-elevated); padding:5px 10px; border-radius:6px; border:1px solid var(--border-subtle); font-size:11.5px;"
+              class="field-inline mono"
+              placeholder="Message ou partage d'état dans le salon..."
+              style="width:340px;"
             />
-            <button class="btn mono" id="btn-send-chat" style="font-size:11px;">📤 Envoyer</button>
-            <button class="btn mono" id="btn-share-state-chat" style="font-size:11px; border-color:var(--gold); color:var(--gold);">💾 Partager Save State Slot #1</button>
+            <button class="btn mono" id="btn-send-chat" style="font-size:11px;">Envoyer</button>
+            <button class="btn mono" id="btn-share-state-chat" style="font-size:11px;">Partager Slot #1</button>
           </div>
-          <div id="netplay-chat-list" style="padding:8px 20px; max-height:110px; overflow-y:auto; border-bottom:1px solid var(--border-subtle); background:rgba(13,17,23,0.75);"></div>
+          <div id="netplay-chat-list" style="padding:8px 24px; max-height:100px; overflow-y:auto; border-bottom:1px solid var(--border-subtle); background:var(--bg-canvas);"></div>
           <div class="page-grid" id="netplay-grid" style="flex:1;"></div>
         </section>
 
-        <!-- ONGLET 4 : CŒURS RUST, HUB MODS .IPS & BIOS -->
+        <!-- VUE 4 : CŒURS RUST, MODS .IPS & BIOS -->
         <section id="view-cores" class="view-pane">
           <div class="page-grid" id="cores-grid"></div>
         </section>
       </main>
 
+      <!-- BARRE CONTEXTUELLE HYBRIDE (MANETTE + TÉLÉMÉTRIE) -->
       <footer class="telemetry-bar mono">
-        <div class="telemetry-group">
-          <div class="telemetry-item">
-            <span class="dot-pulse" style="color:var(--phosphor-green);"></span>
-            <span>MOTEUR :</span>
-            <span class="telemetry-val" id="tel-core">zaimule-rust-gb</span>
-          </div>
-          <div class="telemetry-item">
-            <span>CADENCE :</span>
-            <span class="telemetry-val" id="tel-fps" style="color:var(--phosphor-green);">60.0 FPS</span>
-          </div>
-          <div class="telemetry-item">
-            <span>FRAME TIME :</span>
-            <span class="telemetry-val" id="tel-ft" style="color:var(--cobalt);">16.6 ms</span>
-          </div>
+        <div class="controller-prompts" aria-label="Commandes contextuelles">
+          <button class="prompt-item" id="prompt-launch" title="Lancer le jeu sélectionné">
+            <span class="prompt-key primary">A</span>
+            <span>Lancer</span>
+          </button>
+          <button class="prompt-item" id="prompt-options" title="Afficher ou masquer la fiche technique">
+            <span class="prompt-key">Y</span>
+            <span>Options</span>
+          </button>
+          <button class="prompt-item" id="prompt-console-cycle" title="Parcourir les systèmes">
+            <span class="prompt-key">L/R</span>
+            <span>Console</span>
+          </button>
+          <button class="prompt-item" id="prompt-savestate" title="Sauvegarde rapide F5 / Chargement F8">
+            <span class="prompt-key">F5</span>
+            <span>État</span>
+          </button>
         </div>
 
         <div class="telemetry-group">
           <div class="telemetry-item">
-            <span>MANETTE :</span>
-            <span class="telemetry-val" id="tel-pad">Clavier + Gamepad Prêt</span>
+            <span class="dot-pulse" style="color:var(--status-ok);"></span>
+            <span class="telemetry-val" id="tel-core">En veille</span>
           </div>
           <div class="telemetry-item">
-            <span>LINK BUS :</span>
-            <span class="telemetry-val" id="tel-link">Solo (0 pkt)</span>
+            <span class="telemetry-val ok" id="tel-fps">— FPS</span>
           </div>
           <div class="telemetry-item">
-            <span>REWIND RAM :</span>
-            <span class="telemetry-val" id="tel-rewind" style="color:var(--gold);">0 clichés</span>
+            <span class="telemetry-val" id="tel-ft">— ms</span>
+          </div>
+          <div class="telemetry-item">
+            <span class="telemetry-val" id="tel-link">Solo</span>
+          </div>
+          <div class="telemetry-item">
+            <span class="telemetry-val" id="tel-rewind">0 clichés</span>
+          </div>
+          <div class="telemetry-item">
+            <span class="telemetry-val" id="tel-pad">Clavier + Gamepad</span>
           </div>
         </div>
       </footer>

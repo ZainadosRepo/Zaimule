@@ -65,12 +65,18 @@ fn core_binary_path(app: &AppHandle, core_id: &str) -> Result<PathBuf, String> {
 }
 
 fn flush_sram_best_effort(app: &AppHandle, session: &EmulatorSession) {
+    if session.active_game_id.is_empty() {
+        return;
+    }
     if let Ok(path) = sram_path(app, &session.active_game_id) {
         let _ = save_sram_with_rotation(&path, session.active_sram_bytes());
     }
 }
 
 fn preload_disk_assets_for_game(app: &AppHandle, session: &mut EmulatorSession, game_id: &str) {
+    if game_id.is_empty() {
+        return;
+    }
     if let Ok(path) = sram_path(app, game_id) {
         if let Ok(Some(sram)) = load_sram_bytes(&path) {
             session.load_active_sram(&sram);
@@ -267,7 +273,10 @@ fn step_viewport(
         let out = session.step_viewport(buttons_p1, buttons_p2, turbo_active);
 
         let last_flush = state.last_sram_flush_ms.load(Ordering::Relaxed);
-        if now.saturating_sub(last_flush) >= LIVE_SRAM_FLUSH_INTERVAL_MS && session.sram_dirty {
+        if !session.active_game_id.is_empty()
+            && now.saturating_sub(last_flush) >= LIVE_SRAM_FLUSH_INTERVAL_MS
+            && session.sram_dirty
+        {
             session.sram_dirty = false;
             state.last_sram_flush_ms.store(now, Ordering::Relaxed);
             sram_to_flush = Some((
@@ -689,7 +698,7 @@ fn save_settings(app: AppHandle, settings: Value) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let session = Arc::new(Mutex::new(EmulatorSession::new()));
+    let session = Arc::new(Mutex::new(EmulatorSession::new_clean()));
     let session_for_setup = Arc::clone(&session);
 
     tauri::Builder::default()

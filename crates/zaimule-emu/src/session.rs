@@ -198,6 +198,51 @@ fn build_core_for(console: ConsoleKind, rom: &[u8]) -> Result<Box<dyn EmulatorBa
 }
 
 impl EmulatorSession {
+    /// Creates a clean production session with zero pre-populated test games or mock data.
+    pub fn new_clean() -> Self {
+        Self {
+            settings: GlobalSettings::default(),
+            catalog: Vec::new(),
+            active_game_id: String::new(),
+            mod_layers: Vec::new(),
+            community_mods: Vec::new(),
+            cheat_codes: Vec::new(),
+            memory_watchpoints: Vec::new(),
+            achievements: Vec::new(),
+            keymapper_widgets: default_keymapper_widgets(),
+            macros: Vec::new(),
+            ghost_leaderboard: Vec::new(),
+            active_macro_id: None,
+            macro_start_frame: 0,
+            netplay_rooms: Vec::new(),
+            netplay_chat: Vec::new(),
+            tournament_bracket: TournamentBracket {
+                id: "tourney-live".into(),
+                title: "Tournoi Multi-SIO".into(),
+                console: String::new(),
+                game_title: String::new(),
+                matches: Vec::new(),
+                champion: None,
+                spectator_mode_active: false,
+            },
+            udp_node: UdpNetplayNode::bind_ephemeral(),
+            libretro_cores: default_libretro_cores(),
+            link_telemetry: LinkCableTelemetry::default(),
+            rewind_buffer: RewindBuffer::new(240),
+            save_states_ram: HashMap::new(),
+            custom_roms: HashMap::new(),
+            breakpoints: Vec::new(),
+            last_score: 0,
+            recent_inputs_trace: Vec::with_capacity(128),
+            sram_dirty: false,
+            warning: None,
+            core_p1: Box::new(GameBoyCore::new_empty()),
+            core_p2: Box::new(GameBoyCore::new_empty()),
+            core_p3: Box::new(GameBoyCore::new_empty()),
+            core_p4: Box::new(GameBoyCore::new_empty()),
+        }
+    }
+
     pub fn new() -> Self {
         let catalog = default_catalog();
         let active_game_id = catalog[0].id.clone();
@@ -247,10 +292,30 @@ impl EmulatorSession {
     }
 
     pub fn active_game(&self) -> &GameEntry {
+        static EMPTY_GAME: std::sync::OnceLock<GameEntry> = std::sync::OnceLock::new();
         self.catalog
             .iter()
             .find(|g| g.id == self.active_game_id)
-            .unwrap_or(&self.catalog[0])
+            .or_else(|| self.catalog.first())
+            .unwrap_or_else(|| {
+                EMPTY_GAME.get_or_init(|| GameEntry {
+                    id: String::new(),
+                    title: "Aucune ROM sélectionnée".into(),
+                    console: ConsoleKind::Gbc,
+                    engine_kind: CoreEngineKind::NativeRust,
+                    core_id: "zaimule-rust-gb".into(),
+                    region: "—".into(),
+                    crc32_hex: "00000000".into(),
+                    size_bytes: 0,
+                    sram_summary: "—".into(),
+                    playtime_seconds: 0,
+                    favorite: false,
+                    link_cable_ready: false,
+                    embedded_rom_key: None,
+                    cover_accent: "#1E1B1A".into(),
+                    cover_symbol: String::new(),
+                })
+            })
     }
 
     pub fn bootstrap_snapshot(&self) -> StationBootstrap {
@@ -273,7 +338,18 @@ impl EmulatorSession {
             memory_watchpoints: self.memory_watchpoints.clone(),
             achievements: self.achievements.clone(),
             save_slots: self.list_save_slots_for(&self.active_game_id),
-            sram_hex_inspection: inspect_sram_hex(self.core_p1.sram(), 0, 4),
+            sram_hex_inspection: if self.active_game_id.is_empty() {
+                SramHexInspection {
+                    total_bytes: 0,
+                    non_zero_bytes: 0,
+                    crc32_hex: "00000000".into(),
+                    base_offset: 0,
+                    hex_rows: Vec::new(),
+                    score_slot_value: 0,
+                }
+            } else {
+                inspect_sram_hex(self.core_p1.sram(), 0, 4)
+            },
             keymapper_widgets: self.keymapper_widgets.clone(),
             macros: self.macros.clone(),
             tas_timeline,
@@ -389,8 +465,8 @@ impl EmulatorSession {
                     favorite: true,
                     link_cable_ready: console.supports_link_cable(),
                     embedded_rom_key: None,
-                    cover_accent: "#1e3a8a".into(),
-                    cover_symbol: "🕹️".into(),
+                    cover_accent: "#283655".into(),
+                    cover_symbol: String::new(),
                 },
             );
         }
@@ -404,6 +480,9 @@ impl EmulatorSession {
         patch_name: &str,
         ips_bytes: &[u8],
     ) -> Result<StationBootstrap, String> {
+        if self.active_game_id.is_empty() {
+            return Err("aucune ROM chargée dans la bibliothèque".into());
+        }
         let game = self.active_game().clone();
         let base_rom = self.base_rom_for_game(&game.id, game.console);
         let patched_rom = apply_ips_patch(&base_rom, ips_bytes)?;
@@ -504,6 +583,9 @@ impl EmulatorSession {
         host_name: String,
         peer_addr: Option<String>,
     ) -> Result<StationBootstrap, String> {
+        if self.active_game_id.is_empty() {
+            return Err("importez ou sélectionnez une ROM avant de créer un salon".into());
+        }
         let game = self.active_game().clone();
         let room_code = format!("ZM-{}", &game.crc32_hex[0..4]);
         let deep_link_uri = format_deep_link(&room_code, &game.crc32_hex, &game.core_id);
@@ -724,7 +806,7 @@ impl EmulatorSession {
             self.recent_inputs_trace.remove(0);
         }
         self.recent_inputs_trace.push((mask_p1 & 0xFF) as u8);
-        self.sram_dirty = true;
+        self.sram_dirty = !self.active_game_id.is_empty();
 
         ViewportStepResponse {
             primary,
@@ -751,6 +833,14 @@ impl EmulatorSession {
     /// Returns a live BGB/Mesen-style Debugger payload containing the VRAM 128x64 Tile Atlas
     /// and a 10-instruction disassembled window around the current Program Counter (`PC`).
     pub fn inspect_vram_and_disassembly(&self) -> DebuggerPayload {
+        if self.active_game_id.is_empty() {
+            return DebuggerPayload {
+                cpu: self.core_p1.debug_snapshot(),
+                disassembly: Vec::new(),
+                breakpoints: self.breakpoints.clone(),
+                vram: build_vram_inspector_snapshot(self.core_p1.read_vram_slice()),
+            };
+        }
         let game = self.active_game();
         let rom = self.base_rom_for_game(&game.id, game.console);
         let cpu = self.core_p1.debug_snapshot();
@@ -782,6 +872,9 @@ impl EmulatorSession {
         label: String,
         now_ms: u64,
     ) -> Result<SaveStateSlotInfo, String> {
+        if self.active_game_id.is_empty() {
+            return Err("aucune ROM chargée pour créer un Save State".into());
+        }
         let slot = slot.clamp(1, 9);
         let raw = self.core_p1.save_state()?;
         let crc_hex = format_crc32_hex(compute_crc32(&raw));
@@ -869,6 +962,9 @@ impl EmulatorSession {
     /// Generates a binary `.ips` patch by diffing the clean reference ROM against the active
     /// patched ROM (and any active GameShark RAM/ROM modifications).
     pub fn export_active_ips_patch(&self) -> Result<Vec<u8>, String> {
+        if self.active_game_id.is_empty() {
+            return Err("aucune ROM chargée pour exporter un patch .IPS".into());
+        }
         let game = self.active_game();
         let original = Self::unpatched_rom_for_console(game.console);
         let mut modified = self.base_rom_for_game(&game.id, game.console);
@@ -893,7 +989,7 @@ impl EmulatorSession {
         }
         let pack = ZaimulePortablePack {
             magic: PORTABLE_PACK_MAGIC.into(),
-            version: "1.0.0".into(),
+            version: "1.1.0".into(),
             active_game_id: self.active_game_id.clone(),
             sram_rle,
             sram_uncompressed_len: sram_raw.len(),
@@ -944,6 +1040,9 @@ impl EmulatorSession {
         atlas_y: u16,
         color_idx: u8,
     ) -> DebuggerPayload {
+        if self.active_game_id.is_empty() {
+            return self.inspect_vram_and_disassembly();
+        }
         if let Some(edits) =
             compute_2bpp_pixel_mutation(self.core_p1.read_vram_slice(), atlas_x, atlas_y, color_idx)
         {
@@ -979,13 +1078,17 @@ impl EmulatorSession {
             .netplay_rooms
             .first()
             .map(|r| r.room_code.clone())
-            .unwrap_or_else(|| "PKMN-LINK-01".into());
-        let shared_state_crc32_hex = share_slot.and_then(|slot| {
-            self.save_states_ram
-                .get(&(self.active_game_id.clone(), slot))
-                .map(|(info, _)| info.crc32_hex.clone())
-                .or_else(|| Some(self.active_game().crc32_hex.clone()))
-        });
+            .unwrap_or_else(|| "ZML2-LIVE".into());
+        let shared_state_crc32_hex = if self.active_game_id.is_empty() {
+            None
+        } else {
+            share_slot.and_then(|slot| {
+                self.save_states_ram
+                    .get(&(self.active_game_id.clone(), slot))
+                    .map(|(info, _)| info.crc32_hex.clone())
+                    .or_else(|| Some(self.active_game().crc32_hex.clone()))
+            })
+        };
         self.netplay_chat.insert(
             0,
             NetplayChatMessage {
@@ -1026,6 +1129,9 @@ impl EmulatorSession {
 
     /// Verifies and publishes the player's current deterministic input trace and score to the Ghost Leaderboard.
     pub fn submit_ghost_leaderboard_run(&mut self, player_name: String) -> StationBootstrap {
+        if self.active_game_id.is_empty() {
+            return self.bootstrap_snapshot();
+        }
         let game = self.active_game().clone();
         let clean_player = if player_name.trim().is_empty() {
             "Zainados".into()
@@ -1102,6 +1208,16 @@ impl EmulatorSession {
 
     /// Returns a 4-row hexadecimal + ASCII inspection snapshot of the active game's SRAM / Memory Card.
     pub fn inspect_active_sram_hex(&self, offset: usize) -> SramHexInspection {
+        if self.active_game_id.is_empty() {
+            return SramHexInspection {
+                total_bytes: 0,
+                non_zero_bytes: 0,
+                crc32_hex: "00000000".into(),
+                base_offset: 0,
+                hex_rows: Vec::new(),
+                score_slot_value: 0,
+            };
+        }
         inspect_sram_hex(self.core_p1.sram(), offset, 4)
     }
 
@@ -1112,6 +1228,9 @@ impl EmulatorSession {
         offset: usize,
         value: u8,
     ) -> Result<StationBootstrap, String> {
+        if self.active_game_id.is_empty() {
+            return Err("aucune ROM chargée".into());
+        }
         let mut sram_vec = self.core_p1.sram().to_vec();
         let _ = write_sram_byte_and_rehash(&mut sram_vec, offset, value)?;
         let _ = self.core_p1.load_sram(&sram_vec);
@@ -1126,6 +1245,9 @@ impl EmulatorSession {
     /// Transfers / synchronizes the active Cartridge SRAM or Memory Card (`.srm` / `.mcd` / `.mpk`)
     /// from Instance #1 (`J1`) to Instance #2 (`J2`) over the Virtual Link Bridge.
     pub fn transfer_sram_p1_to_p2(&mut self) -> Result<StationBootstrap, String> {
+        if self.active_game_id.is_empty() {
+            return Err("aucune ROM chargée".into());
+        }
         let p1_sram = self.core_p1.sram().to_vec();
         self.core_p2.load_sram(&p1_sram)?;
         self.link_telemetry.packets_transferred =
@@ -1414,5 +1536,48 @@ mod tests {
 
         let tas_boot = session.toggle_tas_timeline_button(None, 0, 0x02).unwrap();
         assert!(!tas_boot.tas_timeline.is_empty());
+    }
+
+    #[test]
+    fn new_clean_starts_without_test_catalog_or_sram() {
+        let mut session = EmulatorSession::new_clean();
+        let snap = session.bootstrap_snapshot();
+        assert!(snap.active_game_id.is_empty());
+        assert!(snap.catalog.is_empty());
+        assert!(snap.mod_layers.is_empty());
+        assert!(snap.community_mods.is_empty());
+        assert!(snap.cheat_codes.is_empty());
+        assert!(snap.memory_watchpoints.is_empty());
+        assert!(snap.achievements.is_empty());
+        assert!(snap.macros.is_empty());
+        assert!(snap.tas_timeline.is_empty());
+        assert!(snap.ghost_leaderboard.is_empty());
+        assert!(snap.netplay_rooms.is_empty());
+        assert!(snap.netplay_chat.is_empty());
+        assert!(snap.tournament_bracket.matches.is_empty());
+        assert!(snap.save_slots.iter().all(|s| !s.occupied));
+        assert!(snap.sram_hex_inspection.hex_rows.is_empty());
+        assert!(session.inspect_active_sram_hex(0).hex_rows.is_empty());
+        assert!(session
+            .inspect_vram_and_disassembly()
+            .disassembly
+            .is_empty());
+
+        assert!(session.write_active_sram_byte(4, 0x42).is_err());
+        assert!(session.transfer_sram_p1_to_p2().is_err());
+        assert!(session.create_save_state(1, "NoROM".into(), 1).is_err());
+        assert!(session.export_active_ips_patch().is_err());
+
+        let rom = build_gb_pocket_arena_rom();
+        let loaded = session
+            .import_custom_rom("homebrew_clean.gbc", &rom)
+            .unwrap();
+        assert_eq!(loaded.catalog.len(), 1);
+        assert!(!loaded.active_game_id.is_empty());
+        assert!(!loaded.sram_hex_inspection.hex_rows.is_empty());
+        assert!(!session
+            .inspect_vram_and_disassembly()
+            .disassembly
+            .is_empty());
     }
 }

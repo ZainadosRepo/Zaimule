@@ -5072,7 +5072,7 @@ dependencies = [
 
 [[package]]
 name = "zaimule"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5087,7 +5087,7 @@ dependencies = [
 
 [[package]]
 name = "zaimule-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5095,7 +5095,7 @@ dependencies = [
 
 [[package]]
 name = "zaimule-emu"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
