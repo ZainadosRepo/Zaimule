@@ -118,6 +118,16 @@ pub fn load_json_atomic(path: &Path) -> Result<LoadedJson, String> {
     }
 }
 
+fn write_bytes_and_sync(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    file.sync_all()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(())
+}
+
 /// Saves a JSON object atomically by writing to `.json.tmp` first and renaming over `path`.
 pub fn save_json_atomic(path: &Path, value: &Value) -> Result<(), String> {
     if !value.is_object() {
@@ -134,7 +144,7 @@ pub fn save_json_atomic(path: &Path, value: &Value) -> Result<(), String> {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    write_bytes_and_sync(&tmp, text.as_bytes())?;
     fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -178,22 +188,29 @@ pub fn save_sram_with_rotation(path: &Path, sram_bytes: &[u8]) -> Result<(), Str
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
 
-    // Rotate existing backups: .bak2 -> .bak3, .bak1 -> .bak2, .srm -> .bak1
-    let bak1 = path.with_extension("srm.bak1");
-    let bak2 = path.with_extension("srm.bak2");
-    let bak3 = path.with_extension("srm.bak3");
-    if bak2.exists() {
-        let _ = fs::rename(&bak2, &bak3);
-    }
-    if bak1.exists() {
-        let _ = fs::rename(&bak1, &bak2);
-    }
+    // Write & sync the new save FIRST so a disk error never destroys existing backups.
+    let tmp = path.with_extension("srm.tmp");
+    write_bytes_and_sync(&tmp, sram_bytes)?;
+
+    // Rotate existing backups only after the new payload is safely durable on disk.
     if path.exists() {
-        let _ = fs::copy(path, &bak1);
+        let bak1 = path.with_extension("srm.bak1");
+        let bak2 = path.with_extension("srm.bak2");
+        let bak3 = path.with_extension("srm.bak3");
+        let bak1_tmp = path.with_extension("srm.bak1.tmp");
+        if fs::copy(path, &bak1_tmp).is_ok() {
+            if bak2.exists() {
+                let _ = fs::rename(&bak2, &bak3);
+            }
+            if bak1.exists() {
+                let _ = fs::rename(&bak1, &bak2);
+            }
+            let _ = fs::rename(&bak1_tmp, &bak1);
+        } else {
+            let _ = fs::remove_file(&bak1_tmp);
+        }
     }
 
-    let tmp = path.with_extension("srm.tmp");
-    fs::write(&tmp, sram_bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
     fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -219,7 +236,7 @@ pub fn save_state_slot_atomic(path: &Path, state: &PersistedSaveState) -> Result
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let tmp = path.with_extension("zst.tmp");
-    fs::write(&tmp, encoded).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    write_bytes_and_sync(&tmp, &encoded)?;
     fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -242,7 +259,7 @@ pub fn save_rom_binary_atomic(path: &Path, rom_bytes: &[u8]) -> Result<(), Strin
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let tmp = path.with_extension("rom.tmp");
-    fs::write(&tmp, rom_bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    write_bytes_and_sync(&tmp, rom_bytes)?;
     fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 

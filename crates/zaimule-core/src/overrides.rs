@@ -1,6 +1,9 @@
 //! Yuzu-inspired hierarchical configuration overrides (`GlobalSettings -> Console -> Game`).
 
 use crate::catalog::ConsoleKind;
+use crate::cheats::{CheatCodeEntry, MemoryWatchpoint};
+use crate::keymap::KeymapWidget;
+use crate::macros::MacroSequence;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -28,11 +31,29 @@ impl ShaderPreset {
     }
 }
 
+fn default_upscaler_mode() -> String {
+    "OFF".into()
+}
+
+fn default_shader_css() -> String {
+    "mode-crt".into()
+}
+
+fn default_nds_layout() -> String {
+    "vertical".into()
+}
+
 /// Global user preferences across Zaimule.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GlobalSettings {
     pub default_shader: ShaderPreset,
+    #[serde(default = "default_shader_css")]
+    pub active_shader_css: String,
+    #[serde(default = "default_upscaler_mode")]
+    pub upscaler_mode: String,
+    #[serde(default = "default_nds_layout")]
+    pub nds_layout: String,
     pub internal_scale: u8,
     pub speed_multiplier: u8,
     pub cpu_overclock_pct: u16,
@@ -48,12 +69,23 @@ pub struct GlobalSettings {
     pub rom_directories: Vec<String>,
     #[serde(default)]
     pub external_emulators: HashMap<String, String>,
+    #[serde(default)]
+    pub keymapper_widgets: Vec<KeymapWidget>,
+    #[serde(default)]
+    pub cheat_codes: Vec<CheatCodeEntry>,
+    #[serde(default)]
+    pub memory_watchpoints: Vec<MemoryWatchpoint>,
+    #[serde(default)]
+    pub macros: Vec<MacroSequence>,
 }
 
 impl Default for GlobalSettings {
     fn default() -> Self {
         Self {
             default_shader: ShaderPreset::CrtTrinitron,
+            active_shader_css: default_shader_css(),
+            upscaler_mode: default_upscaler_mode(),
+            nds_layout: default_nds_layout(),
             internal_scale: 4,
             speed_multiplier: 1,
             cpu_overclock_pct: 100,
@@ -67,6 +99,10 @@ impl Default for GlobalSettings {
             game_overrides: HashMap::new(),
             rom_directories: Vec::new(),
             external_emulators: HashMap::new(),
+            keymapper_widgets: Vec::new(),
+            cheat_codes: Vec::new(),
+            memory_watchpoints: Vec::new(),
+            macros: Vec::new(),
         }
     }
 }

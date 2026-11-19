@@ -11,6 +11,7 @@ use crate::gb::GameBoyCore;
 use crate::gba::GbaCore;
 use crate::link::{step_quad_link_frame, LinkCableTelemetry};
 use crate::nds::NdsCore;
+use crate::nds_core::NdsBiosAssets;
 use crate::traits::{CpuDebugSnapshot, EmulatorBackend, FrameStepResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 use zaimule_core::archive::{
     extract_7z_entry_to_file, extract_zip_entry_to_file, list_zip_entries,
 };
-use zaimule_core::bios::{default_bios_registry, BiosEntry};
+use zaimule_core::bios::{import_bios_from_paths, scan_bios_registry, BiosEntry, BiosImportReport};
 use zaimule_core::catalog::{
     compute_crc32, detect_console, extract_nds_game_code, extract_rom_title,
     extract_switch_title_id, format_crc32_hex, inspect_rom_header_and_stats, ConsoleKind,
@@ -31,6 +32,7 @@ use zaimule_core::cheats::{
 use zaimule_core::external::{
     clear_switch_shader_cache as core_clear_switch_shader_cache,
     import_switch_engine as core_import_switch_engine,
+    import_switch_firmware as core_import_switch_firmware,
     import_switch_keys as core_import_switch_keys, inspect_switch_vault,
     prepare_switch_launch as core_prepare_switch_launch, resolve_switch_engine_for_game,
     SwitchEngineTarget, SwitchLaunchPlan, SwitchVaultStatus,
@@ -94,6 +96,10 @@ pub struct StationBootstrap {
     pub stun_candidate: StunDiscoveryCandidate,
     pub udp_local_port: u16,
     pub udp_peer_addr: Option<String>,
+    #[serde(default)]
+    pub udp_packets_sent: u64,
+    #[serde(default)]
+    pub udp_packets_received: u64,
     pub native_cores: Vec<NativeCoreInfo>,
     pub bios_entries: Vec<BiosEntry>,
     pub link_telemetry: LinkCableTelemetry,
@@ -106,6 +112,14 @@ pub struct StationBootstrap {
     pub switch_vault: SwitchVaultStatus,
     #[serde(default)]
     pub last_scan_report: Option<DirectoryScanReport>,
+    #[serde(default)]
+    pub active_shader_css: String,
+    #[serde(default)]
+    pub upscaler_mode: String,
+    #[serde(default)]
+    pub speed_multiplier: u8,
+    #[serde(default)]
+    pub nds_layout: String,
 }
 
 /// Combined frame step response for single, dual (2P), or quad (4P Tournament) viewport rendering.
@@ -164,7 +178,11 @@ pub fn built_in_native_cores_info() -> Vec<NativeCoreInfo> {
     ]
 }
 
-fn build_core_for(console: ConsoleKind, rom: &[u8]) -> Result<Box<dyn EmulatorBackend>, String> {
+fn build_core_for(
+    console: ConsoleKind,
+    rom: &[u8],
+    system_dir: &Path,
+) -> Result<Box<dyn EmulatorBackend>, String> {
     match console {
         ConsoleKind::Gb | ConsoleKind::Gbc => {
             let mut c = GameBoyCore::new_empty();
@@ -178,7 +196,8 @@ fn build_core_for(console: ConsoleKind, rom: &[u8]) -> Result<Box<dyn EmulatorBa
         }
         ConsoleKind::Nds => {
             let mut c = NdsCore::new_empty();
-            c.load_rom(rom)?;
+            let bios = NdsBiosAssets::load_from_dir(system_dir);
+            c.load_rom_with_bios(rom, bios)?;
             Ok(Box::new(c))
         }
         ConsoleKind::Switch | ConsoleKind::Switch2 => Ok(Box::new(GameBoyCore::new_empty())),
@@ -275,6 +294,23 @@ pub fn encode_viewport_binary_packet(resp: &ViewportStepResponse, sram_dirty: bo
     out
 }
 
+fn native_fps_for_console(console: ConsoleKind) -> f64 {
+    match console {
+        ConsoleKind::Gb | ConsoleKind::Gbc | ConsoleKind::Gba => 59.7275,
+        ConsoleKind::Nds => 59.8261,
+        ConsoleKind::Switch | ConsoleKind::Switch2 => 60.0,
+    }
+}
+
+fn normalize_nds_layout(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "horizontal" => "horizontal".into(),
+        "vertical-swapped" => "vertical-swapped".into(),
+        "horizontal-swapped" => "horizontal-swapped".into(),
+        _ => "vertical".into(),
+    }
+}
+
 pub struct EmulatorSession {
     pub settings: GlobalSettings,
     pub catalog: Vec<GameEntry>,
@@ -308,6 +344,10 @@ pub struct EmulatorSession {
     pub breakpoints: Vec<u32>,
     pub last_score: u32,
     pub recent_inputs_trace: Vec<u8>,
+    pub frame_counter: u64,
+    playtime_frame_accum: f64,
+    pub playtime_dirty: bool,
+    last_sram_crc: Option<u32>,
     pub sram_dirty: bool,
     core_loaded: bool,
     pub warning: Option<String>,
@@ -370,6 +410,10 @@ impl EmulatorSession {
             breakpoints: Vec::new(),
             last_score: 0,
             recent_inputs_trace: Vec::with_capacity(128),
+            frame_counter: 0,
+            playtime_frame_accum: 0.0,
+            playtime_dirty: false,
+            last_sram_crc: None,
             sram_dirty: false,
             core_loaded: false,
             warning: None,
@@ -403,6 +447,123 @@ impl EmulatorSession {
     pub fn refresh_switch_vault(&mut self) -> StationBootstrap {
         self.switch_vault = inspect_switch_vault(&self.switch_vault_root);
         self.bootstrap_snapshot()
+    }
+
+    /// Copies live runtime state (keymapper, cheats, watchpoints, macros) into `self.settings`
+    /// before writing `settings.json` to disk.
+    pub fn sync_runtime_to_settings(&mut self) {
+        self.settings.keymapper_widgets = self.keymapper_widgets.clone();
+        self.settings.cheat_codes = self.cheat_codes.clone();
+        self.settings.memory_watchpoints = self.memory_watchpoints.clone();
+        self.settings.macros = self.macros.clone();
+    }
+
+    /// Restores persisted `GlobalSettings` into live session state while preserving sensible defaults.
+    pub fn apply_loaded_settings(&mut self, mut settings: GlobalSettings) {
+        if settings.active_shader_css.trim().is_empty() {
+            settings.active_shader_css = "mode-crt".into();
+        }
+        if settings.upscaler_mode.trim().is_empty() {
+            settings.upscaler_mode = "OFF".into();
+        }
+        settings.nds_layout = normalize_nds_layout(&settings.nds_layout);
+        settings.speed_multiplier = settings.speed_multiplier.clamp(1, 8);
+        if !settings.keymapper_widgets.is_empty() {
+            self.keymapper_widgets = settings.keymapper_widgets.clone();
+        }
+        if !settings.cheat_codes.is_empty() {
+            self.cheat_codes = settings.cheat_codes.clone();
+        }
+        if !settings.memory_watchpoints.is_empty() {
+            self.memory_watchpoints = settings.memory_watchpoints.clone();
+        }
+        if !settings.macros.is_empty() {
+            self.macros = settings.macros.clone();
+        }
+        self.settings = settings;
+        self.apply_effective_hardware_profile();
+    }
+
+    fn apply_effective_hardware_profile(&mut self) {
+        if !self.core_loaded || self.active_game_id.is_empty() {
+            return;
+        }
+        let game = self.active_game().clone();
+        let cfg = resolve_effective_config(&self.settings, &game.id, game.console);
+        self.core_p1.set_cpu_overclock_pct(cfg.cpu_overclock_pct);
+        self.core_p1.set_color_correction(cfg.pgxp_subpixel);
+    }
+
+    /// Refreshes the active core's cached SRAM slice before inspection or export.
+    pub fn sync_active_sram(&mut self) {
+        if self.core_loaded {
+            self.core_p1.sync_sram_cache();
+        }
+    }
+
+    /// Returns `true` if native gameplay playtime increased since the last persistence check and clears the flag.
+    pub fn take_playtime_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.playtime_dirty)
+    }
+
+    pub fn update_ui_preferences(
+        &mut self,
+        shader_css: Option<String>,
+        upscaler_mode: Option<String>,
+        speed_multiplier: Option<u8>,
+        nds_layout: Option<String>,
+    ) -> StationBootstrap {
+        if let Some(shader) = shader_css {
+            let trimmed = shader.trim();
+            if !trimmed.is_empty() {
+                self.settings.active_shader_css = trimmed.to_string();
+            }
+        }
+        if let Some(upscaler) = upscaler_mode {
+            let trimmed = upscaler.trim();
+            if !trimmed.is_empty() {
+                self.settings.upscaler_mode = trimmed.to_string();
+            }
+        }
+        if let Some(speed) = speed_multiplier {
+            self.settings.speed_multiplier = speed.clamp(1, 8);
+        }
+        if let Some(layout) = nds_layout {
+            if !layout.trim().is_empty() {
+                self.settings.nds_layout = normalize_nds_layout(&layout);
+            }
+        }
+        self.bootstrap_snapshot()
+    }
+
+    /// Captures the current active SRAM CRC as the clean on-disk baseline and clears `sram_dirty`.
+    pub fn sync_sram_baseline(&mut self) {
+        self.sync_active_sram();
+        if self.has_persistable_sram() {
+            self.last_sram_crc = Some(compute_crc32(self.core_p1.sram()));
+        } else {
+            self.last_sram_crc = None;
+        }
+        self.sram_dirty = false;
+    }
+
+    /// Compares active SRAM CRC against the last flushed baseline and updates `sram_dirty`.
+    pub fn refresh_sram_dirty_flag(&mut self) -> bool {
+        self.sync_active_sram();
+        if !self.has_persistable_sram() {
+            self.sram_dirty = false;
+            return false;
+        }
+        let crc = compute_crc32(self.core_p1.sram());
+        if self.last_sram_crc != Some(crc) {
+            self.sram_dirty = true;
+        }
+        self.sram_dirty
+    }
+
+    /// Marks the currently active SRAM bytes as cleanly persisted on disk.
+    pub fn mark_sram_flushed(&mut self) {
+        self.sync_sram_baseline();
     }
 
     pub fn active_game(&self) -> &GameEntry {
@@ -468,8 +629,10 @@ impl EmulatorSession {
             stun_candidate: discover_stun_candidate(self.udp_node.local_port),
             udp_local_port: self.udp_node.local_port,
             udp_peer_addr: self.udp_node.peer_addr.clone(),
+            udp_packets_sent: self.udp_node.packets_sent,
+            udp_packets_received: self.udp_node.packets_received,
             native_cores: built_in_native_cores_info(),
-            bios_entries: default_bios_registry(),
+            bios_entries: scan_bios_registry(&self.system_dir),
             link_telemetry: self.link_telemetry.clone(),
             rewind_snapshots_count: self.rewind_buffer.len(),
             rewind_memory_bytes: self.rewind_buffer.memory_usage_bytes(),
@@ -477,11 +640,15 @@ impl EmulatorSession {
             rom_directories: self.settings.rom_directories.clone(),
             switch_vault: self.switch_vault.clone(),
             last_scan_report: self.last_scan_report.clone(),
+            active_shader_css: self.settings.active_shader_css.clone(),
+            upscaler_mode: self.settings.upscaler_mode.clone(),
+            speed_multiplier: self.settings.speed_multiplier.clamp(1, 8),
+            nds_layout: normalize_nds_layout(&self.settings.nds_layout),
         }
     }
 
     pub fn list_save_slots_for(&self, game_id: &str) -> Vec<SaveStateSlotInfo> {
-        (1..=6)
+        (1..=9)
             .map(|slot| {
                 if let Some((info, _)) = self.save_states_ram.get(&(game_id.to_string(), slot)) {
                     info.clone()
@@ -618,12 +785,12 @@ impl EmulatorSession {
             return;
         };
 
-        self.core_p2 = build_core_for(game.console, &rom)
+        self.core_p2 = build_core_for(game.console, &rom, &self.system_dir)
             .unwrap_or_else(|_| Box::new(GameBoyCore::new_empty()));
         if self.link_telemetry.quad_mode {
-            self.core_p3 = build_core_for(game.console, &rom)
+            self.core_p3 = build_core_for(game.console, &rom, &self.system_dir)
                 .unwrap_or_else(|_| Box::new(GameBoyCore::new_empty()));
-            self.core_p4 = build_core_for(game.console, &rom)
+            self.core_p4 = build_core_for(game.console, &rom, &self.system_dir)
                 .unwrap_or_else(|_| Box::new(GameBoyCore::new_empty()));
         } else {
             self.core_p3 = Box::new(GameBoyCore::new_empty());
@@ -632,11 +799,12 @@ impl EmulatorSession {
     }
 
     pub fn merge_scanned_entries(&mut self, entries: Vec<GameEntry>) -> Option<String> {
-        let mut first_id = None;
+        if entries.is_empty() {
+            return None;
+        }
+        let mut newest_id = None;
         for mut entry in entries.into_iter().rev() {
-            if first_id.is_none() {
-                first_id = Some(entry.id.clone());
-            }
+            newest_id = Some(entry.id.clone());
             if let Some(pos) = self.catalog.iter().position(|g| {
                 g.id == entry.id
                     || (entry.rom_path.is_some()
@@ -652,10 +820,7 @@ impl EmulatorSession {
                 self.catalog.insert(0, entry);
             }
         }
-        if let Some(latest) = self.catalog.first() {
-            first_id = Some(latest.id.clone());
-        }
-        first_id
+        newest_id
     }
 
     pub fn scan_directory_and_merge(&mut self, dir: &Path) -> DirectoryScanReport {
@@ -681,15 +846,57 @@ impl EmulatorSession {
         report
     }
 
+    /// Removes a watched ROM folder from `settings.rom_directories` without deleting files on disk.
+    pub fn remove_rom_directory(&mut self, dir_path: &str) -> Result<StationBootstrap, String> {
+        let target = dir_path.trim();
+        let before = self.settings.rom_directories.len();
+        self.settings
+            .rom_directories
+            .retain(|d| !d.eq_ignore_ascii_case(target));
+        if self.settings.rom_directories.len() == before {
+            return Err(format!("dossier introuvable dans la liste : {target}"));
+        }
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Manually rescans every registered ROM folder and merges newly discovered entries.
+    pub fn rescan_all_rom_directories(&mut self) -> DirectoryScanReport {
+        let dirs = self.settings.rom_directories.clone();
+        let mut combined = DirectoryScanReport {
+            scanned_root: if dirs.len() == 1 {
+                dirs[0].clone()
+            } else {
+                format!("{} dossier(s) surveillé(s)", dirs.len())
+            },
+            ..Default::default()
+        };
+        for dir in dirs {
+            let rep = self.scan_directory_and_merge(Path::new(&dir));
+            combined.imported_entries.extend(rep.imported_entries);
+            combined.skipped_files += rep.skipped_files;
+            combined
+                .unsupported_archives
+                .extend(rep.unsupported_archives);
+            combined.errors.extend(rep.errors);
+        }
+        self.last_scan_report = Some(combined.clone());
+        combined
+    }
+
     pub fn import_paths(&mut self, paths: &[PathBuf]) -> Result<DirectoryScanReport, String> {
         let mut combined = DirectoryScanReport {
             scanned_root: "Importation directe".into(),
             ..Default::default()
         };
+        let mut file_entries: Vec<GameEntry> = Vec::new();
+        let mut first_dir_entry_id: Option<String> = None;
 
         for p in paths {
             if p.is_dir() {
                 let rep = self.scan_directory_and_merge(p);
+                if first_dir_entry_id.is_none() {
+                    first_dir_entry_id = rep.imported_entries.first().map(|e| e.id.clone());
+                }
                 combined.imported_entries.extend(rep.imported_entries);
                 combined.skipped_files += rep.skipped_files;
                 combined
@@ -699,6 +906,7 @@ impl EmulatorSession {
             } else if p.is_file() {
                 match inspect_path_to_entries(p) {
                     Ok(rep) => {
+                        file_entries.extend(rep.imported_entries.clone());
                         combined.imported_entries.extend(rep.imported_entries);
                         combined.skipped_files += rep.skipped_files;
                         combined
@@ -715,9 +923,9 @@ impl EmulatorSession {
             }
         }
 
-        let first_id = self.merge_scanned_entries(combined.imported_entries.clone());
+        let first_file_id = self.merge_scanned_entries(file_entries);
         self.last_scan_report = Some(combined.clone());
-        if let Some(id) = first_id {
+        if let Some(id) = first_file_id.or(first_dir_entry_id) {
             let _ = self.select_game(&id);
         }
 
@@ -743,6 +951,9 @@ impl EmulatorSession {
             self.active_launched_rom_path = None;
             self.active_disasm_rom.clear();
             self.rewind_buffer.clear();
+            self.frame_counter = 0;
+            self.playtime_frame_accum = 0.0;
+            self.last_sram_crc = None;
             self.sram_dirty = false;
             self.core_loaded = false;
             self.core_p1 = Box::new(GameBoyCore::new_empty());
@@ -750,6 +961,14 @@ impl EmulatorSession {
             self.core_p3 = Box::new(GameBoyCore::new_empty());
             self.core_p4 = Box::new(GameBoyCore::new_empty());
         }
+        Ok(self.bootstrap_snapshot())
+    }
+
+    pub fn toggle_game_favorite(&mut self, game_id: &str) -> Result<StationBootstrap, String> {
+        let Some(game) = self.catalog.iter_mut().find(|g| g.id == game_id) else {
+            return Err(format!("jeu introuvable : {game_id}"));
+        };
+        game.favorite = !game.favorite;
         Ok(self.bootstrap_snapshot())
     }
 
@@ -779,6 +998,15 @@ impl EmulatorSession {
         }
     }
 
+    /// Imports user BIOS/firmware files or `.zip`/`.7z` packs into `self.system_dir`.
+    pub fn import_bios_paths(
+        &mut self,
+        paths: &[PathBuf],
+    ) -> Result<(BiosImportReport, StationBootstrap), String> {
+        let report = import_bios_from_paths(paths, &self.system_dir)?;
+        Ok((report, self.bootstrap_snapshot()))
+    }
+
     /// Imports user-supplied **Torzu** (Switch 1) or **Fritchii / Lichii** (Switch 2) into the Option-A Vault.
     pub fn import_switch_engine(
         &mut self,
@@ -792,6 +1020,13 @@ impl EmulatorSession {
     /// Imports user-supplied `prod.keys` / `title.keys` into the Option-A Vault and mirrors to installed engines.
     pub fn import_switch_keys(&mut self, files: &[PathBuf]) -> Result<StationBootstrap, String> {
         self.switch_vault = core_import_switch_keys(files, &self.switch_vault_root)?;
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Imports user-supplied Nintendo Switch firmware (folder or `.zip`/`.7z` of `.nca` archives)
+    /// into the Option-A Vault and synchronizes it into Torzu & Fritchii NAND directories.
+    pub fn import_switch_firmware(&mut self, source: &Path) -> Result<StationBootstrap, String> {
+        self.switch_vault = core_import_switch_firmware(source, &self.switch_vault_root)?;
         Ok(self.bootstrap_snapshot())
     }
 
@@ -868,6 +1103,9 @@ impl EmulatorSession {
         self.active_launched_rom_path = game.rom_path.as_ref().map(PathBuf::from);
         self.active_disasm_rom.clear();
         self.rewind_buffer.clear();
+        self.frame_counter = 0;
+        self.playtime_frame_accum = 0.0;
+        self.last_sram_crc = None;
         self.sram_dirty = false;
         self.core_loaded = false;
 
@@ -894,12 +1132,45 @@ impl EmulatorSession {
             return Err("aucune donnée ROM disponible pour ce jeu".into());
         };
 
-        self.core_p1 = build_core_for(game.console, &rom_bytes)?;
+        self.core_p1 = build_core_for(game.console, &rom_bytes, &self.system_dir)?;
         let cap = rom_bytes.len().min(4 * 1024 * 1024);
         self.active_disasm_rom = rom_bytes[..cap].to_vec();
         self.core_loaded = true;
+        self.apply_effective_hardware_profile();
         self.warning = None;
+        self.sync_sram_baseline();
         self.sync_secondary_link_cores();
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Performs a hardware cold reset of the active native ROM while preserving its battery SRAM.
+    pub fn reset_active_game(&mut self) -> Result<StationBootstrap, String> {
+        if self.active_game_id.is_empty() || !self.core_loaded {
+            return Err("aucune ROM native active à réinitialiser".into());
+        }
+        let game = self.active_game().clone();
+        if game.console.is_external_only() || game.engine_kind == CoreEngineKind::ExternalLauncher {
+            return Err(
+                "le reset matériel ne s'applique qu'aux cœurs natifs (GB/GBC/GBA/NDS)".into(),
+            );
+        }
+        self.sync_active_sram();
+        let preserved_sram = if self.has_persistable_sram() {
+            Some(self.core_p1.sram().to_vec())
+        } else {
+            None
+        };
+        let was_dirty = self.refresh_sram_dirty_flag();
+
+        self.select_game(&game.id)?;
+        if let Some(sram) = preserved_sram {
+            let _ = self.core_p1.load_sram(&sram);
+            if was_dirty {
+                self.sram_dirty = true;
+            } else {
+                self.sync_sram_baseline();
+            }
+        }
         Ok(self.bootstrap_snapshot())
     }
 
@@ -997,7 +1268,8 @@ impl EmulatorSession {
 
         self.custom_roms
             .insert(game.id.clone(), patched_rom.clone());
-        self.core_p1.load_rom(&patched_rom)?;
+        self.core_p1 = build_core_for(game.console, &patched_rom, &self.system_dir)?;
+        self.apply_effective_hardware_profile();
         self.active_disasm_rom = patched_rom[..patched_rom.len().min(4 * 1024 * 1024)].to_vec();
         self.sync_secondary_link_cores();
 
@@ -1044,12 +1316,40 @@ impl EmulatorSession {
         Ok(self.bootstrap_snapshot())
     }
 
-    pub fn scan_active_ram(&self, target_value: u8) -> Vec<String> {
+    pub fn remove_cheat_code(&mut self, cheat_id: &str) -> Result<StationBootstrap, String> {
+        let before = self.cheat_codes.len();
+        self.cheat_codes.retain(|c| c.id != cheat_id);
+        if self.cheat_codes.len() == before {
+            return Err(format!("code triche introuvable : {cheat_id}"));
+        }
+        Ok(self.bootstrap_snapshot())
+    }
+
+    pub fn scan_active_ram(&mut self, target_value: u8) -> Vec<String> {
+        self.core_p1.sync_debug_caches();
         let slice = self.core_p1.read_ram_slice();
         scan_ram_for_exact_byte(slice, 0xC000, target_value, 24)
             .into_iter()
             .map(|addr| format!("0x{addr:04X}"))
             .collect()
+    }
+
+    /// Connects to a validated LAN UDP peer (`IP:PORT`) or disconnects when `peer_addr` is `None`/empty.
+    pub fn connect_netplay_peer(
+        &mut self,
+        peer_addr: Option<&str>,
+    ) -> Result<StationBootstrap, String> {
+        match peer_addr.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(addr) => {
+                self.udp_node.connect_peer_validated(addr)?;
+                self.link_telemetry.enabled = true;
+                self.sync_secondary_link_cores();
+            }
+            None => {
+                self.udp_node.disconnect_peer();
+            }
+        }
+        Ok(self.bootstrap_snapshot())
     }
 
     pub fn create_netplay_room(
@@ -1064,11 +1364,12 @@ impl EmulatorSession {
         let game = self.active_game().clone();
         let room_code = format!("ZM-{}", &game.crc32_hex[0..4]);
         let deep_link_uri = format_deep_link(&room_code, &game.crc32_hex, &game.core_id);
-        if let Some(ref peer) = peer_addr {
-            self.udp_node.connect_peer(peer);
-        } else if self.udp_node.local_port > 0 {
-            self.udp_node
-                .connect_peer(&format!("127.0.0.1:{}", self.udp_node.local_port));
+        if let Some(peer) = peer_addr
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            self.udp_node.connect_peer_validated(peer)?;
         }
         self.link_telemetry.enabled = true;
         self.sync_secondary_link_cores();
@@ -1090,9 +1391,13 @@ impl EmulatorSession {
                 } else {
                     host_name.trim().to_string()
                 },
-                players_current: 1,
+                players_current: if self.udp_node.peer_addr.is_some() {
+                    2
+                } else {
+                    1
+                },
                 players_max: 2,
-                ping_ms: 4,
+                ping_ms: 0,
                 rollback_frames: 1,
                 link_cable_mode: true,
                 deep_link_uri,
@@ -1115,11 +1420,12 @@ impl EmulatorSession {
         {
             let _ = self.select_game(&game.id);
         }
-        if let Some(ref peer) = peer_addr {
-            self.udp_node.connect_peer(peer);
-        } else if self.udp_node.local_port > 0 {
-            self.udp_node
-                .connect_peer(&format!("127.0.0.1:{}", self.udp_node.local_port));
+        if let Some(peer) = peer_addr
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            self.udp_node.connect_peer_validated(peer)?;
         }
         self.link_telemetry.enabled = true;
         self.sync_secondary_link_cores();
@@ -1146,8 +1452,14 @@ impl EmulatorSession {
         }
         self.macros.insert(0, seq);
         self.active_macro_id = Some(id);
-        self.macro_start_frame = self.core_p1.debug_snapshot().cycles / 256;
+        self.macro_start_frame = self.frame_counter;
         Ok(self.bootstrap_snapshot())
+    }
+
+    pub fn set_active_macro(&mut self, macro_id: Option<String>) -> StationBootstrap {
+        self.active_macro_id = macro_id.filter(|id| self.macros.iter().any(|m| &m.id == id));
+        self.macro_start_frame = self.frame_counter;
+        self.bootstrap_snapshot()
     }
 
     pub fn update_keymapper_widgets(
@@ -1171,7 +1483,7 @@ impl EmulatorSession {
     }
 
     /// Steps the active session `speed_mult` (`1..=8`) frames and returns the final visual frame
-    /// plus rate-matched stereo PCM samples.
+    /// plus rate-matched stereo PCM samples (box-filter averaged during fast-forward).
     pub fn step_viewport_with_speed(
         &mut self,
         raw_buttons_p1: u16,
@@ -1182,22 +1494,37 @@ impl EmulatorSession {
         let steps = usize::from(speed_mult.clamp(1, 8));
         let mut last_resp: Option<ViewportStepResponse> = None;
         let mut merged_pcm: Vec<f32> = Vec::new();
+        let mut acc_l = 0.0f32;
+        let mut acc_r = 0.0f32;
+        let mut acc_count = 0usize;
 
         for s in 0..steps {
             let mut single =
                 self.step_single_viewport_tick(raw_buttons_p1, raw_buttons_p2, turbo_active);
             if steps > 1 {
                 let pcm = std::mem::take(&mut single.primary.audio_samples);
-                for (pair_idx, pair) in pcm.as_chunks::<2>().0.iter().enumerate() {
-                    if pair_idx % steps == 0 {
-                        merged_pcm.push(pair[0]);
-                        merged_pcm.push(pair[1]);
+                let inv_steps = 1.0 / (steps as f32);
+                for pair in pcm.as_chunks::<2>().0 {
+                    acc_l += pair[0];
+                    acc_r += pair[1];
+                    acc_count += 1;
+                    if acc_count == steps {
+                        merged_pcm.push(acc_l * inv_steps);
+                        merged_pcm.push(acc_r * inv_steps);
+                        acc_l = 0.0;
+                        acc_r = 0.0;
+                        acc_count = 0;
                     }
                 }
             } else {
                 merged_pcm = std::mem::take(&mut single.primary.audio_samples);
             }
             if s + 1 == steps {
+                if steps > 1 && acc_count > 0 && merged_pcm.is_empty() {
+                    let inv = 1.0 / (acc_count as f32);
+                    merged_pcm.push(acc_l * inv);
+                    merged_pcm.push(acc_r * inv);
+                }
                 single.primary.audio_samples = std::mem::take(&mut merged_pcm);
                 last_resp = Some(single);
             }
@@ -1227,7 +1554,7 @@ impl EmulatorSession {
         raw_buttons_p2: u16,
         turbo_active: bool,
     ) -> ViewportStepResponse {
-        let current_frame = self.core_p1.debug_snapshot().cycles / 256;
+        let current_frame = self.frame_counter;
         let mut mask_p1 = raw_buttons_p1;
         let mut mask_p2 = raw_buttons_p2;
 
@@ -1294,15 +1621,35 @@ impl EmulatorSession {
             &mut self.link_telemetry,
         );
 
-        let ram_slice = self.core_p1.read_ram_slice();
-        if !ram_slice.is_empty() {
-            for wp in &mut self.memory_watchpoints {
-                wp.previous_value = wp.current_value;
-                if wp.frozen {
-                    wp.current_value = wp.frozen_value;
-                } else {
-                    let idx = (wp.addr as usize).wrapping_sub(0xC000) % ram_slice.len();
-                    wp.current_value = ram_slice[idx];
+        self.frame_counter = self.frame_counter.saturating_add(1);
+        if self.core_loaded && !self.active_game_id.is_empty() {
+            self.playtime_frame_accum += 1.0 / native_fps_for_console(primary.console);
+            if self.playtime_frame_accum >= 1.0 {
+                let whole_secs = self.playtime_frame_accum.floor() as u64;
+                self.playtime_frame_accum -= whole_secs as f64;
+                if let Some(game) = self
+                    .catalog
+                    .iter_mut()
+                    .find(|g| g.id == self.active_game_id)
+                {
+                    game.playtime_seconds = game.playtime_seconds.saturating_add(whole_secs);
+                    self.playtime_dirty = true;
+                }
+            }
+        }
+
+        if !self.memory_watchpoints.is_empty() {
+            self.core_p1.sync_debug_caches();
+            let ram_slice = self.core_p1.read_ram_slice();
+            if !ram_slice.is_empty() {
+                for wp in &mut self.memory_watchpoints {
+                    wp.previous_value = wp.current_value;
+                    if wp.frozen {
+                        wp.current_value = wp.frozen_value;
+                    } else {
+                        let idx = (wp.addr as usize).wrapping_sub(0xC000) % ram_slice.len();
+                        wp.current_value = ram_slice[idx];
+                    }
                 }
             }
         }
@@ -1333,7 +1680,9 @@ impl EmulatorSession {
             self.recent_inputs_trace.remove(0);
         }
         self.recent_inputs_trace.push((mask_p1 & 0xFF) as u8);
-        self.sram_dirty = self.has_persistable_sram();
+        if self.core_loaded && (self.frame_counter & 15) == 0 {
+            self.refresh_sram_dirty_flag();
+        }
 
         ViewportStepResponse {
             primary,
@@ -1366,7 +1715,8 @@ impl EmulatorSession {
         self.bootstrap_snapshot()
     }
 
-    pub fn inspect_vram_and_disassembly(&self) -> DebuggerPayload {
+    pub fn inspect_vram_and_disassembly(&mut self) -> DebuggerPayload {
+        self.core_p1.sync_debug_caches();
         if self.active_game_id.is_empty() || !self.core_loaded {
             return DebuggerPayload {
                 cpu: self.core_p1.debug_snapshot(),
@@ -1416,7 +1766,7 @@ impl EmulatorSession {
         let raw = self.core_p1.save_state()?;
         let crc_hex = format_crc32_hex(compute_crc32(&raw));
         let compressed = rle_compress(&raw);
-        let frame = self.core_p1.debug_snapshot().cycles / 256;
+        let frame = self.frame_counter;
         let info = SaveStateSlotInfo {
             slot,
             occupied: true,
@@ -1451,7 +1801,18 @@ impl EmulatorSession {
             u32::from_le_bytes([envelope[0], envelope[1], envelope[2], envelope[3]]) as usize;
         let raw = rle_decompress(&envelope[4..], expected_len)?;
         self.core_p1.load_state(&raw)?;
+        self.refresh_sram_dirty_flag();
         Ok(info)
+    }
+
+    pub fn delete_save_state(&mut self, slot: u8) -> Result<Vec<SaveStateSlotInfo>, String> {
+        if self.active_game_id.is_empty() {
+            return Err("aucun jeu actif".into());
+        }
+        let slot = slot.clamp(1, 9);
+        self.save_states_ram
+            .remove(&(self.active_game_id.clone(), slot));
+        Ok(self.list_save_slots_for(&self.active_game_id))
     }
 
     pub fn export_save_state_envelope(&self, slot: u8) -> Option<PersistedSaveState> {
@@ -1483,6 +1844,7 @@ impl EmulatorSession {
             return Err("tampon de rembobinage vide".into());
         };
         self.core_p1.load_state(&raw_state)?;
+        self.refresh_sram_dirty_flag();
         Ok(frame)
     }
 
@@ -1503,6 +1865,7 @@ impl EmulatorSession {
 
     pub fn load_active_sram(&mut self, data: &[u8]) {
         let _ = self.core_p1.load_sram(data);
+        self.sync_sram_baseline();
     }
 
     pub fn export_active_ips_patch(&mut self) -> Result<Vec<u8>, String> {
@@ -1527,12 +1890,13 @@ impl EmulatorSession {
         diff_roms_to_ips(&original, &modified)
     }
 
-    pub fn export_portable_pack(&self) -> Result<Vec<u8>, String> {
+    pub fn export_portable_pack(&mut self) -> Result<Vec<u8>, String> {
+        self.sync_active_sram();
         let sram_raw = self.active_sram_bytes();
         let sram_rle = rle_compress(sram_raw);
         let payload_crc32_hex = format_crc32_hex(compute_crc32(sram_raw));
         let mut save_slots = Vec::new();
-        for slot in 1..=6u8 {
+        for slot in 1..=9u8 {
             if let Some(persisted) = self.export_save_state_envelope(slot) {
                 save_slots.push(persisted);
             }
@@ -1554,14 +1918,41 @@ impl EmulatorSession {
 
     pub fn import_portable_pack(&mut self, bytes: &[u8]) -> Result<StationBootstrap, String> {
         let pack = decode_portable_pack(bytes)?;
-        if self.catalog.iter().any(|g| g.id == pack.active_game_id) {
-            let _ = self.select_game(&pack.active_game_id);
+        if !pack.active_game_id.is_empty() {
+            if self.catalog.iter().any(|g| g.id == pack.active_game_id) {
+                self.select_game(&pack.active_game_id)?;
+            } else if !self.active_game_id.is_empty() {
+                return Err(format!(
+                    "le pack portable cible le jeu '{}' qui n'est pas présent dans la bibliothèque",
+                    pack.active_game_id
+                ));
+            }
         }
-        if let Ok(raw_sram) = rle_decompress(&pack.sram_rle, pack.sram_uncompressed_len) {
-            self.load_active_sram(&raw_sram);
+        if pack.sram_uncompressed_len > 0 || !pack.sram_rle.is_empty() {
+            let raw_sram = rle_decompress(&pack.sram_rle, pack.sram_uncompressed_len)?;
+            let actual_crc = format_crc32_hex(compute_crc32(&raw_sram));
+            if !pack.payload_crc32_hex.is_empty()
+                && !actual_crc.eq_ignore_ascii_case(&pack.payload_crc32_hex)
+            {
+                return Err(format!(
+                    "somme de contrôle SRAM du pack portable invalide (attendu {}, obtenu {})",
+                    pack.payload_crc32_hex, actual_crc
+                ));
+            }
+            if self.has_persistable_sram() {
+                self.core_p1.load_sram(&raw_sram)?;
+                self.sram_dirty = true;
+            }
         }
         for persisted in pack.save_slots {
-            self.import_save_state_envelope(self.active_game_id.clone(), persisted);
+            let target_game = if !self.active_game_id.is_empty() {
+                self.active_game_id.clone()
+            } else {
+                pack.active_game_id.clone()
+            };
+            if !target_game.is_empty() {
+                self.import_save_state_envelope(target_game, persisted);
+            }
         }
         if !pack.cheat_codes.is_empty() {
             self.cheat_codes = pack.cheat_codes;
@@ -1588,6 +1979,7 @@ impl EmulatorSession {
         if self.active_game_id.is_empty() || !self.core_loaded {
             return self.inspect_vram_and_disassembly();
         }
+        self.core_p1.sync_debug_caches();
         if let Some(edits) =
             compute_2bpp_pixel_mutation(self.core_p1.read_vram_slice(), atlas_x, atlas_y, color_idx)
         {
@@ -1651,13 +2043,16 @@ impl EmulatorSession {
         let clamped_oc = cpu_overclock_pct.clamp(50, 400);
         self.settings.cpu_overclock_pct = clamped_oc;
         self.settings.pgxp_subpixel = pgxp_subpixel;
-        let entry = self
-            .settings
-            .game_overrides
-            .entry(self.active_game_id.clone())
-            .or_default();
-        entry.custom_cpu_overclock_pct = Some(clamped_oc);
-        entry.custom_pgxp_subpixel = Some(pgxp_subpixel);
+        if !self.active_game_id.is_empty() {
+            let entry = self
+                .settings
+                .game_overrides
+                .entry(self.active_game_id.clone())
+                .or_default();
+            entry.custom_cpu_overclock_pct = Some(clamped_oc);
+            entry.custom_pgxp_subpixel = Some(pgxp_subpixel);
+        }
+        self.core_p1.set_cpu_overclock_pct(clamped_oc);
         self.core_p1.set_color_correction(pgxp_subpixel);
         self.bootstrap_snapshot()
     }
@@ -1717,7 +2112,7 @@ impl EmulatorSession {
             self.macros.insert(0, seq);
         }
         self.active_macro_id = Some(macro_id);
-        self.macro_start_frame = self.core_p1.debug_snapshot().cycles / 256;
+        self.macro_start_frame = self.frame_counter;
         Ok(self.bootstrap_snapshot())
     }
 
@@ -1757,6 +2152,7 @@ impl EmulatorSession {
         offset: usize,
         value: u8,
     ) -> Result<StationBootstrap, String> {
+        self.sync_active_sram();
         if !self.has_persistable_sram() {
             return Err("aucune mémoire SRAM active pour ce cœur".into());
         }
@@ -1768,6 +2164,7 @@ impl EmulatorSession {
     }
 
     pub fn transfer_sram_p1_to_p2(&mut self) -> Result<StationBootstrap, String> {
+        self.sync_active_sram();
         if !self.has_persistable_sram() {
             return Err("aucune sauvegarde SRAM active à transférer".into());
         }
@@ -1809,6 +2206,7 @@ impl EmulatorSession {
         let mut parts = raw_addr.split('=');
         let addr_part = parts.next().unwrap_or(raw_addr);
         let addr = parse_watchpoint_address(addr_part)?;
+        self.core_p1.sync_debug_caches();
         let ram = self.core_p1.read_ram_slice();
         let ram_val = if !ram.is_empty() {
             ram[(addr as usize).wrapping_sub(0xC000) % ram.len()]
@@ -1846,6 +2244,15 @@ impl EmulatorSession {
                     wp.frozen_value = wp.current_value;
                 }
             }
+        }
+        Ok(self.bootstrap_snapshot())
+    }
+
+    pub fn remove_memory_watchpoint(&mut self, watch_id: &str) -> Result<StationBootstrap, String> {
+        let before = self.memory_watchpoints.len();
+        self.memory_watchpoints.retain(|wp| wp.id != watch_id);
+        if self.memory_watchpoints.len() == before {
+            return Err(format!("watchpoint mémoire introuvable : {watch_id}"));
         }
         Ok(self.bootstrap_snapshot())
     }
@@ -2145,6 +2552,286 @@ mod tests {
             .unwrap();
         let (_, plan1_override) = session.prepare_switch_launch(Some(&sw1_id)).unwrap();
         assert_eq!(plan1_override.target, SwitchEngineTarget::Fritchii);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn p0_sram_dirty_frame_counter_slots_pack_crc_and_settings_roundtrip() {
+        let mut session = EmulatorSession::new();
+        let rom = test_gbc_battery_rom();
+        let boot = session.import_custom_rom("arena.gbc", &rom).unwrap();
+        assert_eq!(boot.save_slots.len(), 9);
+        assert!(!session.sram_dirty);
+
+        // Idle frames must NOT falsely mark SRAM dirty (prevents backup thrashing)
+        for _ in 0..32 {
+            session.step_viewport(0, 0, false);
+        }
+        assert_eq!(session.frame_counter, 32);
+        assert!(!session.refresh_sram_dirty_flag());
+
+        // Writing a byte into SRAM marks it dirty until mark_sram_flushed()
+        session.write_active_sram_byte(0, 0x42).unwrap();
+        assert!(session.sram_dirty);
+        assert!(session.refresh_sram_dirty_flag());
+        session.mark_sram_flushed();
+        assert!(!session.sram_dirty);
+        assert!(!session.refresh_sram_dirty_flag());
+
+        // Empty merge_scanned_entries returns None instead of catalog.first()
+        assert_eq!(session.merge_scanned_entries(Vec::new()), None);
+
+        // Save slots 7..=9 work and round-trip through portable packs
+        let s9 = session
+            .create_save_state(9, "Slot Neuf".into(), 999)
+            .unwrap();
+        assert_eq!(s9.slot, 9);
+        assert_eq!(s9.frame, 32);
+        let pack_bytes = session.export_portable_pack().unwrap();
+
+        // Corrupting the CRC inside the portable pack must be rejected
+        let mut bad_pack = decode_portable_pack(&pack_bytes).unwrap();
+        bad_pack.payload_crc32_hex = "DEADBEEF".into();
+        let bad_bytes = encode_portable_pack(&bad_pack).unwrap();
+        assert!(session.import_portable_pack(&bad_bytes).is_err());
+
+        // Valid pack re-imports slot 9 and marks SRAM dirty for persistence
+        session.save_states_ram.clear();
+        session.mark_sram_flushed();
+        let after_pack = session.import_portable_pack(&pack_bytes).unwrap();
+        assert!(after_pack.save_slots[8].occupied);
+        assert!(session.sram_dirty);
+
+        // Macros advance by 1 real frame per step (not cycles / 256)
+        session
+            .save_custom_macro("Combo 3f".into(), vec![BTN_A, BTN_RIGHT, BTN_A])
+            .unwrap();
+        assert!(session.active_macro_id.is_some());
+        session.step_viewport(0, 0, false);
+        assert_eq!(
+            session.recent_inputs_trace.last().copied(),
+            Some(BTN_A as u8)
+        );
+        session.step_viewport(0, 0, false);
+        assert_eq!(
+            session.recent_inputs_trace.last().copied(),
+            Some(BTN_RIGHT as u8)
+        );
+        session.step_viewport(0, 0, false);
+        assert_eq!(
+            session.recent_inputs_trace.last().copied(),
+            Some(BTN_A as u8)
+        );
+        session.set_active_macro(None);
+        assert!(session.active_macro_id.is_none());
+
+        // Settings sync & restore round-trips keymapper, cheats, macros, and UI preferences
+        session
+            .add_cheat_code("01FF04C0", "Max Gold".into())
+            .unwrap();
+        session.update_ui_preferences(
+            Some("mode-lcd".into()),
+            Some("XBRZ".into()),
+            Some(4),
+            Some("horizontal".into()),
+        );
+        session.sync_runtime_to_settings();
+        let saved_json = serde_json::to_string(&session.settings).unwrap();
+
+        let mut restored = EmulatorSession::new();
+        let parsed: GlobalSettings = serde_json::from_str(&saved_json).unwrap();
+        restored.apply_loaded_settings(parsed);
+        let snap = restored.bootstrap_snapshot();
+        assert_eq!(snap.active_shader_css, "mode-lcd");
+        assert_eq!(snap.upscaler_mode, "XBRZ");
+        assert_eq!(snap.speed_multiplier, 4);
+        assert_eq!(snap.nds_layout, "horizontal");
+        assert_eq!(snap.cheat_codes.len(), 1);
+        assert_eq!(snap.macros.len(), 1);
+    }
+
+    #[test]
+    fn p1_bios_import_delete_slot_favorite_overclock_and_ff_audio() {
+        use std::fs;
+        use zaimule_core::bios::BiosStatus;
+
+        let root = std::env::temp_dir().join(format!("zaimule-p1-sess-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let sys_dir = root.join("system");
+        fs::create_dir_all(&sys_dir).unwrap();
+
+        let bios7 = vec![0x33u8; 16_384];
+        let bios9 = vec![0x44u8; 4_096];
+        let firmware = vec![0x55u8; 262_144];
+        let zip_path = root.join("NDS BIOS & Firmware.zip");
+        fs::write(
+            &zip_path,
+            build_stored_zip_for_test(&[
+                ("bios7.bin", bios7.as_slice()),
+                ("bios9.bin", bios9.as_slice()),
+                ("firmware.bin", firmware.as_slice()),
+            ]),
+        )
+        .unwrap();
+
+        let mut session = EmulatorSession::new();
+        session.configure_paths(sys_dir, root.join("sav"), root.join("cache"));
+
+        let (report, snap_after_bios) = session.import_bios_paths(&[zip_path]).unwrap();
+        assert_eq!(report.imported.len(), 3);
+        let fw_entry = snap_after_bios
+            .bios_entries
+            .iter()
+            .find(|e| e.file_name == "firmware.bin")
+            .unwrap();
+        assert!(matches!(fw_entry.status, BiosStatus::CustomLoaded { .. }));
+
+        // Load NDS ROM with imported BIOS assets active + overclock profile
+        let nds_boot = session
+            .import_custom_rom("platine.nds", &test_nds_rom())
+            .unwrap();
+        let nds_id = nds_boot.active_game_id.clone();
+        assert!(nds_boot.catalog[0].favorite);
+
+        // Toggle favorite off and back on
+        let toggled_off = session.toggle_game_favorite(&nds_id).unwrap();
+        assert!(!toggled_off.catalog[0].favorite);
+        let toggled_on = session.toggle_game_favorite(&nds_id).unwrap();
+        assert!(toggled_on.catalog[0].favorite);
+
+        // Overclock + color correction applies cleanly to NDS core and survives re-select
+        let oc_snap = session.set_hardware_overclock_profile(150, true);
+        assert_eq!(oc_snap.effective_config.cpu_overclock_pct, 150);
+        session.select_game(&nds_id).unwrap();
+        let step_1x = session.step_viewport_with_speed(0, 0, false, 1);
+        let step_2x = session.step_viewport_with_speed(0, 0, false, 2);
+        assert!(!step_1x.primary.audio_samples.is_empty());
+        assert!(!step_2x.primary.audio_samples.is_empty());
+        assert_eq!(step_2x.primary.audio_samples.len() % 2, 0);
+        // Box-averaged 2x PCM should match ~1x frame sample count closely
+        assert!(
+            step_2x
+                .primary
+                .audio_samples
+                .len()
+                .abs_diff(step_1x.primary.audio_samples.len())
+                <= 4
+        );
+
+        // Create save slots #1 and #3, then delete slot #3 while preserving slot #1
+        session.create_save_state(1, "Slot 1".into(), 100).unwrap();
+        session.create_save_state(3, "Slot 3".into(), 200).unwrap();
+        let slots_after_del = session.delete_save_state(3).unwrap();
+        assert!(slots_after_del[0].occupied);
+        assert!(!slots_after_del[2].occupied);
+        assert!(session.restore_save_state(3).is_err());
+
+        // Lazy debug cache scan/inspect works without per-frame copies
+        let _ = session.scan_active_ram(0x00);
+        let dbg = session.inspect_vram_and_disassembly();
+        assert_eq!(dbg.disassembly.len(), 10);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn p2_reset_playtime_lan_netplay_folders_and_removals() {
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!("zaimule-p2-sess-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir_a = root.join("roms_a");
+        let dir_b = root.join("roms_b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+        fs::write(dir_a.join("arena.gbc"), test_gbc_battery_rom()).unwrap();
+
+        let mut session = EmulatorSession::new();
+        session.configure_paths(root.join("sys"), root.join("sav"), root.join("cache"));
+
+        // 1. Scan directory A, then add a new ROM in directory B and test rescan_all + remove_rom_directory
+        let rep_a = session.scan_directory_and_merge(&dir_a);
+        assert_eq!(rep_a.imported_entries.len(), 1);
+        let rep_b = session.scan_directory_and_merge(&dir_b);
+        assert_eq!(rep_b.imported_entries.len(), 0);
+        assert_eq!(session.settings.rom_directories.len(), 2);
+
+        fs::write(dir_b.join("horizon.gba"), test_gba_sram_rom()).unwrap();
+        let rescan = session.rescan_all_rom_directories();
+        assert_eq!(rescan.imported_entries.len(), 2);
+        assert_eq!(session.catalog.len(), 2);
+
+        let dir_b_str = dir_b.to_string_lossy().to_string();
+        let after_rm_dir = session.remove_rom_directory(&dir_b_str).unwrap();
+        assert_eq!(after_rm_dir.rom_directories.len(), 1);
+        assert!(session.remove_rom_directory(&dir_b_str).is_err());
+
+        // 2. Native playtime accumulates on stepped frames and sets playtime_dirty
+        let gbc_id = session
+            .catalog
+            .iter()
+            .find(|g| g.console == ConsoleKind::Gbc)
+            .unwrap()
+            .id
+            .clone();
+        session.select_game(&gbc_id).unwrap();
+        assert!(!session.take_playtime_dirty());
+        for _ in 0..65 {
+            session.step_viewport(0, 0, false);
+        }
+        assert!(session.take_playtime_dirty());
+        assert!(!session.take_playtime_dirty());
+        let playtime = session
+            .catalog
+            .iter()
+            .find(|g| g.id == gbc_id)
+            .unwrap()
+            .playtime_seconds;
+        assert!(playtime >= 1);
+
+        // 3. Hardware cold reset clears frame_counter & rewind buffer while preserving battery SRAM + dirty flag
+        session.write_active_sram_byte(0, 0xAB).unwrap();
+        assert!(session.sram_dirty);
+        assert!(session.frame_counter >= 65);
+        assert!(!session.rewind_buffer.is_empty());
+        let reset_snap = session.reset_active_game().unwrap();
+        assert_eq!(reset_snap.active_game_id, gbc_id);
+        assert_eq!(session.frame_counter, 0);
+        assert!(session.rewind_buffer.is_empty());
+        assert_eq!(session.active_sram_bytes()[0], 0xAB);
+        assert!(session.sram_dirty);
+
+        // 4. LAN UDP peer validation, connection, and clean disconnection (no fabricated STUN 198.51.100.x)
+        assert!(!reset_snap
+            .stun_candidate
+            .public_endpoint
+            .contains("198.51.100"));
+        assert!(session.connect_netplay_peer(Some("not-an-ip")).is_err());
+        assert!(session.connect_netplay_peer(Some("127.0.0.1:0")).is_err());
+        let connected = session
+            .connect_netplay_peer(Some("127.0.0.1:54999"))
+            .unwrap();
+        assert_eq!(connected.udp_peer_addr.as_deref(), Some("127.0.0.1:54999"));
+        let disconnected = session.connect_netplay_peer(None).unwrap();
+        assert_eq!(disconnected.udp_peer_addr, None);
+
+        // 5. Cheat code and memory watchpoint removal
+        let with_cheat = session
+            .add_cheat_code("01FF04C0", "Max Gold".into())
+            .unwrap();
+        let cheat_id = with_cheat.cheat_codes[0].id.clone();
+        let without_cheat = session.remove_cheat_code(&cheat_id).unwrap();
+        assert!(without_cheat.cheat_codes.is_empty());
+        assert!(session.remove_cheat_code(&cheat_id).is_err());
+
+        let with_wp = session
+            .add_memory_watchpoint("0xC010", "HP", false)
+            .unwrap();
+        let wp_id = with_wp.memory_watchpoints[0].id.clone();
+        let without_wp = session.remove_memory_watchpoint(&wp_id).unwrap();
+        assert!(without_wp.memory_watchpoints.is_empty());
+        assert!(session.remove_memory_watchpoint(&wp_id).is_err());
 
         let _ = fs::remove_dir_all(&root);
     }

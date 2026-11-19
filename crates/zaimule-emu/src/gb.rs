@@ -133,7 +133,6 @@ impl EmulatorBackend for GameBoyCore {
         let audio_freq_hz = apu_freq.min(u32::from(u16::MAX)) as u16;
         let serial_out_byte = gb.cpu_mut().bus.serial.take_tx();
 
-        self.refresh_sram_cache();
         let cpu = self.debug_snapshot();
 
         FrameStepResult {
@@ -170,6 +169,10 @@ impl EmulatorBackend for GameBoyCore {
 
     fn sram(&self) -> &[u8] {
         &self.sram_cache
+    }
+
+    fn sync_sram_cache(&mut self) {
+        self.refresh_sram_cache();
     }
 
     fn load_sram(&mut self, data: &[u8]) -> Result<(), String> {

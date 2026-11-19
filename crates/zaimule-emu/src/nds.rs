@@ -6,7 +6,7 @@
 //! - 16-channel Nintendo DS SPU stereo synthesizer (`PCM8`, `PCM16`, `IMA-ADPCM`, PSG square, LFSR noise) resampled to `48 kHz`
 //! - Interactive lower-screen Stylus ADC, 512 KiB Flash backup SRAM, and RLE `"ZMND"` savestates
 
-use crate::nds_core::{NdsMachine, NDS_HEIGHT, NDS_WIDTH};
+use crate::nds_core::{NdsBiosAssets, NdsMachine, NDS_HEIGHT, NDS_WIDTH};
 use crate::traits::{
     pcm_rms_level, solid_obsidian_rgba, CpuDebugSnapshot, EmulatorBackend, FrameStepResult,
     DEFAULT_SAMPLE_RATE_HZ,
@@ -22,6 +22,7 @@ pub struct NdsCore {
     stylus_x: u8,
     stylus_y: u8,
     stylus_down: bool,
+    cpu_overclock_pct: u16,
     sram_cache: Vec<u8>,
     ram_cache: Vec<u8>,
     vram_cache: Vec<u8>,
@@ -46,6 +47,7 @@ impl NdsCore {
             stylus_x: 128,
             stylus_y: 96,
             stylus_down: false,
+            cpu_overclock_pct: 100,
             sram_cache: Vec::new(),
             ram_cache: Vec::new(),
             vram_cache: Vec::new(),
@@ -57,17 +59,36 @@ impl NdsCore {
         self.inner.is_some()
     }
 
-    fn sync_debug_and_sram_caches(&mut self, force_sram: bool) {
+    /// Loads an NDS ROM alongside optional user-provided `bios7.bin`, `bios9.bin`, and `firmware.bin`.
+    pub fn load_rom_with_bios(&mut self, rom: &[u8], bios: NdsBiosAssets) -> Result<(), String> {
+        let mut nds = NdsMachine::from_rom_with_bios(rom, bios)?;
+        nds.set_audio_rate(DEFAULT_SAMPLE_RATE_HZ);
+        nds.set_cpu_overclock_pct(self.cpu_overclock_pct);
+        self.frame_number = 0;
+        self.stylus_down = false;
+        self.inner = Some(nds);
+        self.refresh_sram_cache(true);
+        self.refresh_debug_caches();
+        Ok(())
+    }
+
+    fn refresh_sram_cache(&mut self, force_sram: bool) {
         let Some(ref mut nds) = self.inner else {
             self.sram_cache.clear();
-            self.ram_cache.clear();
-            self.vram_cache.clear();
             return;
         };
         if force_sram || nds.is_sram_dirty() {
             self.sram_cache = nds.export_sram();
             nds.clear_sram_dirty();
         }
+    }
+
+    fn refresh_debug_caches(&mut self) {
+        let Some(ref nds) = self.inner else {
+            self.ram_cache.clear();
+            self.vram_cache.clear();
+            return;
+        };
         self.ram_cache = nds.main_ram_copy(0, 0x8000);
         self.vram_cache = nds.vram_bank_copy(0, 0, 0x4000);
     }
@@ -79,13 +100,7 @@ impl EmulatorBackend for NdsCore {
     }
 
     fn load_rom(&mut self, rom: &[u8]) -> Result<(), String> {
-        let mut nds = NdsMachine::from_rom(rom)?;
-        nds.set_audio_rate(DEFAULT_SAMPLE_RATE_HZ);
-        self.frame_number = 0;
-        self.stylus_down = false;
-        self.inner = Some(nds);
-        self.sync_debug_and_sram_caches(true);
-        Ok(())
+        self.load_rom_with_bios(rom, NdsBiosAssets::default())
     }
 
     fn step_frame(&mut self, buttons_mask: u16) -> FrameStepResult {
@@ -106,10 +121,6 @@ impl EmulatorBackend for NdsCore {
             (self.standby_rgba.clone(), Vec::new(), 0)
         };
         let audio_level = pcm_rms_level(&audio_samples);
-
-        if self.inner.is_some() {
-            self.sync_debug_and_sram_caches(false);
-        }
 
         let cpu = self.debug_snapshot();
 
@@ -141,8 +152,10 @@ impl EmulatorBackend for NdsCore {
         };
         nds.load_state_bytes(data)?;
         nds.set_audio_rate(DEFAULT_SAMPLE_RATE_HZ);
+        nds.set_cpu_overclock_pct(self.cpu_overclock_pct);
         self.frame_number = u64::from(nds.frame_count());
-        self.sync_debug_and_sram_caches(true);
+        self.refresh_sram_cache(true);
+        self.refresh_debug_caches();
         Ok(())
     }
 
@@ -155,8 +168,23 @@ impl EmulatorBackend for NdsCore {
             return Err("aucune ROM Nintendo DS chargée".into());
         };
         nds.load_sram(data);
-        self.sync_debug_and_sram_caches(true);
+        self.refresh_sram_cache(true);
         Ok(())
+    }
+
+    fn sync_sram_cache(&mut self) {
+        self.refresh_sram_cache(false);
+    }
+
+    fn sync_debug_caches(&mut self) {
+        self.refresh_debug_caches();
+    }
+
+    fn set_cpu_overclock_pct(&mut self, pct: u16) {
+        self.cpu_overclock_pct = pct.clamp(50, 400);
+        if let Some(ref mut nds) = self.inner {
+            nds.set_cpu_overclock_pct(self.cpu_overclock_pct);
+        }
     }
 
     fn exchange_serial_byte(&mut self, incoming: u8) -> u8 {
@@ -200,14 +228,22 @@ impl EmulatorBackend for NdsCore {
             if thumb { 'T' } else { 'A' },
             code_tag
         );
-        let arch = if thumb {
-            "ARM946E-S (NDS · Thumb · SPU 16-ch)"
+        let (has_b7, has_b9) = nds.has_custom_bios();
+        let bios_mode = if has_b7 && has_b9 {
+            "BIOS"
+        } else if has_b7 || has_b9 {
+            "BIOS/HLE"
         } else {
-            "ARM946E-S + ARM7 (NDS · SPU 16-ch)"
+            "HLE"
+        };
+        let arch = if thumb {
+            format!("ARM946E-S (NDS · Thumb · {bios_mode} · SPU 16-ch)")
+        } else {
+            format!("ARM946E-S + ARM7 (NDS · {bios_mode} · SPU 16-ch)")
         };
 
         CpuDebugSnapshot {
-            arch: arch.into(),
+            arch,
             pc_hex: format!("0x{:08X}", regs[15]),
             sp_hex: format!("0x{:08X}", regs[13]),
             reg_a_hex: format!("0x{:08X}", regs[0]),
@@ -215,10 +251,10 @@ impl EmulatorBackend for NdsCore {
             reg_de_hex: format!("0x{:08X}", regs[2]),
             reg_hl_hex: format!("0x{:08X}", regs[14]),
             flags_str: flags,
-            ly_scanline: 0,
+            ly_scanline: nds.vcount().min(255) as u8,
             serial_sb_hex: "0x00".into(),
             serial_sc_hex: "0x00".into(),
-            cycles: u64::from(nds.frame_count()) * 256,
+            cycles: nds.scanline_clock().saturating_mul(2124),
             score: 0,
         }
     }
@@ -325,6 +361,10 @@ mod tests {
         assert_eq!(f1.sample_rate_hz, DEFAULT_SAMPLE_RATE_HZ);
         assert!(f1.cpu.flags_str.contains("ZMLN"));
         assert!(f1.cpu.arch.contains("SPU 16-ch"));
+        assert!(f1.cpu.arch.contains("HLE"));
+        assert!(f1.cpu.ly_scanline > 0);
+        assert!(f1.cpu.cycles >= 263 * 2124);
+        core.sync_debug_caches();
         assert_eq!(core.read_ram_slice()[4], 0x55);
 
         let state = core.save_state().unwrap();
@@ -335,6 +375,38 @@ mod tests {
 
         core.load_state(&state).unwrap();
         assert_eq!(core.read_ram_slice()[4], 0x55);
+    }
+
+    #[test]
+    fn loads_custom_bios7_bios9_firmware_and_preserves_across_savestate() {
+        let mut bios7 = vec![0u8; 0x4000];
+        bios7[0x0100] = 0x5A;
+        let mut bios9 = vec![0u8; 0x1000];
+        bios9[0x0100] = 0xA5;
+        let fw = vec![0xFFu8; 0x4_0000];
+
+        let mut core = NdsCore::new_empty();
+        core.set_cpu_overclock_pct(150);
+        core.load_rom_with_bios(
+            &minimal_nds_nitro_rom(),
+            NdsBiosAssets {
+                bios7: Some(bios7),
+                bios9: Some(bios9),
+                firmware: Some(fw),
+            },
+        )
+        .unwrap();
+        assert!(core.debug_snapshot().arch.contains("BIOS"));
+        let inner = core.inner.as_mut().unwrap();
+        assert_eq!(inner.has_custom_bios(), (true, true));
+        assert_eq!(inner.cpu_overclock_pct(), 150);
+        assert_eq!(inner.read_mem8(0xFFFF_0100), 0xA5);
+
+        let snap = core.save_state().unwrap();
+        core.load_state(&snap).unwrap();
+        let inner2 = core.inner.as_mut().unwrap();
+        assert_eq!(inner2.has_custom_bios(), (true, true));
+        assert_eq!(inner2.read_mem8(0xFFFF_0100), 0xA5);
     }
 
     #[test]

@@ -11,10 +11,15 @@ struct Key1 {
 }
 
 impl Key1 {
-    fn new(gamecode: u32) -> Self {
+    fn new_with_table(gamecode: u32, table: &[u8]) -> Self {
+        let src = if table.len() >= (18 + 1024) * 4 {
+            table
+        } else {
+            ENCR_DATA
+        };
         let mut magic = [0u32; 18 + 1024];
         for (i, m) in magic.iter_mut().enumerate() {
-            *m = u32::from_le_bytes(ENCR_DATA[i * 4..i * 4 + 4].try_into().unwrap());
+            *m = u32::from_le_bytes(src[i * 4..i * 4 + 4].try_into().unwrap());
         }
         let mut k = Self {
             magic,
@@ -90,16 +95,20 @@ impl Key1 {
 }
 
 /// Decrypt a KEY1-encrypted secure area (2KB at ROM offset 0x4000) in
-/// place. Returns false (leaving data untouched) if the "encryObj"
-/// check fails, i.e. the area was already decrypted or is corrupt.
-pub fn decrypt_secure_area(gamecode: u32, sec: &mut [u8]) -> bool {
+/// place using an optional user-supplied `bios7.bin` (Blowfish table at
+/// `0x0030..0x1078`), falling back to built-in `key1.bin`.
+pub fn decrypt_secure_area_with_bios7(gamecode: u32, sec: &mut [u8], bios7: Option<&[u8]>) -> bool {
     let word = |d: &[u8], i: usize| u32::from_le_bytes(d[i * 4..i * 4 + 4].try_into().unwrap());
     if word(sec, 0) == 0xE7FF_DEFF {
         return false; // already decrypted
     }
     let mut buf: Vec<u32> = (0..0x200).map(|i| word(sec, i)).collect();
 
-    let mut k = Key1::new(gamecode);
+    let table = bios7
+        .filter(|b| b.len() >= 0x30 + (18 + 1024) * 4)
+        .map(|b| &b[0x30..0x30 + (18 + 1024) * 4])
+        .unwrap_or(ENCR_DATA);
+    let mut k = Key1::new_with_table(gamecode, table);
     let (mut w1, mut w0) = (buf[1], buf[0]);
     k.decrypt(&mut w1, &mut w0);
     buf[1] = w1;
@@ -132,4 +141,11 @@ pub fn decrypt_secure_area(gamecode: u32, sec: &mut [u8]) -> bool {
         sec[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
     }
     true
+}
+
+/// Decrypt a KEY1-encrypted secure area (2KB at ROM offset 0x4000) in
+/// place. Returns false (leaving data untouched) if the "encryObj"
+/// check fails, i.e. the area was already decrypted or is corrupt.
+pub fn decrypt_secure_area(gamecode: u32, sec: &mut [u8]) -> bool {
+    decrypt_secure_area_with_bios7(gamecode, sec, None)
 }

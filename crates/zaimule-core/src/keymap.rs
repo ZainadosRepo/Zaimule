@@ -77,7 +77,7 @@ pub fn default_keymapper_widgets() -> Vec<KeymapWidget> {
         },
         KeymapWidget {
             id: "km-btn-a".into(),
-            label: "🅱 Bouton A [J / Espace]".into(),
+            label: "🅰 Bouton A [J / Espace]".into(),
             kind: KeymapWidgetKind::ActionButton,
             key_binding: "KeyJ".into(),
             button_mask: BTN_A,
@@ -87,7 +87,7 @@ pub fn default_keymapper_widgets() -> Vec<KeymapWidget> {
         },
         KeymapWidget {
             id: "km-btn-b".into(),
-            label: "🅰 Bouton B [K / Shift]".into(),
+            label: "🅱 Bouton B [K / Shift]".into(),
             kind: KeymapWidgetKind::ActionButton,
             key_binding: "KeyK".into(),
             button_mask: BTN_B,
@@ -107,9 +107,9 @@ pub fn default_keymapper_widgets() -> Vec<KeymapWidget> {
         },
         KeymapWidget {
             id: "km-touch-nds".into(),
-            label: "🖱 Tactile NDS / Menu [E]".into(),
+            label: "🖱 Tactile NDS / Start [Entrée]".into(),
             kind: KeymapWidgetKind::TouchTapZone,
-            key_binding: "KeyE".into(),
+            key_binding: "Enter".into(),
             button_mask: BTN_START,
             x_pct: 20.0,
             y_pct: 16.0,

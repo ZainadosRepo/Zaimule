@@ -175,6 +175,13 @@ export function applyCrtPhosphorBloomRgba(rgba, width, height) {
   return { width: w, height: h, rgba: out };
 }
 
+export const NDS_LAYOUT_MODES = [
+  "vertical",
+  "horizontal",
+  "vertical-swapped",
+  "horizontal-swapped",
+];
+
 /**
  * Transforms a frame `{ width, height, rgba }` according to the active upscaler mode.
  */
@@ -192,5 +199,66 @@ export function upscaleFrameIfEnabled(frame, mode = "OFF") {
   if (normalized === "BLOOM") {
     return applyCrtPhosphorBloomRgba(frame.rgba, frame.width, frame.height);
   }
+  return frame;
+}
+
+/**
+ * Rearranges a vertically stacked Nintendo DS dual-screen RGBA frame `(W, H)`
+ * (top screen `0..H/2`, touchscreen `H/2..H`) according to the chosen layout:
+ * - `"vertical"` -> `(W, H)` unchanged
+ * - `"vertical-swapped"` -> `(W, H)` with touchscreen on top, main screen below
+ * - `"horizontal"` -> `(2*W, H/2)` with main screen left, touchscreen right
+ * - `"horizontal-swapped"` -> `(2*W, H/2)` with touchscreen left, main screen right
+ */
+export function arrangeNdsDualScreenFrame(frame, layout = "vertical") {
+  if (!frame || !frame.rgba) {
+    return frame;
+  }
+  const mode = String(layout || "vertical").toLowerCase();
+  if (mode === "vertical") {
+    return frame;
+  }
+  const w = Math.floor(Number(frame.width) || 0);
+  const h = Math.floor(Number(frame.height) || 0);
+  if (w <= 0 || h < 2 || (h & 1) !== 0) {
+    return frame;
+  }
+  const halfH = h >> 1;
+  const rowBytes = w * 4;
+  const halfBytes = halfH * rowBytes;
+  const src = frame.rgba;
+  if (src.length < halfBytes * 2) {
+    return frame;
+  }
+
+  if (mode === "vertical-swapped") {
+    const out = new Uint8ClampedArray(w * h * 4);
+    out.set(src.subarray(halfBytes, halfBytes * 2), 0);
+    out.set(src.subarray(0, halfBytes), halfBytes);
+    return { width: w, height: h, rgba: out };
+  }
+
+  if (mode === "horizontal" || mode === "horizontal-swapped") {
+    const outW = w * 2;
+    const outH = halfH;
+    const outRowBytes = outW * 4;
+    const out = new Uint8ClampedArray(outW * outH * 4);
+    const swapped = mode === "horizontal-swapped";
+
+    for (let y = 0; y < halfH; y += 1) {
+      const topOff = y * rowBytes;
+      const botOff = (y + halfH) * rowBytes;
+      const dstOff = y * outRowBytes;
+      if (swapped) {
+        out.set(src.subarray(botOff, botOff + rowBytes), dstOff);
+        out.set(src.subarray(topOff, topOff + rowBytes), dstOff + rowBytes);
+      } else {
+        out.set(src.subarray(topOff, topOff + rowBytes), dstOff);
+        out.set(src.subarray(botOff, botOff + rowBytes), dstOff + rowBytes);
+      }
+    }
+    return { width: outW, height: outH, rgba: out };
+  }
+
   return frame;
 }

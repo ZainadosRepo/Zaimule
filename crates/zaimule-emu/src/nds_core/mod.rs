@@ -17,9 +17,10 @@ mod render3d;
 mod spu;
 pub mod state;
 
-use bus::{user_settings_block, Bus, Machine, MachineHandle, View, DMA_VBLANK, IRQ_VBLANK};
+use bus::{Bus, Machine, MachineHandle, View, DMA_HBLANK, DMA_VBLANK, IRQ_HBLANK, IRQ_VBLANK};
 use cpu::Cpu;
 use ppu::Ppu;
+use std::path::Path;
 use zaimule_core::keymap::{
     BTN_A, BTN_B, BTN_DOWN, BTN_L, BTN_LEFT, BTN_R, BTN_RIGHT, BTN_SELECT, BTN_START, BTN_UP,
     BTN_X, BTN_Y,
@@ -35,6 +36,35 @@ const ARM7_INSTR_PER_LINE: u32 = 500;
 const SPU_CYCLES_PER_LINE: u32 = 1062;
 const PEN_RELEASE_FRAMES: u32 = 3;
 
+/// Optional user-supplied Nintendo DS system images loaded from `system_dir`.
+#[derive(Debug, Clone, Default)]
+pub struct NdsBiosAssets {
+    pub bios7: Option<Vec<u8>>,
+    pub bios9: Option<Vec<u8>>,
+    pub firmware: Option<Vec<u8>>,
+}
+
+impl NdsBiosAssets {
+    /// Loads valid `bios7.bin` (16 KiB), `bios9.bin` (4 KiB), and `firmware.bin` (128/256/512 KiB)
+    /// from `system_dir`, silently ignoring missing or invalidly sized files so HLE fallback remains active.
+    pub fn load_from_dir(system_dir: &Path) -> Self {
+        let bios7 = std::fs::read(system_dir.join("bios7.bin"))
+            .ok()
+            .filter(|b| b.len() == 0x4000);
+        let bios9 = std::fs::read(system_dir.join("bios9.bin"))
+            .ok()
+            .filter(|b| b.len() == 0x1000);
+        let firmware = std::fs::read(system_dir.join("firmware.bin"))
+            .ok()
+            .filter(|b| matches!(b.len(), 0x2_0000 | 0x4_0000 | 0x8_0000));
+        Self {
+            bios7,
+            bios9,
+            firmware,
+        }
+    }
+}
+
 pub struct NdsMachine {
     cpu9: Cpu<View>,
     cpu7: Cpu<View>,
@@ -42,6 +72,7 @@ pub struct NdsMachine {
     rom: Vec<u8>,
     frame_count: u32,
     pen_up_frames: u32,
+    cpu_overclock_pct: u16,
     framebuffer_rgba: Vec<u8>,
     // Keep `MachineHandle` LAST so `cpu9` and `cpu7` (holding `MachinePtr`) drop first.
     machine: MachineHandle,
@@ -49,13 +80,21 @@ pub struct NdsMachine {
 
 impl NdsMachine {
     pub fn from_rom(rom_bytes: &[u8]) -> Result<Self, String> {
+        Self::from_rom_with_bios(rom_bytes, NdsBiosAssets::default())
+    }
+
+    pub fn from_rom_with_bios(rom_bytes: &[u8], bios: NdsBiosAssets) -> Result<Self, String> {
         if rom_bytes.len() < 0x170 {
             return Err("ROM Nintendo DS invalide : en-tête trop court (< 0x170 octets)".into());
         }
         let mut rom = rom_bytes.to_vec();
         if rom.len() > 0x4800 {
             let gamecode = u32::from_le_bytes(rom[0x0C..0x10].try_into().unwrap());
-            key1::decrypt_secure_area(gamecode, &mut rom[0x4000..0x4800]);
+            key1::decrypt_secure_area_with_bios7(
+                gamecode,
+                &mut rom[0x4000..0x4800],
+                bios.bios7.as_deref(),
+            );
         }
 
         let r32 = |off: usize| u32::from_le_bytes(rom[off..off + 4].try_into().unwrap());
@@ -89,6 +128,7 @@ impl NdsMachine {
 
         let mut machine_inner = Machine::new();
         machine_inner.rom = rom.clone();
+        let us = machine_inner.install_bios_and_firmware(bios.bios7, bios.bios9, bios.firmware);
         let machine = MachineHandle::new(machine_inner);
 
         let mut cpu9 = Cpu::new(
@@ -136,7 +176,6 @@ impl NdsMachine {
         cpu9.bus.write16(0x027F_FC10, 0x5835);
         cpu9.bus.write32(0x027F_FC40, 1);
 
-        let us = user_settings_block();
         for (i, &b) in us.iter().enumerate() {
             cpu9.bus.write8(0x027F_FC80 + i as u32, b);
         }
@@ -148,9 +187,23 @@ impl NdsMachine {
             rom,
             frame_count: 0,
             pen_up_frames: u32::MAX,
+            cpu_overclock_pct: 100,
             framebuffer_rgba: vec![0; NDS_WIDTH * NDS_HEIGHT * 4],
             machine,
         })
+    }
+
+    pub fn set_cpu_overclock_pct(&mut self, pct: u16) {
+        self.cpu_overclock_pct = pct.clamp(50, 400);
+    }
+
+    pub fn cpu_overclock_pct(&self) -> u16 {
+        self.cpu_overclock_pct
+    }
+
+    pub fn has_custom_bios(&self) -> (bool, bool) {
+        let mm = self.machine.borrow();
+        (mm.bios7.is_some(), mm.bios9.is_some())
     }
 
     pub fn game_code(&self) -> String {
@@ -165,6 +218,14 @@ impl NdsMachine {
 
     pub fn frame_count(&self) -> u32 {
         self.frame_count
+    }
+
+    pub fn vcount(&self) -> u16 {
+        self.machine.borrow().vcount
+    }
+
+    pub fn scanline_clock(&self) -> u64 {
+        self.machine.borrow().now
     }
 
     pub fn step_frame(&mut self, buttons_p1: u16, touch: Option<(u32, u32, bool)>) -> &[u8] {
@@ -188,6 +249,14 @@ impl NdsMachine {
             }
         }
 
+        let sub_slices = ARM7_INSTR_PER_LINE / 8;
+        let hdraw_slices = (sub_slices * 3) / 4;
+        let hblank_slices = sub_slices - hdraw_slices;
+        let arm9_per_line = ((u64::from(ARM9_INSTR_PER_LINE) * u64::from(self.cpu_overclock_pct))
+            / 100)
+            .max(500) as u32;
+        let arm9_per_slice = (arm9_per_line / sub_slices).max(1);
+
         for line in 0..SCANLINES_PER_FRAME {
             {
                 let mut mm = self.machine.borrow_mut();
@@ -196,7 +265,8 @@ impl NdsMachine {
                 for cpu in 0..2 {
                     let in_vblank = (192..262).contains(&line);
                     let stat = &mut mm.dispstat[cpu];
-                    *stat = (*stat & !1) | u16::from(in_vblank);
+                    // Clear HBlank bit (bit 1) at start of scanline; update VBlank (bit 0) & VMatch (bit 2).
+                    *stat = (*stat & !3) | u16::from(in_vblank);
                     let target = (*stat >> 8) | ((*stat & 0x80) << 1);
                     let matched = line as u16 == target;
                     *stat = (*stat & !4) | (u16::from(matched) << 2);
@@ -220,9 +290,27 @@ impl NdsMachine {
                 self.cpu7.bus.dma_service(DMA_VBLANK);
             }
             self.machine.borrow_mut().tick_timers(2124);
-            let sub_slices = ARM7_INSTR_PER_LINE / 8;
-            for _ in 0..sub_slices {
-                self.cpu9.run_slice(ARM9_INSTR_PER_LINE / sub_slices);
+            // HDraw phase (~74% of scanline)
+            for _ in 0..hdraw_slices {
+                self.cpu9.run_slice(arm9_per_slice);
+                self.cpu7.run_slice(8);
+            }
+            // Enter HBlank: assert DISPSTAT bit 1, fire HBlank IRQ (if enabled), and service ARM9 HBlank DMA on visible lines.
+            {
+                let mut mm = self.machine.borrow_mut();
+                for cpu in 0..2 {
+                    mm.dispstat[cpu] |= 2;
+                    if mm.dispstat[cpu] & 0x10 != 0 {
+                        mm.if_[cpu] |= IRQ_HBLANK;
+                    }
+                }
+            }
+            if line < 192 {
+                self.cpu9.bus.dma_service(DMA_HBLANK);
+            }
+            // HBlank phase (~26% of scanline)
+            for _ in 0..hblank_slices {
+                self.cpu9.run_slice(arm9_per_slice);
                 self.cpu7.run_slice(8);
             }
             self.machine

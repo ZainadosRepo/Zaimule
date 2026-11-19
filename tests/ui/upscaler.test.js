@@ -2,10 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   UPSCALER_MODES,
+  NDS_LAYOUT_MODES,
   applyScale2xRgba,
   applyXbrz2xRgba,
   applyCrtPhosphorBloomRgba,
   upscaleFrameIfEnabled,
+  arrangeNdsDualScreenFrame,
 } from "../../ui/upscaler.js";
 
 test("applyScale2xRgba doubles dimensions and smooths diagonal pixel edges", () => {
@@ -98,4 +100,52 @@ test("upscaleFrameIfEnabled dispatches OFF, SCALE2X, XBRZ, and BLOOM modes clean
   const bloom = upscaleFrameIfEnabled(baseFrame, "BLOOM");
   assert.equal(bloom.width, 2);
   assert.equal(bloom.height, 2);
+});
+
+test("arrangeNdsDualScreenFrame rearranges top/touch halves across all 4 layouts", () => {
+  assert.deepEqual(NDS_LAYOUT_MODES, [
+    "vertical",
+    "horizontal",
+    "vertical-swapped",
+    "horizontal-swapped",
+  ]);
+  // 2x4 frame: rows 0..1 = top screen (red), rows 2..3 = touch screen (blue)
+  const w = 2;
+  const h = 4;
+  const rgba = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const idx = (y * w + x) * 4;
+      rgba[idx] = y < 2 ? 220 : 10;
+      rgba[idx + 1] = 20;
+      rgba[idx + 2] = y < 2 ? 10 : 240;
+      rgba[idx + 3] = 255;
+    }
+  }
+  const frame = { width: w, height: h, rgba };
+
+  // Vertical -> identity
+  const vert = arrangeNdsDualScreenFrame(frame, "vertical");
+  assert.equal(vert, frame);
+
+  // Vertical-swapped -> blue on top (y=0), red on bottom (y=2)
+  const vSwap = arrangeNdsDualScreenFrame(frame, "vertical-swapped");
+  assert.equal(vSwap.width, 2);
+  assert.equal(vSwap.height, 4);
+  assert.equal(vSwap.rgba[2], 240);
+  assert.equal(vSwap.rgba[(2 * 2) * 4], 220);
+
+  // Horizontal -> 4x2: red on left (x=0..1), blue on right (x=2..3)
+  const horiz = arrangeNdsDualScreenFrame(frame, "horizontal");
+  assert.equal(horiz.width, 4);
+  assert.equal(horiz.height, 2);
+  assert.equal(horiz.rgba[0], 220);
+  assert.equal(horiz.rgba[2 * 4 + 2], 240);
+
+  // Horizontal-swapped -> 4x2: blue on left (x=0..1), red on right (x=2..3)
+  const hSwap = arrangeNdsDualScreenFrame(frame, "horizontal-swapped");
+  assert.equal(hSwap.width, 4);
+  assert.equal(hSwap.height, 2);
+  assert.equal(hSwap.rgba[2], 240);
+  assert.equal(hSwap.rgba[2 * 4], 220);
 });

@@ -96,7 +96,8 @@ impl Default for UdpNetplayNode {
 
 impl UdpNetplayNode {
     pub fn bind_ephemeral() -> Self {
-        match UdpSocket::bind("127.0.0.1:0") {
+        let bound = UdpSocket::bind("0.0.0.0:0").or_else(|_| UdpSocket::bind("127.0.0.1:0"));
+        match bound {
             Ok(sock) => {
                 let _ = sock.set_nonblocking(true);
                 let port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
@@ -123,6 +124,27 @@ impl UdpNetplayNode {
         if !trimmed.is_empty() {
             self.peer_addr = Some(trimmed.to_string());
         }
+    }
+
+    /// Validates an `IP:PORT` socket address and attaches it as the active UDP P2P peer.
+    pub fn connect_peer_validated(&mut self, peer_addr: &str) -> Result<String, String> {
+        let trimmed = peer_addr.trim();
+        if trimmed.is_empty() {
+            return Err("adresse du pair UDP vide (attendu : IP:PORT)".into());
+        }
+        let parsed: std::net::SocketAddr = trimmed.parse().map_err(|_| {
+            format!("adresse UDP invalide '{trimmed}' (format attendu : 192.168.1.20:54920)")
+        })?;
+        if parsed.port() == 0 {
+            return Err("le port UDP du pair doit être supérieur à 0".into());
+        }
+        let normalized = parsed.to_string();
+        self.peer_addr = Some(normalized.clone());
+        Ok(normalized)
+    }
+
+    pub fn disconnect_peer(&mut self) {
+        self.peer_addr = None;
     }
 
     pub fn send_frame_packet(&mut self, pkt: NetplayWirePacket) -> bool {
@@ -205,7 +227,7 @@ pub fn default_netplay_rooms() -> Vec<NetplayRoom> {
     Vec::new()
 }
 
-/// STUN / UDP Hole-Punching NAT traversal discovery report.
+/// Local network / LAN UDP P2P endpoint report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StunDiscoveryCandidate {
@@ -215,16 +237,46 @@ pub struct StunDiscoveryCandidate {
     pub stun_latency_ms: u16,
 }
 
-/// Computes a deterministic STUN / UDP Hole-Punching candidate endpoint for P2P NAT traversal.
+/// Queries the OS routing table via an unconnected-traffic UDP bind+connect (zero packets sent)
+/// to determine the host's primary non-loopback LAN IPv4 address.
+pub fn detect_local_lan_ip() -> Option<std::net::IpAddr> {
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    for probe in ["192.0.2.1:80", "10.255.255.1:80", "192.168.1.1:80"] {
+        if sock.connect(probe).is_ok() {
+            if let Ok(local) = sock.local_addr() {
+                let ip = local.ip();
+                if !ip.is_loopback() && !ip.is_unspecified() {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Reports the real local LAN UDP P2P endpoint (never fabricates a synthetic STUN IP).
 pub fn discover_stun_candidate(local_port: u16) -> StunDiscoveryCandidate {
-    let port = if local_port == 0 { 54920 } else { local_port };
-    let oct_c = ((port >> 8) & 0xFF).max(12);
-    let oct_d = (port & 0xFF).max(42);
-    StunDiscoveryCandidate {
-        public_endpoint: format!("198.51.100.{oct_c}:{port}"),
-        nat_type: "Full-Cone NAT (UDP Hole Punching Actif)".into(),
-        hole_punch_ready: true,
-        stun_latency_ms: 4 + (oct_d % 7),
+    if local_port == 0 {
+        return StunDiscoveryCandidate {
+            public_endpoint: "Indisponible".into(),
+            nat_type: "Socket UDP inactif".into(),
+            hole_punch_ready: false,
+            stun_latency_ms: 0,
+        };
+    }
+    match detect_local_lan_ip() {
+        Some(lan_ip) => StunDiscoveryCandidate {
+            public_endpoint: format!("{lan_ip}:{local_port}"),
+            nat_type: "LAN UDP P2P (Direct)".into(),
+            hole_punch_ready: true,
+            stun_latency_ms: 0,
+        },
+        None => StunDiscoveryCandidate {
+            public_endpoint: format!("127.0.0.1:{local_port}"),
+            nat_type: "Localhost (Boucle locale)".into(),
+            hole_punch_ready: false,
+            stun_latency_ms: 0,
+        },
     }
 }
 
@@ -354,11 +406,30 @@ mod tests {
 
     #[test]
     fn stun_candidate_and_empty_defaults_initialize_cleanly() {
-        let stun = discover_stun_candidate(54920);
-        assert!(stun.hole_punch_ready);
-        assert!(stun.public_endpoint.ends_with(":54920"));
+        let inactive = discover_stun_candidate(0);
+        assert!(!inactive.hole_punch_ready);
+        assert_eq!(inactive.public_endpoint, "Indisponible");
+
+        let candidate = discover_stun_candidate(54920);
+        assert!(!candidate.public_endpoint.starts_with("198.51.100."));
+        assert!(candidate.public_endpoint.ends_with(":54920"));
         assert!(default_netplay_rooms().is_empty());
         assert!(default_netplay_chat().is_empty());
+    }
+
+    #[test]
+    fn udp_node_validates_and_disconnects_peers() {
+        let mut node = UdpNetplayNode::bind_ephemeral();
+        assert!(node.connect_peer_validated("").is_err());
+        assert!(node.connect_peer_validated("not-an-ip").is_err());
+        assert!(node.connect_peer_validated("127.0.0.1:0").is_err());
+
+        let normalized = node.connect_peer_validated(" 127.0.0.1:54920 ").unwrap();
+        assert_eq!(normalized, "127.0.0.1:54920");
+        assert_eq!(node.peer_addr.as_deref(), Some("127.0.0.1:54920"));
+
+        node.disconnect_peer();
+        assert!(node.peer_addr.is_none());
     }
 
     #[test]

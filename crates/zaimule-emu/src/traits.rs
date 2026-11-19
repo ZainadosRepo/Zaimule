@@ -132,6 +132,12 @@ pub trait EmulatorBackend: Send {
     fn write_vram_byte(&mut self, _offset: usize, _val: u8) {}
     fn set_touch_stylus(&mut self, _x: u8, _y: u8, _pressed: bool) {}
     fn set_color_correction(&mut self, _enabled: bool) {}
+    /// Refreshes internal SRAM cache on demand (avoids copying SRAM on every video frame).
+    fn sync_sram_cache(&mut self) {}
+    /// Refreshes RAM/VRAM debug mirror slices on demand (avoids per-frame copies when debugger/watchpoints are idle).
+    fn sync_debug_caches(&mut self) {}
+    /// Applies CPU instruction budget scaling (`50..=400`, default `100`%) on cores that support overclocking.
+    fn set_cpu_overclock_pct(&mut self, _pct: u16) {}
 }
 
 #[cfg(test)]

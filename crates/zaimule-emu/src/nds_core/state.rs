@@ -863,9 +863,17 @@ pub fn restore_snapshot<B: Bus>(
     {
         let mut mm = machine.borrow_mut();
         let io_log = mm.io_log.take();
+        let bios7 = mm.bios7.take();
+        let bios9 = mm.bios9.take();
+        let touch_cal = mm.touch_cal;
         *mm = restored_machine;
         mm.rom = rom.to_vec();
         mm.io_log = io_log;
+        mm.bios7 = bios7;
+        mm.bios9 = bios9;
+        mm.touch_cal = super::bus::extract_firmware_user_settings(&mm.firmware)
+            .and_then(|us| super::bus::TouchCalibration::from_user_settings(&us))
+            .or(touch_cal);
         mm.save_dirty = false;
     }
     cpu9.restore(c9);

@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
+use zaimule_core::bios::{looks_like_bios_path, BiosImportReport};
 use zaimule_core::catalog::SwitchEngineOverride;
 use zaimule_core::external::{spawn_switch_process, SwitchEngineTarget};
 use zaimule_core::keymap::KeymapWidget;
@@ -17,16 +18,18 @@ use zaimule_core::rewind::SaveStateSlotInfo;
 use zaimule_core::storage::{
     load_json_atomic, load_library_atomic, load_sram_bytes, load_state_slot_atomic,
     save_json_atomic, save_library_atomic, save_rom_binary_atomic, save_sram_with_rotation,
-    save_state_slot_atomic, LoadedJson, SramHexInspection,
+    save_state_slot_atomic, LoadedJson, PersistedLibrary, SramHexInspection,
 };
 use zaimule_emu::debugger::DebuggerPayload;
 use zaimule_emu::session::{EmulatorSession, StationBootstrap, ViewportStepResponse};
 
 const LIVE_SRAM_FLUSH_INTERVAL_MS: u64 = 10_000;
+const LIVE_PLAYTIME_FLUSH_INTERVAL_MS: u64 = 30_000;
 
 struct AppState {
     session: Arc<Mutex<EmulatorSession>>,
     last_sram_flush_ms: AtomicU64,
+    last_playtime_flush_ms: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,6 +45,13 @@ struct SwitchSessionEndedEvent {
 #[serde(rename_all = "camelCase")]
 struct SwitchShaderCacheClearResponse {
     cleared_bytes: u64,
+    bootstrap: StationBootstrap,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BiosImportResponse {
+    report: BiosImportReport,
     bootstrap: StationBootstrap,
 }
 
@@ -106,7 +116,8 @@ fn persist_library_best_effort(app: &AppHandle, session: &EmulatorSession) {
     }
 }
 
-fn persist_settings_best_effort(app: &AppHandle, session: &EmulatorSession) {
+fn persist_settings_best_effort(app: &AppHandle, session: &mut EmulatorSession) {
+    session.sync_runtime_to_settings();
     if let Ok(path) = settings_path(app) {
         if let Ok(val) = serde_json::to_value(&session.settings) {
             let _ = save_json_atomic(&path, &val);
@@ -114,13 +125,30 @@ fn persist_settings_best_effort(app: &AppHandle, session: &EmulatorSession) {
     }
 }
 
-fn flush_sram_best_effort(app: &AppHandle, session: &EmulatorSession) {
-    if !session.has_persistable_sram() {
+fn flush_sram_best_effort(app: &AppHandle, session: &mut EmulatorSession) {
+    if !session.refresh_sram_dirty_flag() {
         return;
     }
     if let Ok(path) = sram_path(app, &session.active_game_id) {
-        let _ = save_sram_with_rotation(&path, session.active_sram_bytes());
+        if save_sram_with_rotation(&path, session.active_sram_bytes()).is_ok() {
+            session.mark_sram_flushed();
+        }
     }
+}
+
+fn persist_active_pack_assets(app: &AppHandle, session: &mut EmulatorSession) {
+    flush_sram_best_effort(app, session);
+    let game_id = session.active_game_id.clone();
+    if !game_id.is_empty() {
+        for slot in 1..=9u8 {
+            if let Some(persisted) = session.export_save_state_envelope(slot) {
+                if let Ok(path) = state_slot_path(app, &game_id, persisted.info.slot) {
+                    let _ = save_state_slot_atomic(&path, &persisted);
+                }
+            }
+        }
+    }
+    persist_settings_best_effort(app, session);
 }
 
 fn maybe_collect_live_sram(
@@ -129,16 +157,35 @@ fn maybe_collect_live_sram(
     now_ms: u64,
 ) -> Option<(String, Vec<u8>)> {
     let last_flush = state.last_sram_flush_ms.load(Ordering::Relaxed);
-    if session.has_persistable_sram()
-        && now_ms.saturating_sub(last_flush) >= LIVE_SRAM_FLUSH_INTERVAL_MS
-        && session.sram_dirty
-    {
-        session.sram_dirty = false;
+    if now_ms.saturating_sub(last_flush) < LIVE_SRAM_FLUSH_INTERVAL_MS {
+        return None;
+    }
+    if session.refresh_sram_dirty_flag() {
+        session.mark_sram_flushed();
         state.last_sram_flush_ms.store(now_ms, Ordering::Relaxed);
         Some((
             session.active_game_id.clone(),
             session.active_sram_bytes().to_vec(),
         ))
+    } else {
+        None
+    }
+}
+
+fn maybe_collect_live_library(
+    state: &AppState,
+    session: &mut EmulatorSession,
+    now_ms: u64,
+) -> Option<PersistedLibrary> {
+    let last_flush = state.last_playtime_flush_ms.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last_flush) < LIVE_PLAYTIME_FLUSH_INTERVAL_MS {
+        return None;
+    }
+    if session.take_playtime_dirty() {
+        state
+            .last_playtime_flush_ms
+            .store(now_ms, Ordering::Relaxed);
+        Some(session.to_persisted_library())
     } else {
         None
     }
@@ -155,7 +202,7 @@ fn preload_disk_assets_for_game(app: &AppHandle, session: &mut EmulatorSession, 
             }
         }
     }
-    for slot in 1..=6u8 {
+    for slot in 1..=9u8 {
         if let Ok(path) = state_slot_path(app, game_id, slot) {
             if let Ok(Some(persisted)) = load_state_slot_atomic(&path) {
                 session.import_save_state_envelope(game_id.to_string(), persisted);
@@ -166,10 +213,11 @@ fn preload_disk_assets_for_game(app: &AppHandle, session: &mut EmulatorSession, 
 
 #[tauri::command]
 fn get_station_bootstrap(state: tauri::State<AppState>) -> Result<StationBootstrap, String> {
-    let session = state
+    let mut session = state
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
+    session.sync_active_sram();
     Ok(session.bootstrap_snapshot())
 }
 
@@ -183,11 +231,29 @@ fn select_game(
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
-    flush_sram_best_effort(&app, &session);
+    flush_sram_best_effort(&app, &mut session);
     session.select_game(&game_id)?;
     preload_disk_assets_for_game(&app, &mut session, &game_id);
+    let _ = session.take_playtime_dirty();
     persist_library_best_effort(&app, &session);
     Ok(session.bootstrap_snapshot())
+}
+
+#[tauri::command]
+fn reset_active_game(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    flush_sram_best_effort(&app, &mut session);
+    let snap = session.reset_active_game()?;
+    if session.take_playtime_dirty() {
+        persist_library_best_effort(&app, &session);
+    }
+    Ok(snap)
 }
 
 #[tauri::command]
@@ -201,7 +267,7 @@ fn import_rom_file(
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
-    flush_sram_best_effort(&app, &session);
+    flush_sram_best_effort(&app, &mut session);
     let snap = session.import_custom_rom(&file_name, &bytes)?;
     if let Ok(rom_path) = rom_archive_path(&app, &snap.active_game_id) {
         let _ = save_rom_binary_atomic(&rom_path, &bytes);
@@ -226,6 +292,7 @@ fn apply_ips_patch_file(
 
 #[tauri::command]
 fn add_cheat_code(
+    app: AppHandle,
     state: tauri::State<AppState>,
     raw_code: String,
     label: String,
@@ -234,11 +301,14 @@ fn add_cheat_code(
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
-    session.add_cheat_code(&raw_code, label)
+    let snap = session.add_cheat_code(&raw_code, label)?;
+    persist_settings_best_effort(&app, &mut session);
+    Ok(snap)
 }
 
 #[tauri::command]
 fn toggle_cheat_code(
+    app: AppHandle,
     state: tauri::State<AppState>,
     cheat_id: String,
     enabled: bool,
@@ -247,12 +317,29 @@ fn toggle_cheat_code(
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
-    session.toggle_cheat_code(&cheat_id, enabled)
+    let snap = session.toggle_cheat_code(&cheat_id, enabled)?;
+    persist_settings_best_effort(&app, &mut session);
+    Ok(snap)
+}
+
+#[tauri::command]
+fn remove_cheat_code(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    cheat_id: String,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let snap = session.remove_cheat_code(&cheat_id)?;
+    persist_settings_best_effort(&app, &mut session);
+    Ok(snap)
 }
 
 #[tauri::command]
 fn scan_ram_byte(state: tauri::State<AppState>, target_value: u8) -> Result<Vec<String>, String> {
-    let session = state
+    let mut session = state
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
@@ -287,7 +374,20 @@ fn join_netplay_deep_link(
 }
 
 #[tauri::command]
+fn connect_netplay_peer(
+    state: tauri::State<AppState>,
+    peer_addr: Option<String>,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    session.connect_netplay_peer(peer_addr.as_deref())
+}
+
+#[tauri::command]
 fn save_recorded_macro(
+    app: AppHandle,
     state: tauri::State<AppState>,
     name: String,
     frames: Vec<u16>,
@@ -296,11 +396,14 @@ fn save_recorded_macro(
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
-    session.save_custom_macro(name, frames)
+    let snap = session.save_custom_macro(name, frames)?;
+    persist_settings_best_effort(&app, &mut session);
+    Ok(snap)
 }
 
 #[tauri::command]
 fn save_keymapper_layout(
+    app: AppHandle,
     state: tauri::State<AppState>,
     widgets: Vec<KeymapWidget>,
 ) -> Result<StationBootstrap, String> {
@@ -308,7 +411,9 @@ fn save_keymapper_layout(
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
-    session.update_keymapper_widgets(widgets)
+    let snap = session.update_keymapper_widgets(widgets)?;
+    persist_settings_best_effort(&app, &mut session);
+    Ok(snap)
 }
 
 #[tauri::command]
@@ -321,7 +426,7 @@ fn step_viewport(
     speed_mult: Option<u8>,
 ) -> Result<ViewportStepResponse, String> {
     let now = now_unix_ms();
-    let (resp, sram_to_flush) = {
+    let (resp, sram_to_flush, lib_to_flush) = {
         let mut session = state
             .session
             .lock()
@@ -332,13 +437,19 @@ fn step_viewport(
             turbo_active,
             speed_mult.unwrap_or(1),
         );
-        let flush = maybe_collect_live_sram(&state, &mut session, now);
-        (out, flush)
+        let flush_sram = maybe_collect_live_sram(&state, &mut session, now);
+        let flush_lib = maybe_collect_live_library(&state, &mut session, now);
+        (out, flush_sram, flush_lib)
     };
 
     if let Some((game_id, bytes)) = sram_to_flush {
         if let Ok(path) = sram_path(&app, &game_id) {
             let _ = save_sram_with_rotation(&path, &bytes);
+        }
+    }
+    if let Some(lib) = lib_to_flush {
+        if let Ok(path) = library_path(&app) {
+            let _ = save_library_atomic(&path, &lib);
         }
     }
 
@@ -355,7 +466,7 @@ fn step_viewport_binary(
     speed_mult: Option<u8>,
 ) -> Result<tauri::ipc::Response, String> {
     let now = now_unix_ms();
-    let (pkt, sram_to_flush) = {
+    let (pkt, sram_to_flush, lib_to_flush) = {
         let mut session = state
             .session
             .lock()
@@ -366,13 +477,19 @@ fn step_viewport_binary(
             turbo_active,
             speed_mult.unwrap_or(1),
         );
-        let flush = maybe_collect_live_sram(&state, &mut session, now);
-        (out, flush)
+        let flush_sram = maybe_collect_live_sram(&state, &mut session, now);
+        let flush_lib = maybe_collect_live_library(&state, &mut session, now);
+        (out, flush_sram, flush_lib)
     };
 
     if let Some((game_id, bytes)) = sram_to_flush {
         if let Ok(path) = sram_path(&app, &game_id) {
             let _ = save_sram_with_rotation(&path, &bytes);
+        }
+    }
+    if let Some(lib) = lib_to_flush {
+        if let Ok(path) = library_path(&app) {
+            let _ = save_library_atomic(&path, &lib);
         }
     }
 
@@ -405,7 +522,7 @@ fn set_quad_link_enabled(
 
 #[tauri::command]
 fn get_vram_and_disassembly(state: tauri::State<AppState>) -> Result<DebuggerPayload, String> {
-    let session = state
+    let mut session = state
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
@@ -438,7 +555,7 @@ fn create_save_state(
             let _ = save_state_slot_atomic(&path, &persisted);
         }
     }
-    flush_sram_best_effort(&app, &session);
+    flush_sram_best_effort(&app, &mut session);
     Ok(info)
 }
 
@@ -462,6 +579,26 @@ fn restore_save_state(
 }
 
 #[tauri::command]
+fn delete_save_state(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    slot: u8,
+) -> Result<Vec<SaveStateSlotInfo>, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let game_id = session.active_game_id.clone();
+    let slots = session.delete_save_state(slot)?;
+    if !game_id.is_empty() {
+        if let Ok(path) = state_slot_path(&app, &game_id, slot.clamp(1, 9)) {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(slots)
+}
+
+#[tauri::command]
 fn rewind_frames(state: tauri::State<AppState>, steps_back: usize) -> Result<u64, String> {
     let mut session = state
         .session
@@ -479,8 +616,7 @@ fn set_active_macro(
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
-    session.active_macro_id = macro_id;
-    Ok(session.bootstrap_snapshot())
+    Ok(session.set_active_macro(macro_id))
 }
 
 #[tauri::command]
@@ -501,8 +637,27 @@ fn update_game_override(
     entry.custom_scale = Some(scale.clamp(1, 8));
     entry.custom_speed_multiplier = Some(speed_multiplier.clamp(1, 8));
 
-    persist_settings_best_effort(&app, &session);
+    persist_settings_best_effort(&app, &mut session);
     Ok(session.bootstrap_snapshot())
+}
+
+#[tauri::command]
+fn update_ui_preferences(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    shader_css: Option<String>,
+    upscaler_mode: Option<String>,
+    speed_multiplier: Option<u8>,
+    nds_layout: Option<String>,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let snap =
+        session.update_ui_preferences(shader_css, upscaler_mode, speed_multiplier, nds_layout);
+    persist_settings_best_effort(&app, &mut session);
+    Ok(snap)
 }
 
 #[tauri::command]
@@ -534,7 +689,7 @@ fn export_ips_diff(state: tauri::State<AppState>) -> Result<Vec<u8>, String> {
 
 #[tauri::command]
 fn export_portable_pack_archive(state: tauri::State<AppState>) -> Result<Vec<u8>, String> {
-    let session = state
+    let mut session = state
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
@@ -543,6 +698,7 @@ fn export_portable_pack_archive(state: tauri::State<AppState>) -> Result<Vec<u8>
 
 #[tauri::command]
 fn import_portable_pack_archive(
+    app: AppHandle,
     state: tauri::State<AppState>,
     bytes: Vec<u8>,
 ) -> Result<StationBootstrap, String> {
@@ -550,7 +706,9 @@ fn import_portable_pack_archive(
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
-    session.import_portable_pack(&bytes)
+    let snap = session.import_portable_pack(&bytes)?;
+    persist_active_pack_assets(&app, &mut session);
+    Ok(snap)
 }
 
 #[tauri::command]
@@ -608,7 +766,7 @@ fn set_hardware_overclock_profile(
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
     let snap = session.set_hardware_overclock_profile(cpu_overclock_pct, pgxp_subpixel);
-    persist_settings_best_effort(&app, &session);
+    persist_settings_best_effort(&app, &mut session);
     Ok(snap)
 }
 
@@ -653,10 +811,11 @@ fn inspect_sram_hex_view(
     state: tauri::State<AppState>,
     offset: usize,
 ) -> Result<SramHexInspection, String> {
-    let session = state
+    let mut session = state
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
+    session.sync_active_sram();
     Ok(session.inspect_active_sram_hex(offset))
 }
 
@@ -672,7 +831,7 @@ fn write_sram_byte_live(
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
     let snap = session.write_active_sram_byte(offset, value)?;
-    flush_sram_best_effort(&app, &session);
+    flush_sram_best_effort(&app, &mut session);
     Ok(snap)
 }
 
@@ -686,7 +845,7 @@ fn transfer_sram_p1_to_p2(
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
     let snap = session.transfer_sram_p1_to_p2()?;
-    flush_sram_best_effort(&app, &session);
+    flush_sram_best_effort(&app, &mut session);
     Ok(snap)
 }
 
@@ -715,6 +874,7 @@ fn toggle_tournament_spectator(state: tauri::State<AppState>) -> Result<StationB
 
 #[tauri::command]
 fn add_memory_watchpoint(
+    app: AppHandle,
     state: tauri::State<AppState>,
     raw_addr: String,
     label: String,
@@ -724,11 +884,14 @@ fn add_memory_watchpoint(
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
-    session.add_memory_watchpoint(&raw_addr, &label, frozen)
+    let snap = session.add_memory_watchpoint(&raw_addr, &label, frozen)?;
+    persist_settings_best_effort(&app, &mut session);
+    Ok(snap)
 }
 
 #[tauri::command]
 fn toggle_watchpoint_freeze(
+    app: AppHandle,
     state: tauri::State<AppState>,
     watch_id: String,
 ) -> Result<StationBootstrap, String> {
@@ -736,11 +899,29 @@ fn toggle_watchpoint_freeze(
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
-    session.toggle_watchpoint_freeze(&watch_id)
+    let snap = session.toggle_watchpoint_freeze(&watch_id)?;
+    persist_settings_best_effort(&app, &mut session);
+    Ok(snap)
+}
+
+#[tauri::command]
+fn remove_memory_watchpoint(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    watch_id: String,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let snap = session.remove_memory_watchpoint(&watch_id)?;
+    persist_settings_best_effort(&app, &mut session);
+    Ok(snap)
 }
 
 #[tauri::command]
 fn toggle_tas_timeline_button(
+    app: AppHandle,
     state: tauri::State<AppState>,
     macro_id: Option<String>,
     segment_index: usize,
@@ -750,7 +931,10 @@ fn toggle_tas_timeline_button(
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
-    session.toggle_tas_timeline_button(macro_id.as_deref(), segment_index, button_bit)
+    let snap =
+        session.toggle_tas_timeline_button(macro_id.as_deref(), segment_index, button_bit)?;
+    persist_settings_best_effort(&app, &mut session);
+    Ok(snap)
 }
 
 #[tauri::command]
@@ -759,7 +943,16 @@ fn load_settings(app: AppHandle) -> Result<LoadedJson, String> {
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, settings: Value) -> Result<(), String> {
+fn save_settings(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    settings: Value,
+) -> Result<(), String> {
+    if let Ok(parsed) = serde_json::from_value::<GlobalSettings>(settings.clone()) {
+        if let Ok(mut session) = state.session.lock() {
+            session.apply_loaded_settings(parsed);
+        }
+    }
     save_json_atomic(&settings_path(&app)?, &settings)
 }
 
@@ -772,10 +965,13 @@ fn import_paths_impl(
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
-    flush_sram_best_effort(app, &session);
+    flush_sram_best_effort(app, &mut session);
 
     let mut rom_paths = Vec::new();
     let mut key_paths = Vec::new();
+    let mut bios_paths = Vec::new();
+    let mut ips_paths = Vec::new();
+    let mut pack_paths = Vec::new();
     let mut special_handled = false;
 
     for p in paths {
@@ -785,32 +981,42 @@ fn import_paths_impl(
             .unwrap_or_default();
 
         if p.is_file() && lower_name.ends_with(".ips") {
-            let patch_bytes = fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-            let _ = session.apply_custom_ips_to_active_game(&lower_name, &patch_bytes)?;
-            special_handled = true;
+            ips_paths.push((lower_name, p));
             continue;
         }
         if p.is_file() && lower_name.ends_with(".zaimule-pack") {
-            let bytes = fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-            let _ = session.import_portable_pack(&bytes)?;
-            special_handled = true;
+            pack_paths.push(p);
             continue;
         }
         if p.is_file() && lower_name.ends_with(".keys") {
             key_paths.push(p);
             continue;
         }
+        if p.is_file() && looks_like_bios_path(&p) {
+            bios_paths.push(p);
+            continue;
+        }
         rom_paths.push(p);
     }
 
+    // 1. Switch encryption keys & console BIOS/firmware packs first
     if !key_paths.is_empty() {
         session.import_switch_keys(&key_paths)?;
         special_handled = true;
     }
+    if !bios_paths.is_empty() {
+        let _ = session.import_bios_paths(&bios_paths)?;
+        special_handled = true;
+    }
 
+    // 2. ROM files and directories next so active game is selected before applying patches/packs
     if !rom_paths.is_empty() {
         let report = session.import_paths(&rom_paths)?;
-        if report.imported_entries.is_empty() && !special_handled {
+        if report.imported_entries.is_empty()
+            && !special_handled
+            && ips_paths.is_empty()
+            && pack_paths.is_empty()
+        {
             if !report.errors.is_empty() {
                 return Err(report.errors.join(" · "));
             }
@@ -823,10 +1029,27 @@ fn import_paths_impl(
         }
     }
 
-    let active_id = session.active_game_id.clone();
-    preload_disk_assets_for_game(app, &mut session, &active_id);
+    // 3. Preload existing disk SRAM/save states BEFORE applying portable packs so packs aren't overwritten
+    if !rom_paths.is_empty() {
+        let active_id = session.active_game_id.clone();
+        preload_disk_assets_for_game(app, &mut session, &active_id);
+    }
+
+    // 4. Apply IPS patches onto the newly-imported or active ROM
+    for (lower_name, p) in ips_paths {
+        let patch_bytes = fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let _ = session.apply_custom_ips_to_active_game(&lower_name, &patch_bytes)?;
+    }
+
+    // 5. Apply portable packs LAST and persist their SRAM/slots/settings directly to disk
+    for p in pack_paths {
+        let bytes = fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let _ = session.import_portable_pack(&bytes)?;
+        persist_active_pack_assets(app, &mut session);
+    }
+
     persist_library_best_effort(app, &session);
-    persist_settings_best_effort(app, &session);
+    persist_settings_best_effort(app, &mut session);
     Ok(session.bootstrap_snapshot())
 }
 
@@ -839,7 +1062,7 @@ fn scan_directory_impl(
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
-    flush_sram_best_effort(app, &session);
+    flush_sram_best_effort(app, &mut session);
     let prev_active = session.active_game_id.clone();
     let report = session.scan_directory_and_merge(&dir);
     if session.active_game_id != prev_active {
@@ -847,7 +1070,7 @@ fn scan_directory_impl(
         preload_disk_assets_for_game(app, &mut session, &active_id);
     }
     persist_library_best_effort(app, &session);
-    persist_settings_best_effort(app, &session);
+    persist_settings_best_effort(app, &mut session);
 
     if report.imported_entries.is_empty() && !report.unsupported_archives.is_empty() {
         return Err(format!(
@@ -953,6 +1176,48 @@ fn scan_rom_directory(
 }
 
 #[tauri::command]
+fn remove_rom_directory(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    dir_path: String,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let snap = session.remove_rom_directory(&dir_path)?;
+    persist_library_best_effort(&app, &session);
+    persist_settings_best_effort(&app, &mut session);
+    Ok(snap)
+}
+
+#[tauri::command]
+fn rescan_all_rom_directories(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    flush_sram_best_effort(&app, &mut session);
+    let prev_active = session.active_game_id.clone();
+    let report = session.rescan_all_rom_directories();
+    if session.active_game_id != prev_active {
+        let active_id = session.active_game_id.clone();
+        preload_disk_assets_for_game(&app, &mut session, &active_id);
+    }
+    let _ = session.take_playtime_dirty();
+    persist_library_best_effort(&app, &session);
+    persist_settings_best_effort(&app, &mut session);
+
+    if report.imported_entries.is_empty() && !report.errors.is_empty() {
+        return Err(report.errors.join(" · "));
+    }
+    Ok(session.bootstrap_snapshot())
+}
+
+#[tauri::command]
 fn remove_game_from_library(
     app: AppHandle,
     state: tauri::State<AppState>,
@@ -962,13 +1227,106 @@ fn remove_game_from_library(
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
-    flush_sram_best_effort(&app, &session);
+    flush_sram_best_effort(&app, &mut session);
     let snap = session.remove_game(&game_id)?;
     if let Ok(rp) = rom_archive_path(&app, &game_id) {
         let _ = fs::remove_file(rp);
     }
     persist_library_best_effort(&app, &session);
     Ok(snap)
+}
+
+#[tauri::command]
+fn toggle_game_favorite(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    game_id: String,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let snap = session.toggle_game_favorite(&game_id)?;
+    persist_library_best_effort(&app, &session);
+    Ok(snap)
+}
+
+#[tauri::command]
+fn import_bios_paths(
+    state: tauri::State<AppState>,
+    paths: Vec<String>,
+) -> Result<BiosImportResponse, String> {
+    if paths.is_empty() {
+        return Err("aucun fichier BIOS ou firmware sélectionné".into());
+    }
+    let path_bufs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let (report, bootstrap) = session.import_bios_paths(&path_bufs)?;
+    Ok(BiosImportResponse { report, bootstrap })
+}
+
+#[tauri::command]
+async fn pick_and_import_bios(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<BiosImportResponse, String> {
+    let app_for_dialog = app.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app_for_dialog
+            .dialog()
+            .file()
+            .set_title("Importer BIOS / Firmware (.zip, .7z, .bin, .rom)")
+            .add_filter(
+                "BIOS & Firmware (.zip, .7z, .bin, .rom)",
+                &["zip", "7z", "bin", "rom", "bios"],
+            )
+            .blocking_pick_files()
+    })
+    .await
+    .map_err(|e| format!("échec ouverture sélecteur BIOS : {e}"))?;
+
+    let Some(files) = picked else {
+        let session = state
+            .session
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        return Ok(BiosImportResponse {
+            report: BiosImportReport::default(),
+            bootstrap: session.bootstrap_snapshot(),
+        });
+    };
+    let paths: Vec<PathBuf> = files
+        .into_iter()
+        .filter_map(|f| f.into_path().ok())
+        .collect();
+    if paths.is_empty() {
+        return Err("aucun fichier BIOS valide sélectionné".into());
+    }
+
+    let sys_dir = {
+        let session = state
+            .session
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        session.system_dir.clone()
+    };
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        zaimule_core::bios::import_bios_from_paths(&paths, &sys_dir)
+    })
+    .await
+    .map_err(|e| format!("échec importation BIOS : {e}"))??;
+
+    let session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    Ok(BiosImportResponse {
+        report,
+        bootstrap: session.bootstrap_snapshot(),
+    })
 }
 
 #[tauri::command]
@@ -1120,6 +1478,88 @@ async fn pick_and_import_switch_keys(
 }
 
 #[tauri::command]
+async fn import_switch_firmware_path(
+    state: tauri::State<'_, AppState>,
+    source_path: String,
+) -> Result<StationBootstrap, String> {
+    let vault_root = {
+        let session = state
+            .session
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        session.switch_vault_root.clone()
+    };
+    let src = PathBuf::from(source_path);
+    tauri::async_runtime::spawn_blocking(move || {
+        zaimule_core::external::import_switch_firmware(&src, &vault_root)
+    })
+    .await
+    .map_err(|e| format!("échec tâche d'import firmware Switch : {e}"))??;
+
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    Ok(session.refresh_switch_vault())
+}
+
+#[tauri::command]
+async fn pick_and_import_switch_firmware(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    mode: Option<String>,
+) -> Result<StationBootstrap, String> {
+    let app_for_dialog = app.clone();
+    let pick_folder = mode.as_deref() == Some("folder");
+
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        let builder = app_for_dialog
+            .dialog()
+            .file()
+            .set_title("Importer le Firmware Nintendo Switch (.zip, .7z ou dossier .nca)");
+        if pick_folder {
+            builder.blocking_pick_folder()
+        } else {
+            builder
+                .add_filter("Archive Firmware Switch (.zip, .7z)", &["zip", "7z"])
+                .blocking_pick_file()
+        }
+    })
+    .await
+    .map_err(|e| format!("échec ouverture sélecteur firmware Switch : {e}"))?;
+
+    let Some(picked_item) = picked else {
+        let session = state
+            .session
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        return Ok(session.bootstrap_snapshot());
+    };
+    let src = picked_item
+        .into_path()
+        .map_err(|e| format!("chemin firmware invalide : {e}"))?;
+
+    let vault_root = {
+        let session = state
+            .session
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        session.switch_vault_root.clone()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        zaimule_core::external::import_switch_firmware(&src, &vault_root)
+    })
+    .await
+    .map_err(|e| format!("échec importation firmware Switch : {e}"))??;
+
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    Ok(session.refresh_switch_vault())
+}
+
+#[tauri::command]
 fn set_game_switch_engine(
     app: AppHandle,
     state: tauri::State<AppState>,
@@ -1162,7 +1602,7 @@ fn launch_switch_game(
             .session
             .lock()
             .map_err(|_| "verrou session indisponible".to_string())?;
-        flush_sram_best_effort(&app, &session);
+        flush_sram_best_effort(&app, &mut session);
         session.prepare_switch_launch(game_id.as_deref())?
     };
 
@@ -1217,6 +1657,7 @@ pub fn run() {
         .manage(AppState {
             session,
             last_sram_flush_ms: AtomicU64::new(0),
+            last_playtime_flush_ms: AtomicU64::new(0),
         })
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -1244,7 +1685,7 @@ pub fn run() {
                             if let Ok(parsed) =
                                 serde_json::from_value::<GlobalSettings>(loaded.value)
                             {
-                                guard.settings = parsed;
+                                guard.apply_loaded_settings(parsed);
                             }
                         }
                     }
@@ -1282,10 +1723,11 @@ pub fn run() {
             if let WindowEvent::CloseRequested { .. } = event {
                 let app = window.app_handle();
                 if let Some(state) = app.try_state::<AppState>() {
-                    if let Ok(guard) = state.session.lock() {
-                        flush_sram_best_effort(app, &guard);
+                    if let Ok(mut guard) = state.session.lock() {
+                        flush_sram_best_effort(app, &mut guard);
+                        let _ = guard.take_playtime_dirty();
                         persist_library_best_effort(app, &guard);
-                        persist_settings_best_effort(app, &guard);
+                        persist_settings_best_effort(app, &mut guard);
                     }
                 }
             }
@@ -1293,17 +1735,25 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_station_bootstrap,
             select_game,
+            reset_active_game,
             import_rom_file,
             pick_and_import_roms,
             pick_and_scan_folder,
             import_rom_paths,
             scan_rom_directory,
+            remove_rom_directory,
+            rescan_all_rom_directories,
             remove_game_from_library,
+            toggle_game_favorite,
+            import_bios_paths,
+            pick_and_import_bios,
             refresh_switch_vault,
             import_switch_engine_path,
             pick_and_import_switch_engine,
             import_switch_keys_path,
             pick_and_import_switch_keys,
+            import_switch_firmware_path,
+            pick_and_import_switch_firmware,
             set_game_switch_engine,
             clear_switch_shader_cache,
             launch_switch_game,
@@ -1325,12 +1775,15 @@ pub fn run() {
             toggle_tournament_spectator,
             add_memory_watchpoint,
             toggle_watchpoint_freeze,
+            remove_memory_watchpoint,
             toggle_tas_timeline_button,
             add_cheat_code,
             toggle_cheat_code,
+            remove_cheat_code,
             scan_ram_byte,
             create_netplay_room,
             join_netplay_deep_link,
+            connect_netplay_peer,
             save_recorded_macro,
             save_keymapper_layout,
             step_viewport,
@@ -1341,9 +1794,11 @@ pub fn run() {
             toggle_breakpoint,
             create_save_state,
             restore_save_state,
+            delete_save_state,
             rewind_frames,
             set_active_macro,
             update_game_override,
+            update_ui_preferences,
             toggle_mod_layer,
             load_settings,
             save_settings

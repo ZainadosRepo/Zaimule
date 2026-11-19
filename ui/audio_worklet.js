@@ -5,6 +5,9 @@
  */
 
 const RING_FLOATS = 16384; // 8192 stereo pairs (~170 ms @ 48 kHz)
+const MAX_LATENCY_FLOATS = 9216; // 4608 stereo pairs (~96 ms @ 48 kHz)
+const TARGET_LATENCY_FLOATS = 4096; // 2048 stereo pairs (~42 ms @ 48 kHz)
+const TRIM_FADE_FRAMES = 32;
 
 class ZaimulePcmWorklet extends AudioWorkletProcessor {
   constructor() {
@@ -15,6 +18,9 @@ class ZaimulePcmWorklet extends AudioWorkletProcessor {
     this.available = 0;
     this.lastL = 0;
     this.lastR = 0;
+    this.trimFadeRem = 0;
+    this.fadeStartL = 0;
+    this.fadeStartR = 0;
 
     this.port.onmessage = (event) => {
       const msg = event?.data;
@@ -26,6 +32,9 @@ class ZaimulePcmWorklet extends AudioWorkletProcessor {
         this.available = 0;
         this.lastL = 0;
         this.lastR = 0;
+        this.trimFadeRem = 0;
+        this.fadeStartL = 0;
+        this.fadeStartR = 0;
         return;
       }
 
@@ -62,6 +71,18 @@ class ZaimulePcmWorklet extends AudioWorkletProcessor {
       this.writePos = (this.writePos + 1) % RING_FLOATS;
     }
     this.available += len;
+
+    // Trim long-session clock drift back to ~42 ms with a 32-frame crossfade
+    if (this.available > MAX_LATENCY_FLOATS) {
+      const drop = (this.available - TARGET_LATENCY_FLOATS) & ~1;
+      if (drop > 0) {
+        this.readPos = (this.readPos + drop) % RING_FLOATS;
+        this.available -= drop;
+        this.fadeStartL = this.lastL;
+        this.fadeStartR = this.lastR;
+        this.trimFadeRem = TRIM_FADE_FRAMES;
+      }
+    }
   }
 
   process(_inputs, outputs) {
@@ -77,9 +98,15 @@ class ZaimulePcmWorklet extends AudioWorkletProcessor {
     const toRead = Math.min(frames, availPairs);
 
     for (let i = 0; i < toRead; i += 1) {
-      const l = this.ring[this.readPos];
-      const r = this.ring[(this.readPos + 1) % RING_FLOATS];
+      let l = this.ring[this.readPos];
+      let r = this.ring[(this.readPos + 1) % RING_FLOATS];
       this.readPos = (this.readPos + 2) % RING_FLOATS;
+      if (this.trimFadeRem > 0) {
+        const alpha = (TRIM_FADE_FRAMES - this.trimFadeRem + 1) / TRIM_FADE_FRAMES;
+        l = this.fadeStartL + (l - this.fadeStartL) * alpha;
+        r = this.fadeStartR + (r - this.fadeStartR) * alpha;
+        this.trimFadeRem -= 1;
+      }
       this.lastL = l;
       this.lastR = r;
       outL[i] = l;

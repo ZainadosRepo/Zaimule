@@ -195,6 +195,7 @@ pub const BANK_SIZE: [usize; 9] = [
 
 /// IRQ bits (shared numbering across both CPUs).
 pub const IRQ_VBLANK: u32 = 1 << 0;
+pub const IRQ_HBLANK: u32 = 1 << 1;
 pub const IRQ_IPC_SEND_EMPTY: u32 = 1 << 17;
 pub const IRQ_IPC_RECV: u32 = 1 << 18;
 
@@ -452,6 +453,128 @@ pub struct Machine {
     pub spu: super::spu::Spu,
     /// 3D TOON_TABLE (`0x0400_0380..=0x0400_03BF`): 32 RGB555 ramp entries.
     pub toon_table: Vec<u16>,
+    /// Optional user-provided ARM7 BIOS (`bios7.bin`, 16 KiB). Skipped in savestates to preserve ZMND v1 format.
+    #[serde(skip)]
+    pub bios7: Option<Vec<u8>>,
+    /// Optional user-provided ARM9 BIOS (`bios9.bin`, 4 KiB). Skipped in savestates to preserve ZMND v1 format.
+    #[serde(skip)]
+    pub bios9: Option<Vec<u8>>,
+    /// Active touchscreen calibration extracted from loaded firmware user settings (skipped in savestates).
+    #[serde(skip)]
+    pub touch_cal: Option<TouchCalibration>,
+}
+
+/// Two-point touchscreen ADC calibration derived from firmware user settings (`0x58..0x64`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TouchCalibration {
+    pub adc_x1: i32,
+    pub adc_y1: i32,
+    pub scr_x1: i32,
+    pub scr_y1: i32,
+    pub adc_x2: i32,
+    pub adc_y2: i32,
+    pub scr_x2: i32,
+    pub scr_y2: i32,
+}
+
+impl Default for TouchCalibration {
+    fn default() -> Self {
+        Self {
+            adc_x1: 0x02DF,
+            adc_y1: 0x032C,
+            scr_x1: 32,
+            scr_y1: 32,
+            adc_x2: 0x0D3B,
+            adc_y2: 0x0CE7,
+            scr_x2: 224,
+            scr_y2: 160,
+        }
+    }
+}
+
+impl TouchCalibration {
+    pub fn from_user_settings(us: &[u8]) -> Option<Self> {
+        if us.len() < 0x64 {
+            return None;
+        }
+        let adc_x1 = i32::from(u16::from_le_bytes([us[0x58], us[0x59]]));
+        let adc_y1 = i32::from(u16::from_le_bytes([us[0x5A], us[0x5B]]));
+        let scr_x1 = i32::from(us[0x5C]);
+        let scr_y1 = i32::from(us[0x5D]);
+        let adc_x2 = i32::from(u16::from_le_bytes([us[0x5E], us[0x5F]]));
+        let adc_y2 = i32::from(u16::from_le_bytes([us[0x60], us[0x61]]));
+        let scr_x2 = i32::from(us[0x62]);
+        let scr_y2 = i32::from(us[0x63]);
+        if scr_x2 > scr_x1
+            && scr_y2 > scr_y1
+            && adc_x2 > adc_x1
+            && adc_y2 > adc_y1
+            && adc_x2 <= 0x0FFF
+            && adc_y2 <= 0x0FFF
+        {
+            Some(Self {
+                adc_x1,
+                adc_y1,
+                scr_x1,
+                scr_y1,
+                adc_x2,
+                adc_y2,
+                scr_x2,
+                scr_y2,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+fn crc16_modbus(bytes: &[u8]) -> u16 {
+    let mut crc: u16 = 0xFFFF;
+    for &b in bytes {
+        crc ^= u16::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xA001
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
+/// Extracts the active CRC16-validated user-settings block (`0x74` bytes) from a Nintendo DS firmware dump.
+pub fn extract_firmware_user_settings(fw: &[u8]) -> Option<[u8; 0x74]> {
+    if fw.len() < 0x200 {
+        return None;
+    }
+    let base = (usize::from(u16::from_le_bytes([fw[0x20], fw[0x21]]))) * 8;
+    let parse_slot = |off: usize| -> Option<(u16, [u8; 0x74])> {
+        let slice = fw.get(off..off + 0x74)?;
+        let expected_crc = u16::from_le_bytes([slice[0x72], slice[0x73]]);
+        if crc16_modbus(&slice[..0x70]) != expected_crc {
+            return None;
+        }
+        let counter = u16::from_le_bytes([slice[0x70], slice[0x71]]) & 0x007F;
+        let mut block = [0u8; 0x74];
+        block.copy_from_slice(slice);
+        Some((counter, block))
+    };
+    let slot_a = parse_slot(base);
+    let slot_b = parse_slot(base.saturating_add(0x100));
+    match (slot_a, slot_b) {
+        (Some((ca, ba)), Some((cb, bb))) => {
+            let diff = cb.wrapping_sub(ca) & 0x007F;
+            if diff != 0 && diff < 0x40 {
+                Some(bb)
+            } else {
+                Some(ba)
+            }
+        }
+        (Some((_, ba)), None) => Some(ba),
+        (None, Some((_, bb))) => Some(bb),
+        (None, None) => None,
+    }
 }
 
 /// Firmware user-settings block (0x74 bytes incl. update counter + CRC).
@@ -650,6 +773,9 @@ impl Machine {
             bb_read: 0,
             spu: super::spu::Spu::new(),
             toon_table: vec![0; 32],
+            bios7: None,
+            bios9: None,
+            touch_cal: None,
             wifi: vec![0; 0x1_0000],
             rtc_reg: 0,
             rtc_bit_n: 0,
@@ -667,6 +793,27 @@ impl Machine {
             last_pc: [0; 2],
             now: 0,
         }
+    }
+
+    /// Installs optional user-supplied `bios7.bin`, `bios9.bin`, and `firmware.bin` images.
+    /// Returns the active user-settings block (`0x74` bytes) to mirror into `0x027F_FC80`.
+    pub fn install_bios_and_firmware(
+        &mut self,
+        bios7: Option<Vec<u8>>,
+        bios9: Option<Vec<u8>>,
+        firmware: Option<Vec<u8>>,
+    ) -> [u8; 0x74] {
+        self.bios7 = bios7.filter(|b| b.len() == 0x4000);
+        self.bios9 = bios9.filter(|b| b.len() == 0x1000);
+        if let Some(fw) = firmware.filter(|b| matches!(b.len(), 0x2_0000 | 0x4_0000 | 0x8_0000)) {
+            self.firmware = fw;
+            if let Some(us) = extract_firmware_user_settings(&self.firmware) {
+                self.touch_cal = TouchCalibration::from_user_settings(&us);
+                return us;
+            }
+        }
+        self.touch_cal = None;
+        user_settings_block()
     }
 
     /// Advance all timers by `cycles` bus clocks (33MHz domain, both CPUs).
@@ -812,6 +959,9 @@ impl Machine {
     }
 
     pub fn aux_deselect(&mut self) {
+        if self.aux_phase == 2 && matches!(self.aux_cmd, 0x02 | 0x0A | 0xDB | 0xD8) {
+            self.aux_wren = false;
+        }
         self.aux_phase = 0;
     }
 
@@ -845,7 +995,7 @@ impl Machine {
                         self.aux_phase = 4;
                     }
                     0x9F => {
-                        // JEDEC ID: ST 2Mbit flash (M45PE20), byte-streamed.
+                        // JEDEC ID: ST 4Mbit flash (M45PE40), byte-streamed.
                         self.aux_phase = 3;
                         self.aux_addr = 0;
                     }
@@ -853,11 +1003,33 @@ impl Machine {
                 }
             }
             1 => {
-                self.aux_addr = self.aux_addr << 8 | v as u32;
+                if self.aux_addr_n < 3 {
+                    self.aux_addr = self.aux_addr << 8 | v as u32;
+                }
                 self.aux_addr_n += 1;
                 self.auxspi_out = 0xFF;
                 if self.aux_addr_n == 3 {
-                    self.aux_phase = 2;
+                    // 0x0B Fast Read clocks one dummy byte after the 3-byte address.
+                    self.aux_phase = if self.aux_cmd == 0x0B { 1 } else { 2 };
+                    if matches!(self.aux_cmd, 0x0A | 0xDB | 0xD8) {
+                        let save_len = self.save.len();
+                        let mask = save_len.saturating_sub(1);
+                        let (start, len) = if self.aux_cmd == 0xD8 {
+                            (((self.aux_addr as usize) & mask) & !0xFFFF, 0x1_0000)
+                        } else {
+                            (((self.aux_addr as usize) & mask) & !0xFF, 0x100)
+                        };
+                        let end = start.saturating_add(len).min(save_len);
+                        for slot in &mut self.save[start..end] {
+                            *slot = 0xFF;
+                        }
+                        self.save_dirty = true;
+                        if self.aux_cmd != 0x0A {
+                            self.aux_wren = false;
+                        }
+                    }
+                } else if self.aux_addr_n > 3 {
+                    self.aux_phase = 2; // 0x0B dummy byte consumed
                 }
             }
             4 => {
@@ -886,7 +1058,7 @@ impl Machine {
         }
         // CS releases when the hold bit (AUXSPICNT bit 6) is clear.
         if self.auxspicnt & 0x0040 == 0 {
-            self.aux_phase = 0;
+            self.aux_deselect();
         }
     }
 
@@ -1065,7 +1237,9 @@ impl Machine {
                         }
                     }
                     1 => {
-                        self.spi_addr = self.spi_addr << 8 | v as u32;
+                        if self.spi_addr_n < 3 {
+                            self.spi_addr = self.spi_addr << 8 | v as u32;
+                        }
                         self.spi_addr_n += 1;
                         self.spi_out = 0;
                         if self.spi_addr_n == 3 {
@@ -1078,14 +1252,20 @@ impl Machine {
                             // rewritten block read back as the AND of old and
                             // new, which is what the ARM7's verify caught.
                             if matches!(self.spi_cmd, 0xDB | 0xD8 | 0x0A) {
-                                let page = self.spi_addr as usize & 0x3_FF00;
-                                let end = if self.spi_cmd == 0xD8 {
-                                    0x4_0000
+                                let fw_len = self.firmware.len();
+                                let fw_mask = if fw_len.is_power_of_two() && fw_len >= 0x100 {
+                                    fw_len - 1
                                 } else {
-                                    page + 0x100
+                                    0x3_FFFF
                                 };
-                                for i in page..end.min(0x4_0000) {
-                                    self.firmware[i] = 0xFF;
+                                let (start, len) = if self.spi_cmd == 0xD8 {
+                                    (((self.spi_addr as usize) & fw_mask) & !0xFFFF, 0x1_0000)
+                                } else {
+                                    (((self.spi_addr as usize) & fw_mask) & !0xFF, 0x100)
+                                };
+                                let end = start.saturating_add(len).min(fw_len);
+                                for slot in &mut self.firmware[start..end] {
+                                    *slot = 0xFF;
                                 }
                                 if self.spi_cmd != 0x0A {
                                     self.fw_wel = false;
@@ -1111,17 +1291,28 @@ impl Machine {
                         // write-enable latch the ARM7 polls for.
                         0x05 => self.spi_out = if self.fw_wel { 0x02 } else { 0x00 },
                         0x9F => {
+                            let cap_byte = match self.firmware.len() {
+                                0x2_0000 => 0x11, // 1 Mbit / 128 KiB
+                                0x8_0000 => 0x13, // 4 Mbit / 512 KiB
+                                _ => 0x12,        // 2 Mbit / 256 KiB
+                            };
                             self.spi_out = match self.spi_addr_n {
                                 0 => 0x20, // manufacturer: ST
                                 1 => 0x40, // memory type
-                                _ => 0x12, // capacity: 4 Mbit
+                                _ => cap_byte,
                             };
                             self.spi_addr_n += 1;
                         }
                         0x02 | 0x0A => {
                             // Page program. Real flash can only clear bits, and
                             // programming wraps inside the 256 byte page.
-                            let i = (self.spi_addr as usize) & 0x3_FFFF;
+                            let fw_len = self.firmware.len().max(1);
+                            let fw_mask = if fw_len.is_power_of_two() {
+                                fw_len - 1
+                            } else {
+                                0x3_FFFF
+                            };
+                            let i = ((self.spi_addr as usize) & fw_mask) % fw_len;
                             if self.fw_wel {
                                 self.firmware[i] &= v;
                             }
@@ -1130,7 +1321,14 @@ impl Machine {
                             self.spi_out = 0;
                         }
                         _ => {
-                            self.spi_out = self.firmware[(self.spi_addr as usize) & 0x3_FFFF];
+                            let fw_len = self.firmware.len().max(1);
+                            let fw_mask = if fw_len.is_power_of_two() {
+                                fw_len - 1
+                            } else {
+                                0x3_FFFF
+                            };
+                            let i = ((self.spi_addr as usize) & fw_mask) % fw_len;
+                            self.spi_out = self.firmware[i];
                             self.spi_addr = self.spi_addr.wrapping_add(1);
                         }
                     },
@@ -1146,22 +1344,16 @@ impl Machine {
                 if v & 0x80 != 0 {
                     self.spi_out = ((self.tsc_val & 0x1F) << 3) as u8;
                     let chan = v >> 4 & 7;
-                    // Calibration must match user_settings_block():
-                    // ADC (0x02DF,0x032C)->(32,32), (0x0D3B,0x0CE7)->(224,160).
-                    // Released readings are not zero: per GBATEK the X channel
-                    // reads 000h and the Y channel reads FFFh with the pen up,
-                    // and games detect pen-lift with either one.
-                    self.tsc_val = match (chan, self.touch_down) {
-                        (5, true) => (0x02DF
-                            + self.touch_x.saturating_sub(32) * (0x0D3B - 0x02DF) / 192)
-                            .min(0xFFF) as u16,
-                        (1, true) => (0x032C
-                            + self.touch_y.saturating_sub(32) * (0x0CE7 - 0x032C) / 128)
-                            .min(0xFFF) as u16,
-                        (5, false) => 0x000,
-                        (1, false) => 0xFFF,
-                        _ => 0, // Z1/Z2 pressure, temperature, battery, mic: unimplemented
-                    };
+                    // Calibration matches the active firmware user settings block.
+                    // Released readings per GBATEK: X reads 000h, Y reads FFFh.
+                    let cal = self.touch_cal.unwrap_or_default();
+                    self.tsc_val = touch_adc_value_calibrated(
+                        chan,
+                        self.touch_x,
+                        self.touch_y,
+                        self.touch_down,
+                        cal,
+                    );
                 } else {
                     self.spi_out = (self.tsc_val >> 5) as u8;
                 }
@@ -1445,6 +1637,7 @@ pub struct View {
 pub const DMA_IMM: u8 = 0;
 pub const DMA_VBLANK: u8 = 1;
 pub const DMA_CART: u8 = 2;
+pub const DMA_HBLANK: u8 = 4;
 
 impl View {
     fn chan_mode(&self, cnt: u32) -> u8 {
@@ -1453,6 +1646,7 @@ impl View {
             match cnt_h >> 11 & 7 {
                 0 => DMA_IMM,
                 1 => DMA_VBLANK,
+                2 => DMA_HBLANK,
                 5 => DMA_CART,
                 // Geometry-FIFO DMA fires whenever the FIFO is under half
                 // full; ours executes commands instantly so it always is -
@@ -2234,8 +2428,15 @@ impl View {
         }
         match a >> 24 {
             0x00 | 0x01 if cpu == 1 => {
-                // ARM7 BIOS region: HLE stub only.
-                *m.stub7.get((a & 0x3FFF) as usize).unwrap_or(&0)
+                // ARM7 BIOS region: HLE IRQ vector stub at 0x00..0x40, real user bios7.bin at 0x40..0x4000.
+                let off = (a & 0x3FFF) as usize;
+                if off < m.stub7.len() {
+                    m.stub7[off]
+                } else if let Some(ref b7) = m.bios7 {
+                    *b7.get(off).unwrap_or(&0)
+                } else {
+                    0
+                }
             }
             0x02 => m.main_ram[(a & 0x3F_FFFF) as usize],
             0x03 => {
@@ -2259,7 +2460,17 @@ impl View {
             }
             0x07 if cpu == 0 => m.oam[(a & 0x7FF) as usize],
             0x08 | 0x09 => 0xFF, // GBA slot, open
-            0xFF if cpu == 0 => *m.stub9.get((a & 0x3FFF) as usize & 0x3F).unwrap_or(&0),
+            0xFF if cpu == 0 => {
+                // ARM9 BIOS region: HLE IRQ dispatcher at 0x00..0x40, real user bios9.bin at 0x40..0x1000.
+                let off = (a & 0x3FFF) as usize;
+                if off < m.stub9.len() {
+                    m.stub9[off]
+                } else if let Some(ref b9) = m.bios9 {
+                    *b9.get(off).unwrap_or(&0)
+                } else {
+                    *m.stub9.get(off & 0x3F).unwrap_or(&0)
+                }
+            }
             _ => 0,
         }
     }
@@ -2521,5 +2732,167 @@ impl Bus for View {
         // Re-point the IRQ stub's handler literal at the new DTCM top.
         let lit = base.wrapping_add(0x4000);
         m.stub9[0x30..0x34].copy_from_slice(&lit.to_le_bytes());
+    }
+}
+
+/// Converts lower-screen stylus pixel coordinates `(0..=255, 0..=191)` into 12-bit TSC2046 ADC values
+/// using the active two-point touchscreen calibration from firmware user settings.
+///
+/// Signed interpolation is required so coordinates in `0..scr_x1` stay proportional instead of clamping.
+pub(crate) fn touch_adc_value_calibrated(
+    chan: u8,
+    touch_x: u32,
+    touch_y: u32,
+    touch_down: bool,
+    cal: TouchCalibration,
+) -> u16 {
+    match (chan, touch_down) {
+        (5, true) => {
+            let x = touch_x.min(255) as i32;
+            let dx_scr = (cal.scr_x2 - cal.scr_x1).max(1);
+            let dx_adc = cal.adc_x2 - cal.adc_x1;
+            (cal.adc_x1 + (x - cal.scr_x1) * dx_adc / dx_scr).clamp(0, 0xFFF) as u16
+        }
+        (1, true) => {
+            let y = touch_y.min(191) as i32;
+            let dy_scr = (cal.scr_y2 - cal.scr_y1).max(1);
+            let dy_adc = cal.adc_y2 - cal.adc_y1;
+            (cal.adc_y1 + (y - cal.scr_y1) * dy_adc / dy_scr).clamp(0, 0xFFF) as u16
+        }
+        (5, false) => 0x000,
+        (1, false) => 0xFFF,
+        _ => 0, // Z1/Z2 pressure, temperature, battery, mic: unimplemented
+    }
+}
+
+/// Converts lower-screen stylus pixel coordinates using the built-in default calibration.
+pub(crate) fn touch_adc_value(chan: u8, touch_x: u32, touch_y: u32, touch_down: bool) -> u16 {
+    touch_adc_value_calibrated(
+        chan,
+        touch_x,
+        touch_y,
+        touch_down,
+        TouchCalibration::default(),
+    )
+}
+
+#[cfg(test)]
+mod touch_tests {
+    use super::{
+        crc16_modbus, extract_firmware_user_settings, touch_adc_value, touch_adc_value_calibrated,
+        Machine, TouchCalibration,
+    };
+
+    #[test]
+    fn tsc2046_calibration_is_monotonic_across_full_screen_without_border_dead_zone() {
+        let x0 = touch_adc_value(5, 0, 0, true);
+        let x16 = touch_adc_value(5, 16, 0, true);
+        let x32 = touch_adc_value(5, 32, 0, true);
+        let x224 = touch_adc_value(5, 224, 0, true);
+        let x255 = touch_adc_value(5, 255, 0, true);
+        assert_eq!(x32, 0x02DF);
+        assert_eq!(x224, 0x0D3B);
+        assert!(x0 < x16 && x16 < x32 && x32 < x224 && x224 < x255);
+        assert!(x0 > 0 && x255 <= 0xFFF);
+
+        let y0 = touch_adc_value(1, 0, 0, true);
+        let y16 = touch_adc_value(1, 0, 16, true);
+        let y32 = touch_adc_value(1, 0, 32, true);
+        let y160 = touch_adc_value(1, 0, 160, true);
+        let y191 = touch_adc_value(1, 0, 191, true);
+        assert_eq!(y32, 0x032C);
+        assert_eq!(y160, 0x0CE7);
+        assert!(y0 < y16 && y16 < y32 && y32 < y160 && y160 < y191);
+        assert!(y0 > 0 && y191 <= 0xFFF);
+
+        // Released readings per GBATEK
+        assert_eq!(touch_adc_value(5, 100, 100, false), 0x000);
+        assert_eq!(touch_adc_value(1, 100, 100, false), 0xFFF);
+    }
+
+    #[test]
+    fn firmware_user_settings_picks_newer_crc_valid_slot_and_extracts_touch_calibration() {
+        let mut fw = vec![0u8; 0x4_0000];
+        fw[0x20..0x22].copy_from_slice(&((0x3FE00u32 / 8) as u16).to_le_bytes());
+
+        // Slot A: update counter = 3
+        let mut slot_a = [0u8; 0x74];
+        slot_a[0x58..0x5A].copy_from_slice(&0x0200u16.to_le_bytes());
+        slot_a[0x5A..0x5C].copy_from_slice(&0x0300u16.to_le_bytes());
+        slot_a[0x5C] = 20;
+        slot_a[0x5D] = 20;
+        slot_a[0x5E..0x60].copy_from_slice(&0x0E00u16.to_le_bytes());
+        slot_a[0x60..0x62].copy_from_slice(&0x0D00u16.to_le_bytes());
+        slot_a[0x62] = 236;
+        slot_a[0x63] = 172;
+        slot_a[0x70..0x72].copy_from_slice(&3u16.to_le_bytes());
+        let crc_a = crc16_modbus(&slot_a[..0x70]);
+        slot_a[0x72..0x74].copy_from_slice(&crc_a.to_le_bytes());
+
+        // Slot B: update counter = 4 (newer)
+        let mut slot_b = slot_a;
+        slot_b[0x58..0x5A].copy_from_slice(&0x0280u16.to_le_bytes());
+        slot_b[0x5C] = 24;
+        slot_b[0x70..0x72].copy_from_slice(&4u16.to_le_bytes());
+        let crc_b = crc16_modbus(&slot_b[..0x70]);
+        slot_b[0x72..0x74].copy_from_slice(&crc_b.to_le_bytes());
+
+        fw[0x3FE00..0x3FE74].copy_from_slice(&slot_a);
+        fw[0x3FF00..0x3FF74].copy_from_slice(&slot_b);
+
+        let active = extract_firmware_user_settings(&fw).expect("valid user settings");
+        let cal = TouchCalibration::from_user_settings(&active).expect("valid touch calibration");
+        assert_eq!(cal.adc_x1, 0x0280);
+        assert_eq!(cal.scr_x1, 24);
+        assert_eq!(touch_adc_value_calibrated(5, 24, 20, true, cal), 0x0280);
+    }
+
+    #[test]
+    fn auxspi_supports_fast_read_dummy_byte_and_page_and_sector_erase() {
+        let mut m = Machine::new();
+        m.save[0x0010] = 0xAB;
+        m.save[0x0011] = 0xCD;
+        m.save[0x1_0005] = 0x42;
+
+        // 0x0B Fast Read from 0x000010: cmd + 3 addr bytes + 1 dummy byte + data bytes
+        m.auxspicnt = 0xA040; // enabled + hold CS
+        m.auxspi_transfer(0x0B);
+        m.auxspi_transfer(0x00);
+        m.auxspi_transfer(0x00);
+        m.auxspi_transfer(0x10);
+        m.auxspi_transfer(0x00); // dummy byte
+        assert_eq!(m.auxspi_out, 0xFF);
+        m.auxspi_transfer(0x00);
+        assert_eq!(m.auxspi_out, 0xAB);
+        m.auxspicnt = 0xA000; // release CS after this byte
+        m.auxspi_transfer(0x00);
+        assert_eq!(m.auxspi_out, 0xCD);
+
+        // 0xDB Page Erase at page 0x000000
+        m.auxspicnt = 0xA000;
+        m.auxspi_transfer(0x06); // WREN
+        assert!(m.aux_wren);
+        m.auxspicnt = 0xA040;
+        m.auxspi_transfer(0xDB);
+        m.auxspi_transfer(0x00);
+        m.auxspi_transfer(0x00);
+        m.auxspicnt = 0xA000;
+        m.auxspi_transfer(0x00);
+        assert_eq!(m.save[0x0010], 0xFF);
+        assert_eq!(m.save[0x0011], 0xFF);
+        assert_eq!(m.save[0x1_0005], 0x42);
+        assert!(!m.aux_wren);
+
+        // 0xD8 Sector Erase at 0x010000
+        m.auxspicnt = 0xA000;
+        m.auxspi_transfer(0x06); // WREN
+        m.auxspicnt = 0xA040;
+        m.auxspi_transfer(0xD8);
+        m.auxspi_transfer(0x01);
+        m.auxspi_transfer(0x00);
+        m.auxspicnt = 0xA000;
+        m.auxspi_transfer(0x00);
+        assert_eq!(m.save[0x1_0005], 0xFF);
+        assert!(!m.aux_wren);
     }
 }

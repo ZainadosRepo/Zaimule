@@ -79,6 +79,7 @@ export class ApuAudioEngine {
     this.workletInitPromise = null;
     this.nextScheduleTime = 0;
     this.enabled = true;
+    this.volume = 0.85;
     this.spcHarmonyEnabled = true;
     this.lastPlayedFreq = 0;
     this.lastToneMs = 0;
@@ -96,7 +97,7 @@ export class ApuAudioEngine {
         this.ctx = new AudioCtx();
       }
       this.gainNode = this.ctx.createGain();
-      this.gainNode.gain.value = this.enabled ? 0.85 : 0.0;
+      this.gainNode.gain.value = this.enabled ? this.volume : 0.0;
       this.gainNode.connect(this.ctx.destination);
       this._initWorklet();
     }
@@ -139,11 +140,24 @@ export class ApuAudioEngine {
     this.lastPlayedFreq = 0;
   }
 
+  setVolume(rawVolume) {
+    const parsed = Number(rawVolume);
+    this.volume = Number.isFinite(parsed) ? Math.max(0, Math.min(1, parsed)) : 0.85;
+    if (this.gainNode && this.ctx) {
+      this.gainNode.gain.setTargetAtTime(
+        this.enabled ? this.volume : 0.0,
+        this.ctx.currentTime,
+        0.01
+      );
+    }
+    return this.volume;
+  }
+
   toggleEnabled() {
     this.enabled = !this.enabled;
     if (this.gainNode && this.ctx) {
       this.gainNode.gain.setTargetAtTime(
-        this.enabled ? 0.85 : 0.0,
+        this.enabled ? this.volume : 0.0,
         this.ctx.currentTime,
         0.01
       );

@@ -1,6 +1,7 @@
 import {
   filterCatalogEntries,
   computeConsoleCounts,
+  sortCatalogEntries,
   formatPlaytime,
   formatFileSize,
   formatSwitchEngineLabel
@@ -12,26 +13,58 @@ import {
   BTN_RIGHT,
   BTN_A,
   BTN_B,
+  BTN_START,
   computeBitmaskFromPressedCodes,
+  buildKeyBindingsFromWidgets,
+  applyPressedTurboWidgets,
+  mapCanvasToNdsStylus,
   computeBitmaskFromGamepad,
   clampWidgetPosition,
   triggerGamepadRumble,
   computeBigPictureNavAction
 } from "./keymapper.js";
+import { FramePacer, targetFpsForConsole } from "./pacing.js";
 import { ApuAudioEngine, synthesizeMultiChannelSamples } from "./audio.js";
 import { ViewportRecorder } from "./recorder.js";
-import { upscaleFrameIfEnabled } from "./upscaler.js";
+import {
+  NDS_LAYOUT_MODES,
+  upscaleFrameIfEnabled,
+  arrangeNdsDualScreenFrame
+} from "./upscaler.js";
 import { decodeViewportBinaryPacket } from "./viewport_ipc.js";
 
 const tauriInvoke = window.__TAURI__?.core?.invoke;
 const appWindow = window.__TAURI__?.window?.getCurrentWindow?.();
 const apuAudio = new ApuAudioEngine();
 const viewportRecorder = new ViewportRecorder();
+const framePacer = new FramePacer();
 const canvasImageCache = new Map();
+
+const SHADER_MODES = ["mode-crt", "mode-trinitron", "mode-dmg", "mode-lcd", "mode-clean"];
+const SHADER_LABELS = {
+  "mode-crt": "Shader : CRT Scanlines",
+  "mode-trinitron": "Shader : Trinitron Courbé",
+  "mode-dmg": "Shader : Game Boy DMG Vert",
+  "mode-lcd": "Shader : Matrice LCD",
+  "mode-clean": "Shader : Pixel-Perfect"
+};
+const UPSCALER_LABELS = {
+  OFF: "Upscaler : Natif 1x",
+  SCALE2X: "Upscaler : Scale2x EPX",
+  XBRZ: "Upscaler : xBRZ 2x",
+  BLOOM: "Upscaler : CRT Bloom"
+};
+const NDS_LAYOUT_LABELS = {
+  vertical: "Écrans NDS : Vertical",
+  horizontal: "Écrans NDS : Côte à côte",
+  "vertical-swapped": "Écrans NDS : Vertical (Inversé)",
+  "horizontal-swapped": "Écrans NDS : Côte à côte (Inversé)"
+};
 
 let toastTimer = null;
 let lastSurfacedWarning = "";
 let stepInFlight = false;
+let lastTelemetryDomUpdateMs = 0;
 
 let state = {
   activeGameId: "",
@@ -97,28 +130,81 @@ let state = {
       titleKeysFound: false,
       prodKeysPath: null,
       titleKeysPath: null
+    },
+    firmware: {
+      firmwareDir: "",
+      installed: false,
+      ncaCount: 0,
+      totalBytes: 0,
+      versionHint: null
     }
   },
-  saveSlots: [
-    { slot: 1, occupied: false, frame: 0, crc32Hex: "00000000", label: "Slot #1 Vide" },
-    { slot: 2, occupied: false, frame: 0, crc32Hex: "00000000", label: "Slot #2 Vide" },
-    { slot: 3, occupied: false, frame: 0, crc32Hex: "00000000", label: "Slot #3 Vide" },
-    { slot: 4, occupied: false, frame: 0, crc32Hex: "00000000", label: "Slot #4 Vide" },
-    { slot: 5, occupied: false, frame: 0, crc32Hex: "00000000", label: "Slot #5 Vide" },
-    { slot: 6, occupied: false, frame: 0, crc32Hex: "00000000", label: "Slot #6 Vide" }
-  ],
+  saveSlots: Array.from({ length: 9 }, (_, i) => ({
+    slot: i + 1,
+    occupied: false,
+    frame: 0,
+    crc32Hex: "00000000",
+    label: `Slot #${i + 1} Vide`
+  })),
   keymapperWidgets: [
-    { id: "km-dpad-up", label: "Z / ↑", keyCode: "KeyZ", buttonMask: BTN_UP, xPct: 16, yPct: 58, turboHz: null },
-    { id: "km-dpad-down", label: "S / ↓", keyCode: "KeyS", buttonMask: BTN_DOWN, xPct: 16, yPct: 78, turboHz: null },
-    { id: "km-dpad-left", label: "Q / ←", keyCode: "KeyQ", buttonMask: BTN_LEFT, xPct: 8, yPct: 68, turboHz: null },
-    { id: "km-dpad-right", label: "D / →", keyCode: "KeyD", buttonMask: BTN_RIGHT, xPct: 24, yPct: 68, turboHz: null },
-    { id: "km-btn-a", label: "J [A]", keyCode: "KeyJ", buttonMask: BTN_A, xPct: 82, yPct: 64, turboHz: 20 },
-    { id: "km-btn-b", label: "K [B]", keyCode: "KeyK", buttonMask: BTN_B, xPct: 70, yPct: 74, turboHz: null }
+    {
+      id: "km-dpad",
+      label: "✚ D-PAD [ZQSD / Flèches]",
+      kind: "dpad",
+      keyBinding: "ZQSD",
+      buttonMask: BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT,
+      xPct: 14,
+      yPct: 78,
+      turboHz: null
+    },
+    {
+      id: "km-btn-a",
+      label: "🅰 Bouton A [J / Espace]",
+      kind: "actionButton",
+      keyBinding: "KeyJ",
+      buttonMask: BTN_A,
+      xPct: 82,
+      yPct: 74,
+      turboHz: null
+    },
+    {
+      id: "km-btn-b",
+      label: "🅱 Bouton B [K / Shift]",
+      kind: "actionButton",
+      keyBinding: "KeyK",
+      buttonMask: BTN_B,
+      xPct: 68,
+      yPct: 82,
+      turboHz: null
+    },
+    {
+      id: "km-turbo-a",
+      label: "⚡ TURBO A 20Hz [U]",
+      kind: "turboButton",
+      keyBinding: "KeyU",
+      buttonMask: BTN_A,
+      xPct: 78,
+      yPct: 16,
+      turboHz: 20
+    },
+    {
+      id: "km-touch-nds",
+      label: "🖱 Tactile NDS / Start [Entrée]",
+      kind: "touchTapZone",
+      keyBinding: "Enter",
+      buttonMask: BTN_START,
+      xPct: 20,
+      yPct: 16,
+      turboHz: null
+    }
   ],
   macros: [],
   tasTimeline: [],
   netplayRooms: [],
   udpLocalPort: 54920,
+  udpPeerAddr: null,
+  udpPacketsSent: 0,
+  udpPacketsReceived: 0,
   stunCandidate: null,
   netplayChat: [],
   communityMods: [],
@@ -134,38 +220,71 @@ let state = {
   tournamentBracket: null,
   biosEntries: [
     {
-      console: "GB",
-      fileName: "dmg_boot.bin",
-      expectedCrc32Hex: "59C8598E",
-      notes: "Séquence de démarrage DMG/CGB Rust intégrée (termboy-gb 0.5.0)."
+      console: "NDS",
+      fileName: "bios7.bin",
+      expectedCrc32Hex: "1280F0D5",
+      status: "freeBiosBuiltIn",
+      notes: "BIOS ARM7 Nintendo DS (16 Ko) — optionnel, clé KEY1 + appels BIOS officiels."
+    },
+    {
+      console: "NDS",
+      fileName: "bios9.bin",
+      expectedCrc32Hex: "2AB23573",
+      status: "freeBiosBuiltIn",
+      notes: "BIOS ARM9 Nintendo DS (4 Ko) — optionnel, appels BIOS ARM9 natifs."
+    },
+    {
+      console: "NDS",
+      fileName: "firmware.bin",
+      expectedCrc32Hex: "N/A",
+      status: "freeBiosBuiltIn",
+      notes: "Firmware SPI Nintendo DS (256 Ko) — optionnel, profil utilisateur et calibration tactile."
     },
     {
       console: "GBA",
       fileName: "gba_bios.bin",
       expectedCrc32Hex: "81977335",
+      status: "freeBiosBuiltIn",
       notes: "BIOS GBA HLE Rust intégré (termboy-gba 0.5.0, SWI + DMA complets)."
     },
     {
-      console: "NDS",
-      fileName: "bios7.bin / bios9.bin",
-      expectedCrc32Hex: "DF692A80",
-      notes: "BIOS HLE ARM9/ARM7 + key1.bin + firmware synthétique Zaimule (SPU 16 canaux 48 kHz + 3D 4×4/Toon/Decal + PPU affine/étendu)."
+      console: "GB",
+      fileName: "dmg_boot.bin",
+      expectedCrc32Hex: "59C8598E",
+      status: "freeBiosBuiltIn",
+      notes: "Séquence de démarrage DMG/CGB Rust intégrée (termboy-gb 0.5.0)."
     }
   ],
   linkTelemetry: { enabled: false, quadMode: false, packetsTransferred: 0 },
   consoleFilter: "ALL",
+  sortBy: "recent",
   searchQuery: "",
+  audioVolume: (() => {
+    try {
+      const raw = window.localStorage?.getItem("zaimule.audioVolume");
+      if (raw !== null && raw !== "") {
+        const saved = Number(raw);
+        if (Number.isFinite(saved)) return Math.max(0, Math.min(100, Math.round(saved)));
+      }
+    } catch {
+      // Ignore storage access errors in sandboxed webviews
+    }
+    return 85;
+  })(),
   keymapperVisible: false,
   dualLinkMode: false,
   quadLinkMode: false,
   debuggerPaused: false,
   stepOnceRequested: false,
   bigPictureMode: false,
+  isFullscreen: false,
   prevNavMask: 0,
   vramPaintColorIdx: 3,
   stylusPressed: false,
+  activeShaderCss: "mode-crt",
   upscalerMode: "OFF",
   speedMult: 1,
+  ndsLayout: "vertical",
   activeMacroId: null,
   recordingMacro: false,
   recordedFrames: []
@@ -318,6 +437,126 @@ async function handleImportSwitchKeys(buttonEl = null) {
   }
 }
 
+async function handleImportSwitchFirmware(mode = "archive", buttonEl = null) {
+  if (!tauriInvoke) {
+    showToast("L'importation du firmware Switch requiert l'application desktop Zaimule.", "error");
+    return;
+  }
+  const prevText = buttonEl ? buttonEl.textContent : "";
+  if (buttonEl) {
+    buttonEl.disabled = true;
+    buttonEl.textContent = "Importation...";
+  }
+  showToast("Importation du firmware Switch (.nca) dans le coffre isolé...", "info", 8000);
+  const boot = await invokeBackend("pick_and_import_switch_firmware", { mode });
+  if (buttonEl) {
+    buttonEl.disabled = false;
+    buttonEl.textContent = prevText;
+  }
+  if (boot) {
+    applyBootstrap(boot);
+    const fw = boot.switchVault?.firmware;
+    if (fw?.installed) {
+      showToast(
+        `Firmware Switch installé (${fw.ncaCount} .nca · ${formatFileSize(fw.totalBytes)}).`,
+        "ok",
+        6000
+      );
+    }
+  }
+}
+
+function describeBiosStatus(entry) {
+  const st = entry?.status;
+  const expected = entry?.expectedCrc32Hex || "—";
+  if (st === "verifiedOfficial") {
+    return {
+      pillClass: "pill-green",
+      label: `OFFICIEL · CRC ${entry.actualCrc32Hex || expected}`
+    };
+  }
+  if (st && typeof st === "object" && st.customLoaded) {
+    const crc =
+      st.customLoaded.actualCrc32 ||
+      st.customLoaded.actual_crc32 ||
+      entry.actualCrc32Hex ||
+      expected;
+    return {
+      pillClass: "pill-green",
+      label: `IMPORTÉ · CRC ${crc}`
+    };
+  }
+  if (st && typeof st === "object" && st.checksumMismatch) {
+    const crc =
+      st.checksumMismatch.actualCrc32 ||
+      st.checksumMismatch.actual_crc32 ||
+      entry.actualCrc32Hex ||
+      "?";
+    return {
+      pillClass: "pill-terracotta",
+      label: `CRC ≠ (${crc} / ${expected})`
+    };
+  }
+  if (st && typeof st === "object" && st.sizeMismatch) {
+    const sz = st.sizeMismatch.actualBytes ?? st.sizeMismatch.actual_bytes ?? 0;
+    return {
+      pillClass: "pill-terracotta",
+      label: `TAILLE ≠ (${sz} o)`
+    };
+  }
+  return {
+    pillClass: "pill-cobalt",
+    label: expected === "N/A" ? "SYNTHÉTIQUE INTÉGRÉ" : `HLE INTÉGRÉ · ${expected}`
+  };
+}
+
+function listInstalledBiosMap(entries) {
+  const map = new Map();
+  for (const b of entries || []) {
+    if (!b) continue;
+    const isInstalled =
+      Boolean(b.installedPath) ||
+      b.status === "verifiedOfficial" ||
+      (b.status && typeof b.status === "object" && Boolean(b.status.customLoaded));
+    if (isInstalled) {
+      map.set(b.fileName, b.actualCrc32Hex || "installed");
+    }
+  }
+  return map;
+}
+
+async function handleImportBios(buttonEl = null) {
+  if (!tauriInvoke) {
+    showToast("L'importation de BIOS / Firmware requiert l'application desktop Zaimule.", "error");
+    return;
+  }
+  const prevText = buttonEl ? buttonEl.textContent : "";
+  if (buttonEl) {
+    buttonEl.disabled = true;
+    buttonEl.textContent = "Importation...";
+  }
+  const res = await invokeBackend("pick_and_import_bios");
+  if (buttonEl) {
+    buttonEl.disabled = false;
+    buttonEl.textContent = prevText;
+  }
+  if (res?.bootstrap) {
+    applyBootstrap(res.bootstrap);
+    const imported = res.report?.imported || [];
+    if (imported.length > 0) {
+      const verifiedCount = (res.report?.verified || []).length;
+      const verifiedNote = verifiedCount > 0 ? ` (${verifiedCount} vérifié(s) CRC32)` : "";
+      showToast(
+        `BIOS / Firmware importés dans system/ : ${imported.join(", ")}${verifiedNote}. Relancez un jeu NDS pour activer.`,
+        "ok",
+        6500
+      );
+    } else if (res.report?.warnings?.length > 0) {
+      showToast(res.report.warnings.join(" · "), "error", 7000);
+    }
+  }
+}
+
 async function handleClearSwitchShaders(target, buttonEl = null) {
   if (!tauriInvoke) {
     showToast("Le nettoyage du cache shaders requiert l'application desktop Zaimule.", "error");
@@ -378,11 +617,188 @@ function showEmuBanner(modeKey, title, desc, actions = [], variant = "warn") {
   }
 }
 
+function getVisibleCatalog() {
+  const opts = {
+    consoleFilter:
+      state.consoleFilter === "RUST_ONLY" ||
+      state.consoleFilter === "LINK_READY" ||
+      state.consoleFilter === "FAVORITES"
+        ? "ALL"
+        : state.consoleFilter,
+    onlyNativeRust: state.consoleFilter === "RUST_ONLY",
+    onlyLinkReady: state.consoleFilter === "LINK_READY",
+    onlyFavorites: state.consoleFilter === "FAVORITES",
+    query: state.searchQuery
+  };
+  return sortCatalogEntries(filterCatalogEntries(state.catalog, opts), state.sortBy);
+}
+
+function getLibraryGridColumnCount() {
+  const grid = document.getElementById("games-grid");
+  if (!grid || typeof window.getComputedStyle !== "function") return 3;
+  const cols = window.getComputedStyle(grid).gridTemplateColumns;
+  if (!cols || cols === "none") return 3;
+  const count = cols.trim().split(/\s+/).filter(Boolean).length;
+  return Math.max(1, count);
+}
+
+function scrollSelectedCardIntoView() {
+  const card = document.querySelector("#games-grid .game-card.selected");
+  if (card && typeof card.scrollIntoView === "function") {
+    card.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+}
+
+function setEmulationPaused(paused) {
+  state.debuggerPaused = Boolean(paused);
+  if (state.debuggerPaused) {
+    framePacer.reset();
+    apuAudio.reset();
+  }
+  const topBtn = document.getElementById("btn-emu-pause");
+  if (topBtn) {
+    topBtn.textContent = state.debuggerPaused ? "Reprendre (F9)" : "Pause (F9)";
+    topBtn.classList.toggle("btn-paused", state.debuggerPaused);
+  }
+  const dbgBtn = document.getElementById("btn-dbg-pause");
+  if (dbgBtn) {
+    dbgBtn.textContent = state.debuggerPaused ? "Reprendre" : "Pause CPU";
+  }
+}
+
+async function setViewportFullscreen(enabled) {
+  const next = Boolean(enabled);
+  state.isFullscreen = next;
+  document.querySelector(".app-shell")?.classList.toggle("viewport-fullscreen", next);
+  const btn = document.getElementById("btn-fullscreen-toggle");
+  if (btn) {
+    btn.textContent = next ? "Quitter plein écran" : "Plein écran";
+  }
+  try {
+    if (appWindow?.setFullscreen) {
+      await appWindow.setFullscreen(next);
+    } else if (next && document.documentElement?.requestFullscreen) {
+      if (!document.fullscreenElement) {
+        await document.documentElement.requestFullscreen();
+      }
+    } else if (!next && document.fullscreenElement && document.exitFullscreen) {
+      await document.exitFullscreen();
+    }
+  } catch {
+    // Keep CSS fullscreen mode even if OS/WebView fullscreen API declines
+  }
+}
+
+function captureScreenshotPng() {
+  const game = getSelectedGame();
+  if (!game || isSwitchGame(game)) {
+    showToast("Lancez d'abord un jeu natif (GB/GBC/GBA/NDS) pour capturer l'écran.", "info");
+    return;
+  }
+  const canvas = document.getElementById("canvas-p1");
+  if (!canvas || !canvas.width || !canvas.height) return;
+  const slug = String(game.title || game.id || "zaimule")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40) || "zaimule";
+  const fileName = `${slug}-f${state.currentFrame}.png`;
+
+  const triggerLink = (href, revokeAfter = false) => {
+    const a = document.createElement("a");
+    a.href = href;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    if (revokeAfter) {
+      setTimeout(() => URL.revokeObjectURL(href), 4000);
+    }
+    showToast(`Capture PNG enregistrée : ${fileName}`, "ok");
+  };
+
+  if (typeof canvas.toBlob === "function") {
+    canvas.toBlob((blob) => {
+      if (!blob) return;
+      triggerLink(URL.createObjectURL(blob), true);
+    }, "image/png");
+  } else if (typeof canvas.toDataURL === "function") {
+    triggerLink(canvas.toDataURL("image/png"), false);
+  }
+}
+
 function syncViewportScreenAspect(game) {
   const isNds = Boolean(game && String(game.console).toUpperCase() === "NDS");
+  const isHorizontal = isNds && String(state.ndsLayout || "vertical").startsWith("horizontal");
   ["screen-1", "screen-2", "screen-3", "screen-4"].forEach((id) => {
-    document.getElementById(id)?.classList.toggle("mode-nds", isNds);
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.classList.toggle("mode-nds", isNds);
+    el.classList.toggle("nds-horizontal", isHorizontal);
   });
+  const layoutBtn = document.getElementById("btn-nds-layout");
+  if (layoutBtn) {
+    layoutBtn.style.display = isNds ? "inline-flex" : "none";
+  }
+}
+
+function applyDisplayPreferencesToDom() {
+  const shaderCss = SHADER_MODES.includes(state.activeShaderCss) ? state.activeShaderCss : "mode-crt";
+  state.activeShaderCss = shaderCss;
+  const shaderBtn = document.getElementById("btn-shader-cycle");
+  if (shaderBtn) {
+    shaderBtn.textContent = SHADER_LABELS[shaderCss] || SHADER_LABELS["mode-crt"];
+  }
+  ["screen-1", "screen-2", "screen-3", "screen-4"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.classList.remove(...SHADER_MODES);
+    el.classList.add(shaderCss);
+  });
+
+  const upscalerMode = UPSCALER_LABELS[state.upscalerMode] ? state.upscalerMode : "OFF";
+  state.upscalerMode = upscalerMode;
+  const upBtn = document.getElementById("btn-upscaler-cycle");
+  if (upBtn) {
+    upBtn.textContent = UPSCALER_LABELS[upscalerMode];
+  }
+
+  const speed = [1, 2, 4, 8].includes(Number(state.speedMult)) ? Number(state.speedMult) : 1;
+  state.speedMult = speed;
+  const speedBtn = document.getElementById("btn-speed-cycle");
+  if (speedBtn) {
+    speedBtn.textContent = `Vitesse : ${speed}x`;
+  }
+
+  const ndsLayout = NDS_LAYOUT_LABELS[state.ndsLayout] ? state.ndsLayout : "vertical";
+  state.ndsLayout = ndsLayout;
+  const ndsBtn = document.getElementById("btn-nds-layout");
+  if (ndsBtn) {
+    ndsBtn.textContent = NDS_LAYOUT_LABELS[ndsLayout];
+  }
+  syncViewportScreenAspect(getSelectedGame());
+}
+
+function releaseTransientInputs() {
+  pressedKeys.clear();
+  if (state.stylusPressed) {
+    state.stylusPressed = false;
+    const g = getSelectedGame();
+    if (g && String(g.console || "").toUpperCase() === "NDS") {
+      invokeBackend("set_nds_stylus", { x: 0, y: 0, pressed: false }, { silent: true });
+    }
+  }
+}
+
+function stopEmulationPlayback() {
+  state.isEmulationRunning = false;
+  setEmulationPaused(false);
+  framePacer.reset();
+  lastTelemetryDomUpdateMs = 0;
+  apuAudio.reset();
+  releaseTransientInputs();
+  hideEmuBanner();
+  renderStandbyCanvas();
 }
 
 async function launchSelectedGame() {
@@ -393,7 +809,7 @@ async function launchSelectedGame() {
   }
 
   if (isSwitchGame(game)) {
-    state.isEmulationRunning = false;
+    stopEmulationPlayback();
     if (!tauriInvoke) {
       showToast(
         "Le lancement Switch (Torzu / Fritchii) requiert l'application desktop Zaimule.",
@@ -412,6 +828,7 @@ async function launchSelectedGame() {
 
   apuAudio.ensureContext();
   apuAudio.reset();
+  setEmulationPaused(false);
 
   const consoleKey = String(game.console || "").toUpperCase();
   if (consoleKey === "NDS") {
@@ -432,11 +849,14 @@ async function launchSelectedGame() {
   }
 
   syncViewportScreenAspect(game);
+  framePacer.reset();
+  lastTelemetryDomUpdateMs = 0;
   state.isEmulationRunning = true;
+  const targetFps = targetFpsForConsole(game.console);
   const fpsEl = document.getElementById("tel-fps");
-  if (fpsEl) fpsEl.textContent = `${(60 * state.speedMult).toFixed(0)} FPS`;
+  if (fpsEl) fpsEl.textContent = `${(targetFps * state.speedMult).toFixed(1)} FPS`;
   const ftEl = document.getElementById("tel-ft");
-  if (ftEl) ftEl.textContent = `${(16.6 / state.speedMult).toFixed(1)} ms`;
+  if (ftEl) ftEl.textContent = `${(1000 / targetFps).toFixed(1)} ms`;
   switchTab("view-emulator");
 }
 
@@ -493,22 +913,27 @@ async function handleBigPictureNavigation(currentMask) {
   }
 
   if (activePane === "view-library") {
-    if (state.catalog.length === 0) {
+    const visible = getVisibleCatalog();
+    if (visible.length === 0) {
       if (action === "LAUNCH_GAME") {
         await launchSelectedGame();
       }
       return;
     }
-    const idx = state.catalog.findIndex((g) => g.id === state.activeGameId);
+    const idx = visible.findIndex((g) => g.id === state.activeGameId);
     if (action === "PREV_GAME" || action === "NEXT_GAME" || action === "PREV_ROW" || action === "NEXT_ROW") {
-      const step = action === "PREV_GAME" ? -1 : action === "NEXT_GAME" ? 1 : action === "PREV_ROW" ? -3 : 3;
-      const nextIdx = (Math.max(0, idx) + step + state.catalog.length) % state.catalog.length;
-      const nextGame = state.catalog[nextIdx];
+      const cols = getLibraryGridColumnCount();
+      const step =
+        action === "PREV_GAME" ? -1 : action === "NEXT_GAME" ? 1 : action === "PREV_ROW" ? -cols : cols;
+      const baseIdx = idx >= 0 ? idx : 0;
+      const nextIdx = (baseIdx + step + visible.length * 4) % visible.length;
+      const nextGame = visible[nextIdx];
       if (nextGame) {
         state.activeGameId = nextGame.id;
         const boot = await invokeBackend("select_game", { gameId: nextGame.id });
         if (boot) applyBootstrap(boot);
         else updateAllViews();
+        scrollSelectedCardIntoView();
         triggerGamepadRumble(getConnectedGamepad(), 35, 0.25, 0.4);
       }
     } else if (action === "LAUNCH_GAME") {
@@ -527,6 +952,7 @@ function renderSidebarCounts() {
     if (el) el.textContent = String(val || 0);
   };
   setTxt("count-all", counts.ALL);
+  setTxt("count-favorites", counts.FAVORITES);
   setTxt("count-gbc", (counts.GB || 0) + (counts.GBC || 0));
   setTxt("count-gba", counts.GBA);
   setTxt("count-nds", counts.NDS);
@@ -573,17 +999,7 @@ function renderCatalogGrid() {
   const grid = document.getElementById("games-grid");
   if (!grid) return;
 
-  const opts = {
-    consoleFilter:
-      state.consoleFilter === "RUST_ONLY" || state.consoleFilter === "LINK_READY"
-        ? "ALL"
-        : state.consoleFilter,
-    onlyNativeRust: state.consoleFilter === "RUST_ONLY",
-    onlyLinkReady: state.consoleFilter === "LINK_READY",
-    query: state.searchQuery
-  };
-
-  const filtered = filterCatalogEntries(state.catalog, opts);
+  const filtered = getVisibleCatalog();
   grid.innerHTML = "";
 
   if (filtered.length === 0) {
@@ -650,6 +1066,7 @@ function renderCatalogGrid() {
     card.innerHTML = `
       <div class="game-jacket-stage">
         <div class="game-cover" style="--cover-bg: ${spec.bg};">
+          <button class="game-fav-btn${game.favorite ? " active" : ""}" type="button" title="${game.favorite ? "Retirer des favoris" : "Ajouter aux favoris"}" aria-label="${game.favorite ? "Retirer" : "Ajouter"} ${escapeHtml(game.title)} ${game.favorite ? "des" : "aux"} favoris">${game.favorite ? "★" : "☆"}</button>
           <button class="game-remove-btn" type="button" title="Retirer de la bibliothèque" aria-label="Retirer ${escapeHtml(game.title)}">✕</button>
           ${
             hasSpine
@@ -680,8 +1097,23 @@ function renderCatalogGrid() {
       </div>
     `;
 
+    card.querySelector(".game-fav-btn")?.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (tauriInvoke) {
+        const boot = await invokeBackend("toggle_game_favorite", { gameId: game.id });
+        if (boot) applyBootstrap(boot);
+      } else {
+        game.favorite = !game.favorite;
+        updateAllViews();
+      }
+    });
+
     card.querySelector(".game-remove-btn")?.addEventListener("click", async (e) => {
       e.stopPropagation();
+      const removingActive = state.activeGameId === game.id;
+      if (removingActive && state.isEmulationRunning) {
+        stopEmulationPlayback();
+      }
       if (tauriInvoke) {
         const boot = await invokeBackend("remove_game_from_library", { gameId: game.id });
         if (boot) {
@@ -690,7 +1122,7 @@ function renderCatalogGrid() {
         }
       } else {
         state.catalog = state.catalog.filter((item) => item.id !== game.id);
-        if (state.activeGameId === game.id) {
+        if (removingActive) {
           state.activeGameId = state.catalog[0]?.id || "";
         }
         updateAllViews();
@@ -879,14 +1311,17 @@ function renderInspector() {
       cheatsEl.innerHTML = `<div class="empty-list-hint">Aucun code GameShark / Action Replay</div>`;
     } else {
       for (const c of state.cheatCodes) {
-        const row = document.createElement("label");
+        const row = document.createElement("div");
         row.className = "mod-item";
         row.innerHTML = `
-          <span style="display:flex; align-items:center; gap:8px;">
+          <label style="display:flex; align-items:center; gap:8px; min-width:0; flex:1; cursor:pointer;">
             <input type="checkbox" ${c.enabled ? "checked" : ""} />
-            <span>${escapeHtml(String(c.label || "").replace(/^[^\w]+/, ""))}</span>
+            <span class="path-ellipsis">${escapeHtml(String(c.label || "").replace(/^[^\w]+/, ""))}</span>
+          </label>
+          <span style="display:inline-flex; align-items:center; gap:6px; flex-shrink:0;">
+            <span class="mono" style="font-size:10.5px; color:var(--accent-primary);">${escapeHtml(c.codeText)}</span>
+            <button class="btn mono btn-inline-delete btn-remove-cheat" type="button" title="Supprimer ce code" aria-label="Supprimer ce code">✕</button>
           </span>
-          <span class="mono" style="font-size:10.5px; color:var(--accent-primary);">${escapeHtml(c.codeText)}</span>
         `;
         row.querySelector("input").addEventListener("change", async (e) => {
           c.enabled = e.target.checked;
@@ -896,6 +1331,15 @@ function renderInspector() {
           });
           if (boot) applyBootstrap(boot);
           else renderInspector();
+        });
+        row.querySelector(".btn-remove-cheat")?.addEventListener("click", async () => {
+          if (tauriInvoke) {
+            const boot = await invokeBackend("remove_cheat_code", { cheatId: c.id });
+            if (boot) applyBootstrap(boot);
+          } else {
+            state.cheatCodes = state.cheatCodes.filter((item) => item.id !== c.id);
+            renderInspector();
+          }
         });
         cheatsEl.appendChild(row);
       }
@@ -925,34 +1369,80 @@ function renderInspector() {
   const slotsEl = document.getElementById("savestate-slots");
   if (slotsEl) {
     slotsEl.innerHTML = "";
-    for (const slot of state.saveSlots.slice(0, 6)) {
+    const selected = getSelectedGame();
+    const canUseStates = Boolean(selected && !isSwitchGame(selected));
+    for (const slot of state.saveSlots.slice(0, 9)) {
       const card = document.createElement("div");
       card.className = "slot-card";
+      const metaLabel = slot.occupied
+        ? `${slot.label}${slot.crc32Hex && slot.crc32Hex !== "00000000" ? ` · ${slot.crc32Hex}` : ""}`
+        : "Emplacement libre";
       card.innerHTML = `
-        <div class="slot-num mono">SLOT #${slot.slot}</div>
-        <div class="slot-time mono">${slot.occupied ? escapeHtml(slot.label) : "Vide — Cliquer pour sauver"}</div>
+        <div class="slot-head">
+          <div class="slot-num mono">SLOT #${slot.slot}</div>
+          <div class="slot-time mono" title="${escapeHtml(metaLabel)}">${escapeHtml(metaLabel)}</div>
+        </div>
+        <div class="slot-actions">
+          <button class="slot-action-btn mono btn-slot-save" type="button" ${canUseStates ? "" : "disabled"}>
+            ${slot.occupied ? "Écraser" : "Sauver"}
+          </button>
+          <button class="slot-action-btn mono btn-slot-load" type="button" ${canUseStates && slot.occupied ? "" : "disabled"}>
+            Charger
+          </button>
+          <button class="slot-action-btn danger mono btn-slot-delete" type="button" title="Supprimer le Slot #${slot.slot}" aria-label="Supprimer le Slot #${slot.slot}" ${canUseStates && slot.occupied ? "" : "disabled"}>
+            ✕
+          </button>
+        </div>
       `;
-      card.addEventListener("click", async () => {
-        if (!getSelectedGame()) return;
-        if (slot.occupied) {
-          const info = await invokeBackend("restore_save_state", { slot: slot.slot });
-          document.getElementById("save-toast").textContent =
-            `Slot #${slot.slot} chargé (${info?.crc32Hex || slot.crc32Hex})`;
-        } else {
-          const info = await invokeBackend("create_save_state", {
-            slot: slot.slot,
-            label: `Frame #${state.currentFrame}`
-          });
-          if (info) {
-            const boot = await invokeBackend("get_station_bootstrap");
-            if (boot) applyBootstrap(boot);
-          } else {
-            slot.occupied = true;
-            slot.label = `Frame #${state.currentFrame}`;
-            renderInspector();
+
+      card.querySelector(".btn-slot-save")?.addEventListener("click", async () => {
+        if (!canUseStates) return;
+        const info = await invokeBackend("create_save_state", {
+          slot: slot.slot,
+          label: `Frame #${state.currentFrame}`
+        });
+        if (info) {
+          const boot = await invokeBackend("get_station_bootstrap");
+          if (boot) applyBootstrap(boot);
+          const toast = document.getElementById("save-toast");
+          if (toast) toast.textContent = `Slot #${slot.slot} sauvegardé (${info.crc32Hex})`;
+        } else if (!tauriInvoke) {
+          slot.occupied = true;
+          slot.label = `Frame #${state.currentFrame}`;
+          renderInspector();
+        }
+      });
+
+      card.querySelector(".btn-slot-load")?.addEventListener("click", async () => {
+        if (!canUseStates || !slot.occupied) return;
+        const info = await invokeBackend("restore_save_state", { slot: slot.slot });
+        if (info || !tauriInvoke) {
+          const toast = document.getElementById("save-toast");
+          if (toast) {
+            toast.textContent = `Slot #${slot.slot} chargé (${info?.crc32Hex || slot.crc32Hex})`;
           }
         }
       });
+
+      card.querySelector(".btn-slot-delete")?.addEventListener("click", async () => {
+        if (!canUseStates || !slot.occupied) return;
+        if (tauriInvoke) {
+          const slots = await invokeBackend("delete_save_state", { slot: slot.slot });
+          if (Array.isArray(slots)) {
+            state.saveSlots = slots;
+            renderInspector();
+            const toast = document.getElementById("save-toast");
+            if (toast) toast.textContent = `Slot #${slot.slot} supprimé`;
+          }
+        } else {
+          slot.occupied = false;
+          slot.frame = 0;
+          slot.crc32Hex = "00000000";
+          slot.label = `Slot #${slot.slot} Vide`;
+          renderInspector();
+        }
+      });
+
       slotsEl.appendChild(card);
     }
   }
@@ -1077,16 +1567,28 @@ function renderKeymapperAndMacros() {
         row.style.fontSize = "10.5px";
         const hexVal = `0x${(wp.currentValue ?? 0).toString(16).padStart(2, "0").toUpperCase()}`;
         row.innerHTML = `
-          <span><strong style="color:var(--accent-primary)">${escapeHtml(wp.addrHex)}</strong> ${escapeHtml(wp.label)} : <strong style="color:var(--status-ok)">${hexVal}</strong></span>
-          <button class="btn mono" style="padding:1px 6px; font-size:9.5px; color:${wp.frozen ? "var(--accent-secondary)" : "var(--text-muted)"};">
-            ${wp.frozen ? "Gelé" : "Pin"}
-          </button>
+          <span class="path-ellipsis" style="min-width:0; flex:1;"><strong style="color:var(--accent-primary)">${escapeHtml(wp.addrHex)}</strong> ${escapeHtml(wp.label)} : <strong style="color:var(--status-ok)">${hexVal}</strong></span>
+          <span style="display:inline-flex; align-items:center; gap:4px; flex-shrink:0;">
+            <button class="btn mono btn-toggle-wp" type="button" style="padding:1px 6px; font-size:9.5px; color:${wp.frozen ? "var(--accent-secondary)" : "var(--text-muted)"};">
+              ${wp.frozen ? "Gelé" : "Pin"}
+            </button>
+            <button class="btn mono btn-inline-delete btn-remove-wp" type="button" title="Supprimer ce watchpoint" aria-label="Supprimer ce watchpoint">✕</button>
+          </span>
         `;
-        row.querySelector("button").addEventListener("click", async () => {
+        row.querySelector(".btn-toggle-wp")?.addEventListener("click", async () => {
           const boot = await invokeBackend("toggle_watchpoint_freeze", { watchId: wp.id });
           if (boot) applyBootstrap(boot);
-          else {
+          else if (!tauriInvoke) {
             wp.frozen = !wp.frozen;
+            renderKeymapperAndMacros();
+          }
+        });
+        row.querySelector(".btn-remove-wp")?.addEventListener("click", async () => {
+          if (tauriInvoke) {
+            const boot = await invokeBackend("remove_memory_watchpoint", { watchId: wp.id });
+            if (boot) applyBootstrap(boot);
+          } else {
+            state.memoryWatchpoints = state.memoryWatchpoints.filter((item) => item.id !== wp.id);
             renderKeymapperAndMacros();
           }
         });
@@ -1141,13 +1643,29 @@ function buildSwitchEngineBlock(install, target, displayName) {
 function renderNetplayAndCores() {
   const portBadge = document.getElementById("udp-port-badge");
   if (portBadge) {
-    portBadge.textContent = `UDP ZML2 : 127.0.0.1:${state.udpLocalPort || 54920}`;
+    portBadge.textContent = state.udpLocalPort
+      ? `UDP ZML2 : 0.0.0.0:${state.udpLocalPort}`
+      : "UDP ZML2 : Inactif";
   }
   const stunBadge = document.getElementById("stun-endpoint-badge");
   if (stunBadge) {
     stunBadge.textContent = state.stunCandidate
-      ? `STUN Hole-Punch : ${state.stunCandidate.publicEndpoint} (${state.stunCandidate.natType})`
-      : "STUN Hole-Punch : En attente";
+      ? `${state.stunCandidate.natType} : ${state.stunCandidate.publicEndpoint}`
+      : "LAN UDP : En attente";
+  }
+  const packetsBadge = document.getElementById("udp-packets-badge");
+  if (packetsBadge) {
+    packetsBadge.textContent = state.udpPeerAddr
+      ? `Pair ${state.udpPeerAddr} · ${state.udpPacketsSent} ↑ / ${state.udpPacketsReceived} ↓`
+      : `Aucun pair · ${state.udpPacketsSent} ↑ / ${state.udpPacketsReceived} ↓`;
+  }
+  const disconnectBtn = document.getElementById("btn-disconnect-peer");
+  if (disconnectBtn) {
+    disconnectBtn.style.display = state.udpPeerAddr ? "inline-flex" : "none";
+  }
+  const peerInp = document.getElementById("netplay-peer-input");
+  if (peerInp && document.activeElement !== peerInp && state.udpPeerAddr) {
+    peerInp.value = state.udpPeerAddr;
   }
   const specBtn = document.getElementById("btn-toggle-spectator");
   if (specBtn) {
@@ -1266,9 +1784,10 @@ function renderNetplayAndCores() {
         </div>
       `;
       card.querySelector("button").addEventListener("click", async () => {
+        const peerAddr = document.getElementById("netplay-peer-input")?.value?.trim() || null;
         const boot = await invokeBackend("join_netplay_deep_link", {
           uri: r.deepLinkUri,
-          peerAddr: null
+          peerAddr
         });
         if (boot) applyBootstrap(boot);
         if (!state.dualLinkMode) {
@@ -1319,8 +1838,10 @@ function renderNetplayAndCores() {
 
     const vault = state.switchVault || {};
     const keys = vault.keys || {};
+    const fw = vault.firmware || {};
     const prodOk = Boolean(keys.prodKeysFound);
     const titleOk = Boolean(keys.titleKeysFound);
+    const fwOk = Boolean(fw.installed);
 
     // 1. Coffre Switch (Option A)
     const vaultCard = document.createElement("div");
@@ -1350,6 +1871,33 @@ function renderNetplayAndCores() {
           </button>
         </div>
       </div>
+      <div class="switch-vault-row">
+        <div class="switch-vault-head">
+          <div style="font-weight:600;">Firmware Nintendo Switch (.nca · Polices &amp; Applets)</div>
+          <span class="pill-badge ${fwOk ? "pill-green" : "pill-gold"} mono">
+            ${
+              fwOk
+                ? `${fw.ncaCount} .nca · ${escapeHtml(fw.versionHint || formatFileSize(fw.totalBytes || 0))}`
+                : "Optionnel (Recommandé)"
+            }
+          </span>
+        </div>
+        <div class="mono path-ellipsis" style="font-size:10.5px; color:${fwOk ? "var(--status-ok)" : "var(--text-muted)"};" title="${escapeHtml(fw.firmwareDir || "")}">
+          ${
+            fwOk
+              ? `${escapeHtml(fw.firmwareDir)} (${escapeHtml(formatFileSize(fw.totalBytes || 0))}) · synchronisé vers Torzu & Fritchii`
+              : "Recommandé pour les polices système, Mii et jeux récents (MK8D, Animal Crossing, Pokémon). Importez .zip/.7z ou dossier .nca."
+          }
+        </div>
+        <div class="vault-actions">
+          <button class="btn btn-primary mono" id="btn-import-switch-fw-archive" type="button" style="padding:4px 9px; font-size:11px;">
+            ${fwOk ? "Remplacer Firmware (.zip / .7z)..." : "Importer Firmware (.zip / .7z)..."}
+          </button>
+          <button class="btn mono" id="btn-import-switch-fw-folder" type="button" style="padding:4px 9px; font-size:11px;">
+            Importer Dossier Firmware...
+          </button>
+        </div>
+      </div>
       <div id="vault-engines-wrap"></div>
       ${
         vault.vaultRoot
@@ -1366,6 +1914,12 @@ function renderNetplayAndCores() {
     });
     vaultCard.querySelector("#btn-import-switch-keys")?.addEventListener("click", (ev) => {
       handleImportSwitchKeys(ev.currentTarget);
+    });
+    vaultCard.querySelector("#btn-import-switch-fw-archive")?.addEventListener("click", (ev) => {
+      handleImportSwitchFirmware("archive", ev.currentTarget);
+    });
+    vaultCard.querySelector("#btn-import-switch-fw-folder")?.addEventListener("click", (ev) => {
+      handleImportSwitchFirmware("folder", ev.currentTarget);
     });
     const enginesWrap = vaultCard.querySelector("#vault-engines-wrap");
     if (enginesWrap) {
@@ -1414,20 +1968,13 @@ function renderNetplayAndCores() {
       <div class="vault-actions" style="margin-bottom:10px;">
         <button class="btn btn-primary" id="btn-cores-import-files" type="button">Importer fichiers...</button>
         <button class="btn" id="btn-cores-scan-folder" type="button">Scanner un dossier...</button>
+        ${
+          state.romDirectories.length > 0
+            ? `<button class="btn" id="btn-cores-rescan-all" type="button">Tout rescanner</button>`
+            : ""
+        }
       </div>
-      ${
-        state.romDirectories.length > 0
-          ? `<div style="padding-top:8px; border-top:1px solid var(--border-subtle);">
-               <div class="mono" style="font-size:10px; color:var(--text-muted); margin-bottom:4px;">DOSSIERS SCANNÉS</div>
-               ${state.romDirectories
-                 .map(
-                   (dir) =>
-                     `<div class="mono path-ellipsis" style="font-size:11px; color:var(--text-secondary); padding:2px 0;" title="${escapeHtml(dir)}">${escapeHtml(dir)}</div>`
-                 )
-                 .join("")}
-             </div>`
-          : `<div class="empty-list-hint">Aucun scan automatique au démarrage. Ajoutez vos fichiers ou dossiers manuellement, ou par glisser-déposer.</div>`
-      }
+      <div id="rom-dirs-container"></div>
       ${
         state.lastScanReport
           ? `<div class="mono" style="margin-top:10px; font-size:10.5px; color:var(--text-secondary);">
@@ -1436,11 +1983,98 @@ function renderNetplayAndCores() {
           : ""
       }
     `;
+    const dirsWrap = foldersCard.querySelector("#rom-dirs-container");
+    if (dirsWrap) {
+      if (state.romDirectories.length > 0) {
+        const listBox = document.createElement("div");
+        listBox.style.cssText = "padding-top:8px; border-top:1px solid var(--border-subtle);";
+        const head = document.createElement("div");
+        head.className = "mono";
+        head.style.cssText = "font-size:10px; color:var(--text-muted); margin-bottom:6px;";
+        head.textContent = "DOSSIERS SCANNÉS";
+        listBox.appendChild(head);
+
+        for (const dir of state.romDirectories) {
+          const row = document.createElement("div");
+          row.className = "rom-dir-row";
+          row.innerHTML = `
+            <span class="mono path-ellipsis" style="font-size:11px; color:var(--text-secondary); min-width:0; flex:1;" title="${escapeHtml(dir)}">${escapeHtml(dir)}</span>
+            <span class="rom-dir-actions">
+              <button class="btn mono btn-rescan-dir" type="button" style="padding:2px 7px; font-size:10px;" title="Rescanner ce dossier">Rescanner</button>
+              <button class="btn mono btn-inline-delete btn-remove-dir" type="button" title="Retirer ce dossier de la liste" aria-label="Retirer ce dossier">✕</button>
+            </span>
+          `;
+          row.querySelector(".btn-rescan-dir")?.addEventListener("click", async (ev) => {
+            const btn = ev.currentTarget;
+            if (!tauriInvoke) {
+              showToast("Le rescan de dossier requiert l'application desktop Zaimule.", "error");
+              return;
+            }
+            btn.disabled = true;
+            btn.textContent = "Scan...";
+            const boot = await invokeBackend("scan_rom_directory", { dirPath: dir });
+            if (boot) {
+              applyBootstrap(boot);
+              const added = boot.lastScanReport?.importedEntries?.length || 0;
+              showToast(
+                added > 0
+                  ? `${added} jeu(x) synchronisé(s) depuis ${dir}.`
+                  : `Dossier rescanné (${dir}) : aucun nouveau jeu.`,
+                added > 0 ? "ok" : "info"
+              );
+            } else {
+              btn.disabled = false;
+              btn.textContent = "Rescanner";
+            }
+          });
+          row.querySelector(".btn-remove-dir")?.addEventListener("click", async () => {
+            if (tauriInvoke) {
+              const boot = await invokeBackend("remove_rom_directory", { dirPath: dir });
+              if (boot) {
+                applyBootstrap(boot);
+                showToast("Dossier retiré de la liste (ROMs existantes conservées).", "info");
+              }
+            } else {
+              state.romDirectories = state.romDirectories.filter((d) => d !== dir);
+              renderNetplayAndCores();
+            }
+          });
+          listBox.appendChild(row);
+        }
+        dirsWrap.appendChild(listBox);
+      } else {
+        dirsWrap.innerHTML = `<div class="empty-list-hint">Aucun scan automatique au démarrage. Ajoutez vos fichiers ou dossiers manuellement, ou par glisser-déposer.</div>`;
+      }
+    }
     foldersCard.querySelector("#btn-cores-import-files")?.addEventListener("click", () => {
       handleImportRomsTrigger();
     });
     foldersCard.querySelector("#btn-cores-scan-folder")?.addEventListener("click", () => {
       handleScanFolderTrigger();
+    });
+    foldersCard.querySelector("#btn-cores-rescan-all")?.addEventListener("click", async (ev) => {
+      const btn = ev.currentTarget;
+      if (!tauriInvoke) {
+        showToast("Le rescan des dossiers requiert l'application desktop Zaimule.", "error");
+        return;
+      }
+      const prev = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Rescan...";
+      const boot = await invokeBackend("rescan_all_rom_directories");
+      if (boot) {
+        applyBootstrap(boot);
+        const added = boot.lastScanReport?.importedEntries?.length || 0;
+        showToast(
+          added > 0
+            ? `Rescan complet terminé : ${added} jeu(x) synchronisé(s).`
+            : "Rescan complet terminé : bibliothèque à jour.",
+          added > 0 ? "ok" : "info"
+        );
+      } else {
+        btn.disabled = false;
+        btn.textContent = prev;
+      }
     });
 
     // 4. Patchs .IPS Non-Destructifs
@@ -1485,25 +2119,40 @@ function renderNetplayAndCores() {
       }
     }
 
-    // 5. Registre Cryptographique des BIOS
+    // 5. Registre Cryptographique des BIOS & Firmware
     const biosCard = document.createElement("div");
     biosCard.className = "panel-card";
     biosCard.innerHTML = `
-      <div class="section-title"><span>Registre Cryptographique des BIOS HLE</span></div>
+      <div class="section-title">
+        <span>Registre Cryptographique des BIOS &amp; Firmware</span>
+        <button class="btn mono" id="btn-import-bios" type="button" style="padding:3px 9px; font-size:10.5px;">
+          Importer BIOS / Firmware (.zip / .7z / .bin)...
+        </button>
+      </div>
+      <div style="font-size:11px; color:var(--text-secondary); margin-bottom:8px; line-height:1.45;">
+        Optionnel — les cœurs fonctionnent déjà en HLE. Importer vos propres dumps
+        (<strong>bios7.bin</strong>, <strong>bios9.bin</strong>, <strong>firmware.bin</strong> en <strong>.zip</strong>, <strong>.7z</strong> ou <strong>.bin</strong>)
+        active la table KEY1 officielle, les appels BIOS et la calibration tactile sur Nintendo DS.
+      </div>
       ${state.biosEntries
-        .map(
-          (b) => `
-          <div class="mod-item">
+        .map((b) => {
+          const badge = describeBiosStatus(b);
+          const pathAttr = b.installedPath ? ` title="${escapeHtml(b.installedPath)}"` : "";
+          return `
+          <div class="mod-item"${pathAttr}>
             <div>
-              <div class="mono" style="font-weight:600">${escapeHtml(b.fileName)} (${escapeHtml(b.console)})</div>
+              <div class="mono" style="font-weight:600">${escapeHtml(b.fileName)} (${escapeHtml(String(b.console || "").toUpperCase())})</div>
               <div style="font-size:11px; color:var(--text-muted)">${escapeHtml(b.notes)}</div>
             </div>
-            <span class="pill-badge pill-green mono">CRC ${escapeHtml(b.expectedCrc32Hex)}</span>
+            <span class="pill-badge ${badge.pillClass} mono">${escapeHtml(badge.label)}</span>
           </div>
-        `
-        )
+        `;
+        })
         .join("")}
     `;
+    biosCard.querySelector("#btn-import-bios")?.addEventListener("click", (ev) => {
+      handleImportBios(ev.currentTarget);
+    });
 
     coresGrid.appendChild(vaultCard);
     coresGrid.appendChild(nativeCard);
@@ -1529,7 +2178,11 @@ function applyBootstrap(boot) {
   state.macros = Array.isArray(boot.macros) ? boot.macros : state.macros;
   state.tasTimeline = Array.isArray(boot.tasTimeline) ? boot.tasTimeline : state.tasTimeline;
   state.netplayRooms = Array.isArray(boot.netplayRooms) ? boot.netplayRooms : state.netplayRooms;
-  state.udpLocalPort = boot.udpLocalPort || state.udpLocalPort;
+  state.udpLocalPort =
+    boot.udpLocalPort !== undefined ? Number(boot.udpLocalPort) || 0 : state.udpLocalPort;
+  state.udpPeerAddr = boot.udpPeerAddr ?? null;
+  state.udpPacketsSent = Number(boot.udpPacketsSent) || 0;
+  state.udpPacketsReceived = Number(boot.udpPacketsReceived) || 0;
   state.stunCandidate = boot.stunCandidate || state.stunCandidate;
   state.netplayChat = Array.isArray(boot.netplayChat) ? boot.netplayChat : state.netplayChat;
   state.communityMods = Array.isArray(boot.communityMods)
@@ -1556,11 +2209,27 @@ function applyBootstrap(boot) {
     : state.romDirectories;
   state.switchVault = boot.switchVault || state.switchVault;
   state.lastScanReport = boot.lastScanReport || state.lastScanReport;
+  if (typeof boot.activeShaderCss === "string" && boot.activeShaderCss) {
+    state.activeShaderCss = boot.activeShaderCss;
+  }
+  if (typeof boot.upscalerMode === "string" && boot.upscalerMode) {
+    state.upscalerMode = boot.upscalerMode;
+  }
+  if ([1, 2, 4, 8].includes(Number(boot.speedMultiplier))) {
+    state.speedMult = Number(boot.speedMultiplier);
+  }
+  if (typeof boot.ndsLayout === "string" && boot.ndsLayout) {
+    state.ndsLayout = boot.ndsLayout;
+  }
   state.warning = boot.warning || null;
   if (state.warning && state.warning !== lastSurfacedWarning) {
     lastSurfacedWarning = state.warning;
     showToast(state.warning, "error", 7000);
   }
+  if (state.isEmulationRunning && (!getSelectedGame() || isSwitchGame(getSelectedGame()))) {
+    stopEmulationPlayback();
+  }
+  applyDisplayPreferencesToDom();
   updateAllViews();
 }
 
@@ -1584,12 +2253,29 @@ function updateAllViews() {
 }
 
 function switchTab(targetId) {
+  const prevPane = document.querySelector(".view-pane.active")?.id;
+  if (prevPane === "view-emulator" && targetId !== "view-emulator") {
+    if (state.isFullscreen) {
+      setViewportFullscreen(false);
+    }
+    framePacer.reset();
+    apuAudio.reset();
+    releaseTransientInputs();
+  } else if (targetId === "view-emulator") {
+    framePacer.reset();
+    lastTelemetryDomUpdateMs = 0;
+  }
   document.querySelectorAll(".nav-tab").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.target === targetId);
   });
   document.querySelectorAll(".view-pane").forEach((pane) => {
     pane.classList.toggle("active", pane.id === targetId);
   });
+  if ((targetId === "view-library" || targetId === "view-netplay") && tauriInvoke) {
+    invokeBackend("get_station_bootstrap", {}, { silent: true }).then((boot) => {
+      if (boot) applyBootstrap(boot);
+    });
+  }
 }
 
 function renderStandbyCanvas() {
@@ -1620,10 +2306,17 @@ function renderStandbyCanvas() {
 function paintRgbaFrame(canvasId, frame) {
   const canvas = document.getElementById(canvasId);
   if (!canvas || !frame || !frame.rgba) return;
-  const processed =
+  let processed =
     canvasId.startsWith("canvas-p") && state.upscalerMode !== "OFF"
       ? upscaleFrameIfEnabled(frame, state.upscalerMode)
       : frame;
+
+  if (canvasId.startsWith("canvas-p") && state.ndsLayout !== "vertical") {
+    const g = getSelectedGame();
+    if (g && String(g.console || "").toUpperCase() === "NDS") {
+      processed = arrangeNdsDualScreenFrame(processed, state.ndsLayout);
+    }
+  }
 
   const w = processed.width;
   const h = processed.height;
@@ -1900,31 +2593,60 @@ async function refreshDebuggerDrawer() {
   }
 }
 
-async function tickEmulationLoop() {
+async function tickEmulationLoop(nowMs) {
   if (stepInFlight) {
     requestAnimationFrame(tickEmulationLoop);
     return;
   }
   stepInFlight = true;
   try {
-    const buttonsP1 = computeBitmaskFromPressedCodes(pressedKeys) | pollGamepadBitmask();
-    await handleBigPictureNavigation(buttonsP1);
-
     const activeGame = getSelectedGame();
     const isSwitch = isSwitchGame(activeGame);
+    const activePane = document.querySelector(".view-pane.active")?.id || "view-library";
+    const keyBindings = buildKeyBindingsFromWidgets(state.keymapperWidgets);
+    const rawMask = computeBitmaskFromPressedCodes(pressedKeys, keyBindings) | pollGamepadBitmask();
+
+    if (!document.hidden) {
+      await handleBigPictureNavigation(rawMask);
+    }
 
     if (!state.isEmulationRunning || !activeGame || isSwitch) {
       if (isSwitch && state.isEmulationRunning) {
-        state.isEmulationRunning = false;
-        hideEmuBanner();
+        stopEmulationPlayback();
+      } else {
+        framePacer.reset();
       }
       return;
     }
 
+    if (document.hidden || activePane !== "view-emulator") {
+      framePacer.reset();
+      return;
+    }
+
     if (state.debuggerPaused && !state.stepOnceRequested) {
+      framePacer.reset();
+      return;
+    }
+
+    const targetFps = targetFpsForConsole(activeGame.console);
+    const manualStep = state.stepOnceRequested;
+    const pacing = manualStep
+      ? { shouldStep: true, measuredFps: targetFps, frameTimeMs: 1000 / targetFps }
+      : framePacer.advance(nowMs, targetFps);
+
+    if (!pacing.shouldStep) {
       return;
     }
     state.stepOnceRequested = false;
+
+    const buttonsP1 = applyPressedTurboWidgets(
+      rawMask,
+      pressedKeys,
+      state.keymapperWidgets,
+      state.currentFrame,
+      targetFps
+    );
 
     if (state.recordingMacro) {
       state.recordedFrames.push(buttonsP1);
@@ -1935,7 +2657,7 @@ async function tickEmulationLoop() {
       {
         buttonsP1,
         buttonsP2: 0,
-        turboActive: true,
+        turboActive: false,
         speedMult: state.speedMult
       },
       { silent: true }
@@ -1983,6 +2705,14 @@ async function tickEmulationLoop() {
           else renderInspector();
         }
 
+        if (!lastTelemetryDomUpdateMs || nowMs - lastTelemetryDomUpdateMs >= 250) {
+          lastTelemetryDomUpdateMs = nowMs;
+          const fpsEl = document.getElementById("tel-fps");
+          if (fpsEl) fpsEl.textContent = `${(pacing.measuredFps * state.speedMult).toFixed(1)} FPS`;
+          const ftEl = document.getElementById("tel-ft");
+          if (ftEl) ftEl.textContent = `${pacing.frameTimeMs.toFixed(1)} ms`;
+        }
+
         const cpu = meta.cpu || {};
         const score = cpu.score ?? 0;
         document.getElementById("emu-score-pill").textContent = `Score : ${score}`;
@@ -2023,13 +2753,40 @@ async function setupDragAndDrop() {
     const paths = Array.isArray(rawPaths) ? rawPaths.filter(Boolean) : [];
     setDragActive(false);
     if (paths.length === 0) return;
+    const prevBios = listInstalledBiosMap(state.biosEntries);
     showToast(`Importation de ${paths.length} élément(s)...`, "info", 4000);
     const boot = await invokeBackend("import_rom_paths", { paths });
     if (boot) {
       applyBootstrap(boot);
       const added = boot.lastScanReport?.importedEntries?.length || 0;
-      if (added > 0) {
+      const nextBios = listInstalledBiosMap(boot.biosEntries);
+      const changedBios = [];
+      for (const [fileName, sig] of nextBios.entries()) {
+        if (prevBios.get(fileName) !== sig) {
+          changedBios.push(fileName);
+        }
+      }
+      const looksLikeBiosDrop = paths.some((p) => /bios|firmware/i.test(String(p)));
+      if (added > 0 && changedBios.length > 0) {
+        showToast(
+          `${added} jeu(x) + BIOS (${changedBios.join(", ")}) importés.`,
+          "ok",
+          6500
+        );
+      } else if (added > 0) {
         showToast(`${added} jeu(x) importé(s) dans la bibliothèque.`, "ok");
+      } else if (changedBios.length > 0) {
+        showToast(
+          `BIOS / Firmware importés dans system/ : ${changedBios.join(", ")}. Relancez un jeu NDS pour activer.`,
+          "ok",
+          6500
+        );
+      } else if (looksLikeBiosDrop && nextBios.size > 0) {
+        showToast(
+          `BIOS / Firmware vérifiés dans system/ : ${Array.from(nextBios.keys()).join(", ")}.`,
+          "ok",
+          6000
+        );
       } else {
         showToast("Élément(s) traité(s).", "ok");
       }
@@ -2186,20 +2943,37 @@ function bindEvents() {
   });
 
   const canvasP1 = document.getElementById("canvas-p1");
+  const isNdsActive = () => {
+    const g = getSelectedGame();
+    return Boolean(g && String(g.console || "").toUpperCase() === "NDS");
+  };
   const handleStylusEvent = async (ev, pressed) => {
-    if (!canvasP1 || !getSelectedGame()) return;
+    if (!canvasP1 || !isNdsActive()) return false;
     const rect = canvasP1.getBoundingClientRect();
     const normX = Math.max(0, Math.min(1, (ev.clientX - rect.left) / Math.max(1, rect.width)));
     const normY = Math.max(0, Math.min(1, (ev.clientY - rect.top) / Math.max(1, rect.height)));
-    const x = Math.floor(normX * 255);
-    const fullY = Math.floor(normY * (canvasP1.height || 384));
-    const touchY = canvasP1.height >= 300 ? Math.max(0, fullY - 192) : Math.floor(normY * 191);
-    await invokeBackend("set_nds_stylus", { x, y: Math.min(191, touchY), pressed });
+    const mapped = mapCanvasToNdsStylus(normX, normY, state.ndsLayout);
+    if (pressed && !mapped.onBottomScreen) {
+      await invokeBackend("set_nds_stylus", { x: mapped.x, y: 0, pressed: false }, { silent: true });
+      return false;
+    }
+    await invokeBackend(
+      "set_nds_stylus",
+      { x: mapped.x, y: mapped.y, pressed: pressed && mapped.onBottomScreen },
+      { silent: true }
+    );
+    return mapped.onBottomScreen;
   };
 
   canvasP1?.addEventListener("mousedown", async (e) => {
+    if (!isNdsActive()) return;
+    const rect = canvasP1.getBoundingClientRect();
+    const normX = Math.max(0, Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width)));
+    const normY = Math.max(0, Math.min(1, (e.clientY - rect.top) / Math.max(1, rect.height)));
+    const mapped = mapCanvasToNdsStylus(normX, normY, state.ndsLayout);
+    if (!mapped.onBottomScreen) return;
     state.stylusPressed = true;
-    await handleStylusEvent(e, true);
+    await invokeBackend("set_nds_stylus", { x: mapped.x, y: mapped.y, pressed: true }, { silent: true });
   });
   canvasP1?.addEventListener("mousemove", async (e) => {
     if (!state.stylusPressed) return;
@@ -2287,6 +3061,11 @@ function bindEvents() {
 
   document.getElementById("search-input")?.addEventListener("input", (e) => {
     state.searchQuery = e.target.value;
+    renderCatalogGrid();
+  });
+
+  document.getElementById("library-sort-select")?.addEventListener("change", (e) => {
+    state.sortBy = e.target.value || "recent";
     renderCatalogGrid();
   });
 
@@ -2482,13 +3261,47 @@ function bindEvents() {
     }
   });
 
+  document.getElementById("btn-connect-peer")?.addEventListener("click", async () => {
+    const inp = document.getElementById("netplay-peer-input");
+    const peerAddr = inp?.value?.trim();
+    if (!peerAddr) {
+      showToast("Saisissez une adresse LAN IP:PORT (ex: 192.168.1.20:54920).", "info");
+      return;
+    }
+    if (tauriInvoke) {
+      const boot = await invokeBackend("connect_netplay_peer", { peerAddr });
+      if (boot) {
+        applyBootstrap(boot);
+        showToast(`Pair UDP LAN connecté : ${boot.udpPeerAddr || peerAddr}`, "ok");
+      }
+    } else {
+      state.udpPeerAddr = peerAddr;
+      renderNetplayAndCores();
+      showToast(`Pair UDP LAN connecté : ${peerAddr}`, "ok");
+    }
+  });
+
+  document.getElementById("btn-disconnect-peer")?.addEventListener("click", async () => {
+    const inp = document.getElementById("netplay-peer-input");
+    if (inp) inp.value = "";
+    if (tauriInvoke) {
+      const boot = await invokeBackend("connect_netplay_peer", { peerAddr: null });
+      if (boot) applyBootstrap(boot);
+    } else {
+      state.udpPeerAddr = null;
+      renderNetplayAndCores();
+    }
+    showToast("Pair UDP déconnecté.", "info");
+  });
+
   document.getElementById("btn-create-room")?.addEventListener("click", async () => {
     const g = getSelectedGame();
     if (!g) return;
+    const peerAddr = document.getElementById("netplay-peer-input")?.value?.trim() || null;
     const boot = await invokeBackend("create_netplay_room", {
       title: `Salon Live · ${g.title}`,
       hostName: "Hôte",
-      peerAddr: null
+      peerAddr
     });
     if (boot) {
       applyBootstrap(boot);
@@ -2513,7 +3326,8 @@ function bindEvents() {
     const inp = document.getElementById("deeplink-input");
     const uri = inp?.value?.trim();
     if (!uri) return;
-    const boot = await invokeBackend("join_netplay_deep_link", { uri, peerAddr: null });
+    const peerAddr = document.getElementById("netplay-peer-input")?.value?.trim() || null;
+    const boot = await invokeBackend("join_netplay_deep_link", { uri, peerAddr });
     if (boot) applyBootstrap(boot);
     launchSelectedGame();
   });
@@ -2533,6 +3347,19 @@ function bindEvents() {
     e.currentTarget.textContent = `Audio APU : ${on ? "ON" : "MUET"}`;
   });
 
+  document.getElementById("audio-volume-slider")?.addEventListener("input", (e) => {
+    const pct = Math.max(0, Math.min(100, Math.round(Number(e.target.value) || 0)));
+    state.audioVolume = pct;
+    apuAudio.setVolume(pct / 100);
+    const label = document.getElementById("audio-volume-label");
+    if (label) label.textContent = `${pct}%`;
+    try {
+      window.localStorage?.setItem("zaimule.audioVolume", String(pct));
+    } catch {
+      // Ignore storage write errors
+    }
+  });
+
   document.getElementById("btn-record-video")?.addEventListener("click", (e) => {
     if (!getSelectedGame()) return;
     const canvas = document.getElementById("canvas-p1");
@@ -2548,7 +3375,63 @@ function bindEvents() {
     }
   });
 
-  document.getElementById("btn-upscaler-cycle")?.addEventListener("click", (e) => {
+  document.getElementById("btn-emu-pause")?.addEventListener("click", () => {
+    if (!state.isEmulationRunning) return;
+    setEmulationPaused(!state.debuggerPaused);
+  });
+
+  document.getElementById("btn-emu-reset")?.addEventListener("click", async () => {
+    const g = getSelectedGame();
+    if (!g || isSwitchGame(g)) {
+      showToast("Lancez d'abord un jeu natif (GB/GBC/GBA/NDS) pour effectuer un reset.", "info");
+      return;
+    }
+    if (tauriInvoke) {
+      const boot = await invokeBackend("reset_active_game");
+      if (!boot) return;
+      applyBootstrap(boot);
+    }
+    state.currentFrame = 0;
+    framePacer.reset();
+    apuAudio.reset();
+    setEmulationPaused(false);
+    showToast("Reset matériel effectué (sauvegarde SRAM préservée).", "ok");
+  });
+
+  document.getElementById("btn-screenshot-png")?.addEventListener("click", () => {
+    captureScreenshotPng();
+  });
+
+  document.getElementById("btn-nds-layout")?.addEventListener("click", () => {
+    const curIdx = Math.max(0, NDS_LAYOUT_MODES.indexOf(state.ndsLayout));
+    state.ndsLayout = NDS_LAYOUT_MODES[(curIdx + 1) % NDS_LAYOUT_MODES.length];
+    applyDisplayPreferencesToDom();
+    invokeBackend(
+      "update_ui_preferences",
+      {
+        shaderCss: null,
+        upscalerMode: null,
+        speedMultiplier: null,
+        ndsLayout: state.ndsLayout
+      },
+      { silent: true }
+    );
+  });
+
+  document.getElementById("btn-fullscreen-toggle")?.addEventListener("click", async () => {
+    await setViewportFullscreen(!state.isFullscreen);
+  });
+
+  document.addEventListener("fullscreenchange", () => {
+    if (!document.fullscreenElement && state.isFullscreen) {
+      state.isFullscreen = false;
+      document.querySelector(".app-shell")?.classList.remove("viewport-fullscreen");
+      const btn = document.getElementById("btn-fullscreen-toggle");
+      if (btn) btn.textContent = "Plein écran";
+    }
+  });
+
+  document.getElementById("btn-upscaler-cycle")?.addEventListener("click", () => {
     state.upscalerMode =
       state.upscalerMode === "OFF"
         ? "SCALE2X"
@@ -2557,35 +3440,33 @@ function bindEvents() {
           : state.upscalerMode === "XBRZ"
             ? "BLOOM"
             : "OFF";
-    const label =
-      state.upscalerMode === "SCALE2X"
-        ? "Upscaler : Scale2x EPX"
-        : state.upscalerMode === "XBRZ"
-          ? "Upscaler : xBRZ 2x"
-          : state.upscalerMode === "BLOOM"
-            ? "Upscaler : CRT Bloom"
-            : "Upscaler : Natif 1x";
-    e.currentTarget.textContent = label;
+    applyDisplayPreferencesToDom();
+    invokeBackend(
+      "update_ui_preferences",
+      {
+        shaderCss: null,
+        upscalerMode: state.upscalerMode,
+        speedMultiplier: null,
+        ndsLayout: null
+      },
+      { silent: true }
+    );
   });
 
-  const shaders = ["mode-crt", "mode-trinitron", "mode-dmg", "mode-lcd", "mode-clean"];
-  const shaderLabels = [
-    "Shader : CRT Scanlines",
-    "Shader : Trinitron Courbé",
-    "Shader : Game Boy DMG Vert",
-    "Shader : Matrice LCD",
-    "Shader : Pixel-Perfect"
-  ];
-  let shaderIdx = 0;
-  document.getElementById("btn-shader-cycle")?.addEventListener("click", (e) => {
-    shaderIdx = (shaderIdx + 1) % shaders.length;
-    e.currentTarget.textContent = shaderLabels[shaderIdx];
-    ["screen-1", "screen-2", "screen-3", "screen-4"].forEach((id) => {
-      const el = document.getElementById(id);
-      if (!el) return;
-      el.classList.remove("mode-crt", "mode-trinitron", "mode-dmg", "mode-lcd", "mode-clean");
-      el.classList.add(shaders[shaderIdx]);
-    });
+  document.getElementById("btn-shader-cycle")?.addEventListener("click", () => {
+    const curIdx = Math.max(0, SHADER_MODES.indexOf(state.activeShaderCss));
+    state.activeShaderCss = SHADER_MODES[(curIdx + 1) % SHADER_MODES.length];
+    applyDisplayPreferencesToDom();
+    invokeBackend(
+      "update_ui_preferences",
+      {
+        shaderCss: state.activeShaderCss,
+        upscalerMode: null,
+        speedMultiplier: null,
+        ndsLayout: null
+      },
+      { silent: true }
+    );
   });
 
   const toggleKm = () => {
@@ -2662,26 +3543,30 @@ function bindEvents() {
     await invokeBackend("set_quad_link_enabled", { enabled: state.quadLinkMode });
   });
 
-  document.getElementById("btn-dbg-pause")?.addEventListener("click", (e) => {
-    state.debuggerPaused = !state.debuggerPaused;
-    e.currentTarget.textContent = state.debuggerPaused ? "Reprendre" : "Pause CPU";
+  document.getElementById("btn-dbg-pause")?.addEventListener("click", () => {
+    setEmulationPaused(!state.debuggerPaused);
   });
 
   document.getElementById("btn-dbg-step")?.addEventListener("click", () => {
-    state.debuggerPaused = true;
+    setEmulationPaused(true);
     state.stepOnceRequested = true;
-    const pauseBtn = document.getElementById("btn-dbg-pause");
-    if (pauseBtn) pauseBtn.textContent = "Reprendre";
   });
 
-  document.getElementById("btn-speed-cycle")?.addEventListener("click", (e) => {
+  document.getElementById("btn-speed-cycle")?.addEventListener("click", () => {
     state.speedMult =
       state.speedMult === 1 ? 2 : state.speedMult === 2 ? 4 : state.speedMult === 4 ? 8 : 1;
-    e.currentTarget.textContent = `Vitesse : ${state.speedMult}x`;
-    if (state.isEmulationRunning) {
-      document.getElementById("tel-fps").textContent = `${(60 * state.speedMult).toFixed(0)} FPS`;
-      document.getElementById("tel-ft").textContent = `${(16.6 / state.speedMult).toFixed(1)} ms`;
-    }
+    applyDisplayPreferencesToDom();
+    lastTelemetryDomUpdateMs = 0;
+    invokeBackend(
+      "update_ui_preferences",
+      {
+        shaderCss: null,
+        upscalerMode: null,
+        speedMultiplier: state.speedMult,
+        ndsLayout: null
+      },
+      { silent: true }
+    );
   });
 
   document.getElementById("btn-quick-save")?.addEventListener("click", async () => {
@@ -2705,6 +3590,16 @@ function bindEvents() {
     await invokeBackend("rewind_frames", { stepsBack: 2 });
   });
 
+  const EMULATOR_PREVENT_DEFAULT_CODES = new Set([
+    "Space",
+    "ArrowUp",
+    "ArrowDown",
+    "ArrowLeft",
+    "ArrowRight",
+    "Enter",
+    "Backspace"
+  ]);
+
   window.addEventListener("keydown", async (e) => {
     const activeTag = document.activeElement?.tagName;
     if (activeTag === "INPUT" || activeTag === "TEXTAREA" || activeTag === "SELECT") {
@@ -2714,22 +3609,51 @@ function bindEvents() {
     if (e.ctrlKey || e.metaKey || e.altKey) {
       return;
     }
-    if (state.isEmulationRunning && apuAudio.enabled) {
+
+    const activePane = document.querySelector(".view-pane.active")?.id || "view-library";
+    if (e.code === "Escape" && state.isFullscreen) {
+      e.preventDefault();
+      await setViewportFullscreen(false);
+      return;
+    }
+    if ((e.code === "F9" || e.code === "Pause") && activePane === "view-emulator" && state.isEmulationRunning) {
+      e.preventDefault();
+      setEmulationPaused(!state.debuggerPaused);
+      return;
+    }
+    if (e.code === "F11" && activePane === "view-emulator") {
+      e.preventDefault();
+      await setViewportFullscreen(!state.isFullscreen);
+      return;
+    }
+    if (e.code === "F12" && activePane === "view-emulator") {
+      e.preventDefault();
+      captureScreenshotPng();
+      return;
+    }
+
+    if (activePane === "view-emulator" && EMULATOR_PREVENT_DEFAULT_CODES.has(e.code)) {
+      e.preventDefault();
+    }
+
+    if (state.isEmulationRunning && apuAudio.enabled && activePane === "view-emulator") {
       apuAudio.ensureContext();
     }
     pressedKeys.add(e.code);
 
-    const activePane = document.querySelector(".view-pane.active")?.id || "view-library";
-    if (e.key === "/") {
-      e.preventDefault();
-      document.getElementById("search-input")?.focus();
-      return;
+    if (activePane !== "view-emulator") {
+      if (e.key === "/") {
+        e.preventDefault();
+        document.getElementById("search-input")?.focus();
+        return;
+      }
+      if (e.code === "KeyY") {
+        e.preventDefault();
+        toggleInspectorDrawer();
+        return;
+      }
     }
-    if (e.code === "KeyY") {
-      e.preventDefault();
-      toggleInspectorDrawer();
-      return;
-    }
+
     if (activePane === "view-library") {
       if (e.code === "Enter") {
         if (activeTag === "BUTTON") return;
@@ -2747,16 +3671,37 @@ function bindEvents() {
         cycleConsoleFilter(1);
         return;
       }
-      if ((e.code === "ArrowRight" || e.code === "ArrowLeft") && state.catalog.length > 0) {
+      if (
+        e.code === "ArrowRight" ||
+        e.code === "ArrowLeft" ||
+        e.code === "ArrowDown" ||
+        e.code === "ArrowUp"
+      ) {
+        const visible = getVisibleCatalog();
+        if (visible.length === 0) return;
         e.preventDefault();
-        const step = e.code === "ArrowRight" ? 1 : -1;
-        const idx = state.catalog.findIndex((g) => g.id === state.activeGameId);
-        const nextGame = state.catalog[(Math.max(0, idx) + step + state.catalog.length) % state.catalog.length];
-        if (nextGame) {
+        const cols = getLibraryGridColumnCount();
+        const step =
+          e.code === "ArrowRight"
+            ? 1
+            : e.code === "ArrowLeft"
+              ? -1
+              : e.code === "ArrowDown"
+                ? cols
+                : -cols;
+        const idx = visible.findIndex((g) => g.id === state.activeGameId);
+        const base = idx >= 0 ? idx : 0;
+        const nextIdx =
+          e.code === "ArrowRight" || e.code === "ArrowLeft"
+            ? (base + step + visible.length) % visible.length
+            : Math.max(0, Math.min(visible.length - 1, base + step));
+        const nextGame = visible[nextIdx];
+        if (nextGame && (idx < 0 || nextGame.id !== state.activeGameId)) {
           state.activeGameId = nextGame.id;
           const boot = await invokeBackend("select_game", { gameId: nextGame.id });
           if (boot) applyBootstrap(boot);
           else updateAllViews();
+          scrollSelectedCardIntoView();
         }
         return;
       }
@@ -2768,7 +3713,7 @@ function bindEvents() {
     } else if (e.code === "F8") {
       e.preventDefault();
       document.getElementById("btn-quick-load")?.click();
-    } else if (e.code === "Backspace") {
+    } else if (e.code === "Backspace" && activePane === "view-emulator") {
       e.preventDefault();
       document.getElementById("btn-rewind-step")?.click();
     }
@@ -2776,6 +3721,21 @@ function bindEvents() {
 
   window.addEventListener("keyup", (e) => {
     pressedKeys.delete(e.code);
+  });
+
+  window.addEventListener("blur", () => {
+    releaseTransientInputs();
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      releaseTransientInputs();
+      framePacer.reset();
+      apuAudio.reset();
+    } else {
+      framePacer.reset();
+      lastTelemetryDomUpdateMs = 0;
+    }
   });
 
   document.getElementById("win-min")?.addEventListener("click", () => appWindow?.minimize());
@@ -2809,6 +3769,12 @@ async function init() {
     }
   }
 
+  apuAudio.setVolume(state.audioVolume / 100);
+  const volSlider = document.getElementById("audio-volume-slider");
+  if (volSlider) volSlider.value = String(state.audioVolume);
+  const volLabel = document.getElementById("audio-volume-label");
+  if (volLabel) volLabel.textContent = `${state.audioVolume}%`;
+  applyDisplayPreferencesToDom();
   renderStandbyCanvas();
   updateAllViews();
   const boot = await invokeBackend("get_station_bootstrap");

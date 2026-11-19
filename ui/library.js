@@ -75,7 +75,7 @@ export function filterCatalogEntries(entries, filterOptions = {}) {
 }
 
 export function computeConsoleCounts(entries) {
-  const counts = { ALL: 0, RUST: 0, LINK: 0 };
+  const counts = { ALL: 0, FAVORITES: 0, RUST: 0, LINK: 0 };
   if (!Array.isArray(entries)) return counts;
 
   for (const g of entries) {
@@ -83,10 +83,45 @@ export function computeConsoleCounts(entries) {
     counts.ALL += 1;
     const c = String(g.console || "").toUpperCase();
     counts[c] = (counts[c] || 0) + 1;
+    if (g.favorite) counts.FAVORITES += 1;
     if (g.engineKind === "nativeRust") counts.RUST += 1;
     if (g.linkCableReady) counts.LINK += 1;
   }
   return counts;
+}
+
+export function sortCatalogEntries(entries, sortBy = "recent") {
+  if (!Array.isArray(entries)) return [];
+  const copy = [...entries];
+  const mode = String(sortBy || "recent").toLowerCase();
+  if (mode === "title") {
+    return copy.sort((a, b) =>
+      String(a?.title || "").localeCompare(String(b?.title || ""), "fr", {
+        sensitivity: "base"
+      })
+    );
+  }
+  if (mode === "playtime") {
+    return copy.sort((a, b) => {
+      const diff = (Number(b?.playtimeSeconds) || 0) - (Number(a?.playtimeSeconds) || 0);
+      if (diff !== 0) return diff;
+      return String(a?.title || "").localeCompare(String(b?.title || ""), "fr", {
+        sensitivity: "base"
+      });
+    });
+  }
+  if (mode === "console") {
+    return copy.sort((a, b) => {
+      const cDiff = String(a?.console || "").localeCompare(String(b?.console || ""), "fr", {
+        sensitivity: "base"
+      });
+      if (cDiff !== 0) return cDiff;
+      return String(a?.title || "").localeCompare(String(b?.title || ""), "fr", {
+        sensitivity: "base"
+      });
+    });
+  }
+  return copy;
 }
 
 export function formatHardwareProfileLabel(cpuOverclockPct = 100, pgxpSubpixel = true) {

@@ -34,8 +34,13 @@ export const DEFAULT_KEY_BINDINGS = {
   ShiftLeft: BTN_B,
   KeyI: BTN_X,
   KeyO: BTN_Y,
+  KeyE: BTN_L,
+  KeyL: BTN_L,
+  KeyR: BTN_R,
+  KeyP: BTN_R,
   Enter: BTN_START,
-  Backspace: BTN_SELECT
+  ShiftRight: BTN_SELECT,
+  KeyN: BTN_SELECT
 };
 
 export function computeBitmaskFromPressedCodes(pressedSet, bindings = DEFAULT_KEY_BINDINGS) {
@@ -49,15 +54,109 @@ export function computeBitmaskFromPressedCodes(pressedSet, bindings = DEFAULT_KE
   return mask;
 }
 
+/**
+ * Merges custom non-turbo keymapper widget bindings over the default keyboard layout.
+ */
+export function buildKeyBindingsFromWidgets(widgets, baseBindings = DEFAULT_KEY_BINDINGS) {
+  const bindings = { ...baseBindings };
+  if (!Array.isArray(widgets)) return bindings;
+  for (const w of widgets) {
+    if (!w || w.kind === "dpad") continue;
+    const code = w.keyBinding || w.keyCode;
+    const mask = Number(w.buttonMask) || 0;
+    const turboHz = Number(w.turboHz) || 0;
+    if (!code || typeof code !== "string" || !mask || turboHz > 0) continue;
+    if (/^[A-Za-z][A-Za-z0-9]+$/.test(code) && code !== "ZQSD") {
+      bindings[code] = mask;
+    }
+  }
+  return bindings;
+}
+
+/**
+ * Applies turbo duty-cycle pulsing ONLY for turbo widgets whose bound key is actively held.
+ * Never fires unpressed buttons.
+ */
+export function applyPressedTurboWidgets(baseMask, pressedSet, widgets, frame, fps = 60) {
+  let mask = Number(baseMask) || 0;
+  if (!pressedSet || pressedSet.size === 0 || !Array.isArray(widgets)) {
+    return mask;
+  }
+  for (const w of widgets) {
+    if (!w || w.kind === "dpad") continue;
+    const turboHz = Number(w.turboHz) || 0;
+    const btnMask = Number(w.buttonMask) || 0;
+    const code = w.keyBinding || w.keyCode;
+    if (turboHz <= 0 || !btnMask || !code) continue;
+    if (!pressedSet.has(code)) continue;
+    if (shouldFireTurboOnFrame(frame, turboHz, fps)) {
+      mask |= btnMask;
+    } else {
+      mask &= ~btnMask;
+    }
+  }
+  return mask;
+}
+
+/**
+ * Maps normalized viewport coordinates (0..1, 0..1) on the Nintendo DS dual-screen
+ * canvas into NDS touchscreen coordinates (0..255, 0..191), independent of upscaler
+ * resolution and supporting all 4 dual-screen layouts:
+ * - `"vertical"` (default): top screen 0..0.5 Y, touchscreen 0.5..1.0 Y
+ * - `"vertical-swapped"`: touchscreen 0..0.5 Y, top screen 0.5..1.0 Y
+ * - `"horizontal"`: top screen 0..0.5 X, touchscreen 0.5..1.0 X
+ * - `"horizontal-swapped"`: touchscreen 0..0.5 X, top screen 0.5..1.0 X
+ */
+export function mapCanvasToNdsStylus(normX, normY, layout = "vertical") {
+  const clampedX = Math.max(0, Math.min(1, Number(normX) || 0));
+  const clampedY = Math.max(0, Math.min(1, Number(normY) || 0));
+  const mode = String(layout || "vertical").toLowerCase();
+
+  let touchNormX = clampedX;
+  let touchNormY = clampedY;
+
+  if (mode === "vertical-swapped") {
+    if (clampedY >= 0.5) {
+      return { onBottomScreen: false, x: 0, y: 0 };
+    }
+    touchNormY = clampedY / 0.5;
+  } else if (mode === "horizontal") {
+    if (clampedX < 0.5) {
+      return { onBottomScreen: false, x: 0, y: 0 };
+    }
+    touchNormX = (clampedX - 0.5) / 0.5;
+  } else if (mode === "horizontal-swapped") {
+    if (clampedX >= 0.5) {
+      return { onBottomScreen: false, x: 0, y: 0 };
+    }
+    touchNormX = clampedX / 0.5;
+  } else {
+    if (clampedY < 0.5) {
+      return { onBottomScreen: false, x: 0, y: 0 };
+    }
+    touchNormY = (clampedY - 0.5) / 0.5;
+  }
+
+  const x = Math.min(255, Math.max(0, Math.floor(touchNormX * 256)));
+  const y = Math.min(191, Math.max(0, Math.floor(touchNormY * 192)));
+  return { onBottomScreen: true, x, y };
+}
+
 export function computeBitmaskFromGamepad(gamepad, deadzone = 0.35) {
   if (!gamepad || !gamepad.buttons) return 0;
   let mask = 0;
   const pressed = (idx) => Boolean(gamepad.buttons[idx]?.pressed);
+  const triggerPressed = (idx) => {
+    const btn = gamepad.buttons[idx];
+    return Boolean(btn?.pressed) || Number(btn?.value) > 0.25;
+  };
 
-  if (pressed(0) || pressed(2)) mask |= BTN_A;
-  if (pressed(1) || pressed(3)) mask |= BTN_B;
-  if (pressed(4) || pressed(6)) mask |= BTN_L;
-  if (pressed(5) || pressed(7)) mask |= BTN_R;
+  if (pressed(0)) mask |= BTN_A;
+  if (pressed(1)) mask |= BTN_B;
+  if (pressed(2)) mask |= BTN_X;
+  if (pressed(3)) mask |= BTN_Y;
+  if (pressed(4) || triggerPressed(6)) mask |= BTN_L;
+  if (pressed(5) || triggerPressed(7)) mask |= BTN_R;
   if (pressed(8)) mask |= BTN_SELECT;
   if (pressed(9)) mask |= BTN_START;
   if (pressed(12)) mask |= BTN_UP;
