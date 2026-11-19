@@ -128,9 +128,27 @@ pub fn rle_compress(input: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Decompresses a buffer produced by `rle_compress`.
+/// Maximum uncompressed payload allowed when decoding a Save State or Rewind snapshot (64 MiB).
+pub const MAX_RLE_UNCOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Decompresses a buffer produced by `rle_compress`, rejecting oversized or overflowing payloads.
 pub fn rle_decompress(compressed: &[u8], expected_len: usize) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(expected_len);
+    if expected_len > MAX_RLE_UNCOMPRESSED_BYTES {
+        return Err(format!(
+            "Save State trop volumineux ({expected_len} octets, max {MAX_RLE_UNCOMPRESSED_BYTES})"
+        ));
+    }
+    let cap = if expected_len > 0 {
+        expected_len.min(MAX_RLE_UNCOMPRESSED_BYTES)
+    } else {
+        compressed.len().min(MAX_RLE_UNCOMPRESSED_BYTES)
+    };
+    let max_len = if expected_len > 0 {
+        expected_len
+    } else {
+        MAX_RLE_UNCOMPRESSED_BYTES
+    };
+    let mut out = Vec::with_capacity(cap);
     let mut i = 0;
     while i < compressed.len() {
         let b = compressed[i];
@@ -140,9 +158,19 @@ pub fn rle_decompress(compressed: &[u8], expected_len: usize) -> Result<Vec<u8>,
             }
             let count = compressed[i + 1] as usize;
             let val = compressed[i + 2];
+            if out.len().saturating_add(count) > max_len {
+                return Err(format!(
+                    "dépassement RLE dans le Save State (limite {max_len} octets)"
+                ));
+            }
             out.extend(std::iter::repeat_n(val, count));
             i += 3;
         } else {
+            if out.len() >= max_len {
+                return Err(format!(
+                    "dépassement RLE dans le Save State (limite {max_len} octets)"
+                ));
+            }
             out.push(b);
             i += 1;
         }
@@ -169,6 +197,17 @@ mod tests {
         assert!(compressed.len() < 200);
         let restored = rle_decompress(&compressed, fake_ram.len()).unwrap();
         assert_eq!(restored, fake_ram);
+    }
+
+    #[test]
+    fn rle_decompress_rejects_oversized_expected_len_and_stream_overflow() {
+        let err = rle_decompress(&[0x01, 0x02], MAX_RLE_UNCOMPRESSED_BYTES + 1).unwrap_err();
+        assert!(err.contains("trop volumineux"));
+
+        // Encoded run of 200 zero bytes, but expected_len claims only 16 bytes.
+        let bomb = [RLE_MARKER, 200, 0x00];
+        let err = rle_decompress(&bomb, 16).unwrap_err();
+        assert!(err.contains("dépassement RLE"));
     }
 
     #[test]

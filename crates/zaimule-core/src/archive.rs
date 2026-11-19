@@ -286,12 +286,23 @@ pub fn read_zip_entry_prefix(
     Ok(out)
 }
 
+/// Hard ceiling for a single extracted file on disk (32 GiB, covers large Switch ROMs while blocking zip bombs).
+const MAX_DISK_EXTRACT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+/// Hard ceiling for in-memory ZIP entry extraction (256 MiB).
+const MAX_IN_MEMORY_EXTRACT_BYTES: usize = 256 * 1024 * 1024;
+
 /// Streams and extracts a ZIP entry atomically onto disk (`dest_path`), verifying CRC32.
 pub fn extract_zip_entry_to_file(
     zip_path: &Path,
     entry: &ZipEntryMeta,
     dest_path: &Path,
 ) -> Result<u64, String> {
+    if entry.uncompressed_size > MAX_DISK_EXTRACT_BYTES {
+        return Err(format!(
+            "entrée ZIP trop volumineuse ({} octets) : {}",
+            entry.uncompressed_size, entry.name
+        ));
+    }
     if let Some(parent) = dest_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
@@ -307,15 +318,32 @@ pub fn extract_zip_entry_to_file(
     let mut total_written = 0u64;
 
     loop {
-        let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
+        let n = match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(e.to_string());
+            }
+        };
+        total_written = total_written.saturating_add(n as u64);
+        if total_written > MAX_DISK_EXTRACT_BYTES {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!(
+                "extraction ZIP interrompue : limite de taille dépassée pour {}",
+                entry.name
+            ));
         }
         hasher.update(&buf[..n]);
-        out_file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-        total_written += n as u64;
+        if let Err(e) = out_file.write_all(&buf[..n]) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e.to_string());
+        }
     }
-    out_file.flush().map_err(|e| e.to_string())?;
+    if let Err(e) = out_file.flush() {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.to_string());
+    }
 
     if entry.crc32 != 0 && hasher.finalize() != entry.crc32 {
         let _ = fs::remove_file(&tmp_path);
@@ -356,9 +384,25 @@ pub fn extract_first_matching_file_from_zip_bytes(
         .find(|e| e.name.to_ascii_lowercase().ends_with(suffix_lower))
         .ok_or_else(|| format!("aucun fichier *{suffix_lower} trouvé dans l'archive ZIP"))?;
 
+    if target.uncompressed_size > MAX_IN_MEMORY_EXTRACT_BYTES as u64 {
+        return Err(format!(
+            "entrée ZIP en mémoire trop volumineuse ({} octets) : {}",
+            target.uncompressed_size, target.name
+        ));
+    }
+
     let mut stream = open_entry_data_stream(&mut cursor, &target)?;
     let mut out = Vec::with_capacity(target.uncompressed_size.min(64 << 20) as usize);
-    stream.read_to_end(&mut out).map_err(|e| e.to_string())?;
+    let mut limited = stream
+        .by_ref()
+        .take((MAX_IN_MEMORY_EXTRACT_BYTES as u64) + 1);
+    limited.read_to_end(&mut out).map_err(|e| e.to_string())?;
+    if out.len() > MAX_IN_MEMORY_EXTRACT_BYTES {
+        return Err(format!(
+            "entrée ZIP en mémoire dépasse la limite ({MAX_IN_MEMORY_EXTRACT_BYTES} octets) : {}",
+            target.name
+        ));
+    }
     if target.crc32 != 0 && crc32fast::hash(&out) != target.crc32 {
         return Err(format!(
             "empreinte CRC32 invalide pour l'entrée ZIP {}",

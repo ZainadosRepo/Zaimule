@@ -2266,7 +2266,9 @@ function switchTab(targetId) {
     lastTelemetryDomUpdateMs = 0;
   }
   document.querySelectorAll(".nav-tab").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.target === targetId);
+    const isActive = btn.dataset.target === targetId;
+    btn.classList.toggle("active", isActive);
+    btn.setAttribute("aria-selected", String(isActive));
   });
   document.querySelectorAll(".view-pane").forEach((pane) => {
     pane.classList.toggle("active", pane.id === targetId);
@@ -2871,7 +2873,9 @@ function bindEvents() {
     btn.addEventListener("click", () => {
       const targetPane = btn.dataset.inspTab;
       document.querySelectorAll(".inspector-tab-btn").forEach((b) => {
-        b.classList.toggle("active", b === btn);
+        const isActive = b === btn;
+        b.classList.toggle("active", isActive);
+        b.setAttribute("aria-selected", String(isActive));
       });
       document.querySelectorAll(".inspector-tab-pane").forEach((p) => {
         p.classList.toggle("active", p.id === targetPane);
@@ -3149,7 +3153,7 @@ function bindEvents() {
         new TextEncoder().encode(
           JSON.stringify({
             magic: "ZAIMULE_PACK_V1",
-            version: "1.4.0",
+            version: "1.4.1",
             activeGameId: state.activeGameId,
             cheatCodes: state.cheatCodes,
             macros: state.macros

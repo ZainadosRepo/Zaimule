@@ -25,12 +25,12 @@ jobs:
             targets: aarch64-apple-darwin,x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.targets }}
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: lts/*
       - run: npm install -g @tauri-apps/cli@2
@@ -54,7 +54,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG=$(gh release list -R "${{ github.repository }}" --limit 5 --json tagName,isDraft --jq '.[] | select(.isDraft == true) | .tagName' | head -n 1)
+          # Tag pushes publish exactly their own draft; manual runs fall back to the newest draft.
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG=$(gh release list -R "${{ github.repository }}" --limit 5 --json tagName,isDraft --jq '.[] | select(.isDraft == true) | .tagName' | head -n 1)
+          fi
           if [ -n "$TAG" ]; then
             gh release edit "$TAG" -R "${{ github.repository }}" --draft=false --latest
           fi

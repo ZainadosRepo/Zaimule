@@ -1,6 +1,6 @@
 [package]
 name = "zaimule-emu"
-version = "1.4.0"
+version = "1.4.1"
 description = "Native Rust emulator cores (Game Boy/GBC via termboy-gb, GBA via termboy-gba, Nintendo DS ARM9+ARM7 via nds_core), Link Cable sync, binary viewport packet encoder, and Switch Torzu/Fritchii vault session bridge for Zaimule"
 authors = ["ZainadosRepo"]
 edition = "2021"

@@ -1800,6 +1800,15 @@ impl EmulatorSession {
         let expected_len =
             u32::from_le_bytes([envelope[0], envelope[1], envelope[2], envelope[3]]) as usize;
         let raw = rle_decompress(&envelope[4..], expected_len)?;
+        if !info.crc32_hex.is_empty() {
+            let actual_crc = format_crc32_hex(compute_crc32(&raw));
+            if !actual_crc.eq_ignore_ascii_case(&info.crc32_hex) {
+                return Err(format!(
+                    "Save State Slot #{slot} corrompu (CRC32 attendu {}, reçu {actual_crc})",
+                    info.crc32_hex
+                ));
+            }
+        }
         self.core_p1.load_state(&raw)?;
         self.refresh_sram_dirty_flag();
         Ok(info)
@@ -1903,7 +1912,7 @@ impl EmulatorSession {
         }
         let pack = ZaimulePortablePack {
             magic: PORTABLE_PACK_MAGIC.into(),
-            version: "1.4.0".into(),
+            version: "1.4.1".into(),
             active_game_id: self.active_game_id.clone(),
             sram_rle,
             sram_uncompressed_len: sram_raw.len(),
@@ -2360,6 +2369,17 @@ mod tests {
             .unwrap();
         assert!(saved.occupied);
         assert!(session.restore_save_state(1).is_ok());
+
+        // Corrupting the expected CRC32 must fail restore_save_state before touching the core.
+        if let Some((slot_info, _)) = session
+            .save_states_ram
+            .get_mut(&(session.active_game_id.clone(), 1))
+        {
+            slot_info.crc32_hex = "0xDEADBEEF".into();
+        }
+        let corrupt_err = session.restore_save_state(1).unwrap_err();
+        assert!(corrupt_err.contains("CRC32"));
+
         assert!(session.rewind(1).is_ok());
 
         // Verify `"ZMFR"` v1 binary frame + PCM packet framing

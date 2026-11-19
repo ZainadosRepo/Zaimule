@@ -10,7 +10,7 @@ jobs:
     # The Tauri crate needs WebView2 headers to compile; Windows runners ship them.
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
