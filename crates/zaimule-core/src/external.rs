@@ -315,6 +315,7 @@ fn is_macos_bundle_macos_dir(dir: &Path) -> bool {
             .unwrap_or(false)
 }
 
+#[cfg(target_os = "linux")]
 fn is_appimage_path(path: &Path) -> bool {
     path.file_name()
         .map(|n| {
