@@ -31,34 +31,35 @@ Au lancement, l'appli regarde sur GitHub si une version plus récente est publi�
 
 ---
 
-## ✨ Architecture & Fonctionnalités (`v1.3.0`)
+## ✨ Architecture & Fonctionnalités (`v1.4.0`)
 
-- **🧹 Démarrage Propre & Importation Manuelle (`.zip`, `.7z`, Fichiers & Dossiers)**
-  - **Zéro contenu propriétaire inclus & zéro scan automatique** : la bibliothèque démarre vide sans parcourir vos dossiers personnels ; aucune ROM, aucun BIOS propriétaire, aucune clé Switch ni aucun binaire externe n'est distribué avec Zaimule.
-  - **Importation directe (`scanner.rs` & `archive.rs`)** : sélecteurs natifs de fichiers ou dossiers (`tauri-plugin-dialog`) et glisser-déposer direct avec extraction streaming des archives **`.zip` / ZIP64** et **`.7z`** vers le cache applicatif local.
+- **🧹 Démarrage Propre, Bibliothèque & Dossiers ROMs (`.zip`, `.7z`, Fichiers & Dossiers)**
+  - **Zéro contenu propriétaire inclus & zéro scan automatique** : la bibliothèque démarre vide sans parcourir vos dossiers personnels ; aucune ROM, aucune clé Switch ni aucun binaire externe n'est distribué avec Zaimule.
+  - **Importation directe & gestion de dossiers (`scanner.rs` & `archive.rs`)** : sélecteurs natifs de fichiers/dossiers (`tauri-plugin-dialog`), glisser-déposer direct, extraction streaming **`.zip` / ZIP64** et **`.7z`**, boutons **Rescanner**, **Tout rescanner** et **Retirer** par dossier, **Favoris**, tri dynamique, temps de jeu natif persisté et navigation clavier/manette 2D filtrée.
 - **🦀 Cœurs d'Émulation 100% Rust Natifs (`crates/zaimule-emu` & `vendor/termboy-*`)**
-  - **Game Boy & Game Boy Color (`GB` / `GBC`, `zaimule-rust-gb`)** : motorisé par `termboy-gb` + `termboy-core` (MIT) — affichage `160×144` RGBA8888, APU 4 canaux `48 kHz` stéréo, sauvegarde batterie MBC (`.srm`), Save States `"TBSS"` et Câble Link Série `SB`/`SC`.
-  - **Game Boy Advance (`GBA`, `zaimule-rust-gba`)** : motorisé par `termboy-gba` + `termboy-core` (MIT) — CPU ARM7TDMI + BIOS HLE SWI/DMA, PPU `240×160` RGBA8888 avec correction couleur LCD, APU `48 kHz` stéréo, sauvegarde SRAM/Flash et Save States `"TBSS"`.
-  - **Nintendo DS (`NDS`, `zaimule-rust-nds`)** : motorisé par `nds_core` (`x0cero/nds` MIT) — double CPU **ARM946E-S + ARM7TDMI**, BIOS HLE, déchiffrement Blowfish `key1.bin`, firmware synthétique, double écran `256×384` (avec permutation d'affichage `powcnt1`), **Stylet Tactile** sur l'écran inférieur, **SPU 16 canaux `48 kHz` stéréo** (`PCM8`, `PCM16`, `IMA-ADPCM`, PSG, Bruit), **moteur 3D** (textures compressées `4×4` Format 5 sur Slots 0/2, modes `Decal`/`Toon`/`Highlight` + matrice texture), **PPU 2D complet** (modes Affines/Étendus, Grand Bitmap Mode 6, Bitmap OBJ 1D/2D avec alpha), Flash 512 Ko et Save States RLE `"ZMND"`.
+  - **Game Boy & Game Boy Color (`GB` / `GBC`, `zaimule-rust-gb`)** : motorisé par `termboy-gb` + `termboy-core` (MIT) — affichage `160×144` RGBA8888 à `59.73 Hz`, APU 4 canaux `48 kHz` stéréo, sauvegarde batterie MBC (`.srm`) avec suivi de modifications, Save States `"TBSS"` et Câble Link Série `SB`/`SC`.
+  - **Game Boy Advance (`GBA`, `zaimule-rust-gba`)** : motorisé par `termboy-gba` + `termboy-core` (MIT) — CPU ARM7TDMI + BIOS HLE SWI/DMA, PPU `240×160` RGBA8888 à `59.73 Hz` avec correction couleur LCD, APU `48 kHz` stéréo, sauvegarde SRAM/Flash et Save States `"TBSS"`.
+  - **Nintendo DS (`NDS`, `zaimule-rust-nds`)** : motorisé par `nds_core` (`x0cero/nds` MIT) — double CPU **ARM946E-S + ARM7TDMI**, support optionnel de vos propres dumps **BIOS / Firmware** (`bios7.bin`, `bios9.bin`, `firmware.bin`) avec vérification CRC32 et calibration tactile **TSC2046**, **4 dispositions d'écrans** (Vertical, Côte à côte, Inversés) avec stylet tactile adapté, **SPU 16 canaux `48 kHz` stéréo**, **moteur 3D** (`4×4`, `Decal`/`Toon`/`Highlight`), **PPU 2D complet**, télémétrie `VCOUNT`/cycles en direct, Flash 512 Ko et Save States RLE `"ZMND"`.
 - **🔐 Coffre Nintendo Switch Option A — Torzu & Fritchii (`external.rs`)**
   - **Séparation Switch 1 & Switch 2** : `SWITCH` (`.nsp`, `.xci`, `.nsz`, `.xcz`, `.nro`, `.nso`) cible par défaut **Torzu**, tandis que `SWITCH2` (`.nx`, `.nup`) cible par défaut **Fritchii / Lichii**, avec **surcharge par jeu** (`Auto` / `Torzu` / `Fritchii`).
-  - **Coffre isolé (`<app_config_dir>/switch`)** : importation par dossier, exécutable ou archive `.zip`/`.7z` de chaque build, plus importation manuelle de vos clés `prod.keys` et `title.keys`.
-  - **Synchronisation & télémétrie de session** : copie automatique des clés vers `<engine_dir>/user/keys` avant exécution (`-f -g <rom>`), purge dédiée du cache shaders et comptabilisation du temps de jeu à la fermeture (`switch-session-ended`).
-- **⚡ Optimisations Moteur, IPC Binaire & Audio Temps Réel (`session.rs`, `viewport_ipc.js`, `audio_worklet.js`)**
-  - **Protocole Binaire `"ZMFR"` v1 (`step_viewport_binary`)** : transport via `tauri::ipc::Response` transférant directement en binaire les tampons pixels RGBA et les échantillons audio PCM `f32` (sans sérialisation JSON de pixels ni d'audio).
-  - **Audio Faible Latence (`AudioWorkletNode`)** : processeur audio dédié (`ui/audio_worklet.js`) avec tampon circulaire et rééchantillonnage linéaire stéréo, plus repli `AudioBufferSourceNode` et cache `ImageData` réutilisable dans le viewport.
-  - **Vitesse Turbo & Profils Cargo (`Cargo.toml`)** : multiplicateur d'exécution `1x → 2x → 4x → 8x` (`speed_mult`) et `opt-level = 2` activé sur les cœurs et dépendances dès le profil `dev` (en plus de `lto = true` en `release`).
-- **🎨 Upscalers, Atelier & Persistance Atomique**
-  - **Upscalers & Shaders (`ui/upscaler.js`)** : **Scale2x / EPX**, **xBRZ 2x**, **CRT Bloom** et 5 modes visuels (CRT Scanlines, Trinitron, Game Boy DMG, LCD, Pixel-Perfect).
-  - **Outils Power-User (`cheats.rs`, `debugger.rs`, `patch.rs`, `keymap.rs`, `macros.rs`, `link.rs`, `netplay.rs`)** : Keymapper visuel + manettes W3C Gamepad API, TAS Studio & Link 2P/4P / salons P2P UDP (`ZML2`), inspecteur CPU / tuiles VRAM 2bpp, patchs `.IPS`, Watchpoints RAM, rembobinage 60 s (`Rewind`), sauvegardes atomiques `.tmp → fs::rename` et archive portable `.zaimule-pack`.
+  - **Coffre isolé (`<app_config_dir>/switch`)** : importation de vos builds (dossier, exécutable, `.zip`/`.7z`), de vos clés (`prod.keys` / `title.keys`) et de votre **Firmware Nintendo Switch (`.nca`)** synchronisés vers Torzu et Fritchii avant exécution (`-f -g <rom>`), purge du cache shaders et comptabilisation du temps de jeu (`switch-session-ended`).
+- **⚡ Optimisations Moteur, Pacing Matériel, IPC Binaire & Audio Temps Réel (`pacing.js`, `session.rs`, `viewport_ipc.js`, `audio_worklet.js`)**
+  - **Cadencement matériel (`FramePacer`)** : verrouillage de la cadence sur `59.73 Hz` (GB/GBC/GBA) et `59.83 Hz` (NDS) sur écrans 60/120/144/240 Hz, plus mode **Pause (`F9`)**, **Reset matériel à froid** (préservant la SRAM), **Plein écran (`F11`)** et **Capture PNG (`F12`)**.
+  - **Protocole Binaire `"ZMFR"` v1 (`step_viewport_binary`) & Audio `AudioWorkletNode`** : transport binaire sans JSON pour les pixels et le PCM `f32`, rééchantillonnage linéaire stéréo, réglage de volume persisté et décimation audio propre en avance rapide (`1x → 2x → 4x → 8x`).
+- **🎨 Upscalers, Atelier, Netplay LAN & Persistance Atomique**
+  - **Upscalers & Shaders (`ui/upscaler.js`)** : **Scale2x / EPX**, **xBRZ 2x**, **CRT Bloom** et 5 modes visuels persistés (CRT Scanlines, Trinitron, Game Boy DMG, LCD, Pixel-Perfect).
+  - **Outils Power-User (`cheats.rs`, `debugger.rs`, `patch.rs`, `keymap.rs`, `macros.rs`, `link.rs`, `netplay.rs`)** : Keymapper visuel + manettes W3C Gamepad API, TAS Studio, Link 2P/4P & **Netplay UDP LAN P2P (`ZML2`)** avec connexion/déconnexion de pair `IP:PORT`, inspecteur CPU / tuiles VRAM 2bpp, patchs `.IPS`, gestion complète (ajout/suppression) des codes triche, watchpoints RAM et Save States (9 slots), rembobinage 60 s (`Rewind`), sauvegardes atomiques `.tmp → fs::rename` et archive portable `.zaimule-pack`.
 
 | Action | Raccourci |
 | --- | --- |
 | Déplacements (D-Pad) | `ZQSD` ou `Flèches directionnelles` |
-| Bouton A / Bouton B | `J` (ou `Espace`) / `K` (ou `Maj`) |
-| Start / Select | `Entrée` / `Retour arrière` |
-| Sauvegarde rapide (Save State Slot #1) | `F5` |
-| Chargement rapide (Load State Slot #1) | `F8` |
+| Bouton A / Bouton B | `J` (ou `Espace`) / `K` (ou `Maj gauche`) |
+| Gâchettes L / R (GBA / NDS) | `E` / `R` (ou `Q` / `P`) |
+| Boutons X / Y (NDS) | `I` / `O` |
+| Start / Select | `Entrée` / `N` (ou `Maj droit`) |
+| Pause / Reprendre | `F9` (ou `Pause`) |
+| Sauvegarde / Chargement rapide (Slot #1) | `F5` / `F8` |
+| Plein écran / Capture PNG | `F11` / `F12` |
 | Rembobinage temporel (Rewind) | `Retour arrière` (`Backspace`) |
 
 ---
