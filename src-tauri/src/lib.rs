@@ -234,7 +234,7 @@ fn add_cheat_code(
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
-    session.add_cheat_code(&raw_code, &label)
+    session.add_cheat_code(&raw_code, label)
 }
 
 #[tauri::command]
