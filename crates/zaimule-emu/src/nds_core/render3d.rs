@@ -233,7 +233,12 @@ impl<'a> TexVramCache<'a> {
 
 /// Sample a texture using pre-resolved VRAM slices; `None` = transparent texel, `Some((rgb15, alpha 0..=31))`.
 #[inline]
-fn sample_tex_cached(cache: &TexVramCache<'_>, tex: &TexInfo, s: f64, t: f64) -> Option<(u16, u32)> {
+fn sample_tex_cached(
+    cache: &TexVramCache<'_>,
+    tex: &TexInfo,
+    s: f64,
+    t: f64,
+) -> Option<(u16, u32)> {
     let x = wrap_texcoord(
         (s + tex.bias).floor() as i32,
         tex.tw,
@@ -836,7 +841,8 @@ fn raster_poly(
                             if textured {
                                 let s = (l0 * s0 + l1 * s1 + l2 * s2) * inv_rw;
                                 let t = (l0 * t0 + l1 * t1 + l2 * t2) * inv_rw;
-                                let Some((tc, ta)) = sample_tex_cached(tex_cache, &tex, s, t) else {
+                                let Some((tc, ta)) = sample_tex_cached(tex_cache, &tex, s, t)
+                                else {
                                     continue;
                                 };
                                 let rgb = (blend_modulate((tc & 0x1F) as u32, tr_n as f64) as u16)
@@ -854,7 +860,8 @@ fn raster_poly(
                             let (base_r, base_g, base_b, ta) = if textured {
                                 let s = (l0 * s0 + l1 * s1 + l2 * s2) * inv_rw;
                                 let t = (l0 * t0 + l1 * t1 + l2 * t2) * inv_rw;
-                                let Some((tc, ta)) = sample_tex_cached(tex_cache, &tex, s, t) else {
+                                let Some((tc, ta)) = sample_tex_cached(tex_cache, &tex, s, t)
+                                else {
                                     continue;
                                 };
                                 (

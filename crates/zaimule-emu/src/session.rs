@@ -1674,7 +1674,7 @@ impl EmulatorSession {
         } else {
             16
         };
-        if self.core_loaded && primary.frame_number % rewind_stride == 0 {
+        if self.core_loaded && primary.frame_number.is_multiple_of(rewind_stride) {
             if let Ok(raw_state) = self.core_p1.save_state() {
                 self.rewind_buffer
                     .push_snapshot(primary.frame_number, &raw_state);
@@ -1685,7 +1685,7 @@ impl EmulatorSession {
             self.recent_inputs_trace.remove(0);
         }
         self.recent_inputs_trace.push((mask_p1 & 0xFF) as u8);
-        if self.core_loaded && self.frame_counter % rewind_stride == 0 {
+        if self.core_loaded && self.frame_counter.is_multiple_of(rewind_stride) {
             self.refresh_sram_dirty_flag();
         }
 

@@ -705,7 +705,8 @@ impl Ppu {
         for (p, slot) in obj_pages.iter_mut().enumerate() {
             *slot = m.vram_slot(obj_vram_base + ((p as u32) << 14));
         }
-        let obj_vram8 = |addr: u32| vram_page_read8(m, &obj_pages, addr.wrapping_sub(obj_vram_base));
+        let obj_vram8 =
+            |addr: u32| vram_page_read8(m, &obj_pages, addr.wrapping_sub(obj_vram_base));
         let pal_base = eng * 0x400 + 0x200;
         let one_d = dispcnt & 0x10 != 0;
         let bmp_one_d = dispcnt & 0x40 != 0;
