@@ -2707,30 +2707,35 @@ async function tickEmulationLoop(nowMs) {
           else renderInspector();
         }
 
-        if (!lastTelemetryDomUpdateMs || nowMs - lastTelemetryDomUpdateMs >= 250) {
+        if (
+          !lastTelemetryDomUpdateMs ||
+          nowMs - lastTelemetryDomUpdateMs >= 250 ||
+          state.debuggerPaused ||
+          manualStep
+        ) {
           lastTelemetryDomUpdateMs = nowMs;
           const fpsEl = document.getElementById("tel-fps");
           if (fpsEl) fpsEl.textContent = `${(pacing.measuredFps * state.speedMult).toFixed(1)} FPS`;
           const ftEl = document.getElementById("tel-ft");
           if (ftEl) ftEl.textContent = `${pacing.frameTimeMs.toFixed(1)} ms`;
-        }
 
-        const cpu = meta.cpu || {};
-        const score = cpu.score ?? 0;
-        document.getElementById("emu-score-pill").textContent = `Score : ${score}`;
-        document.getElementById("p1-reg-readout").textContent = `${cpu.arch || "—"} · PC:${cpu.pcHex || "—"}`;
-        document.getElementById("rewind-readout").textContent = `Frame #${pkt.frameNumber}`;
-        document.getElementById("dbg-pc-sp").textContent = `${cpu.pcHex || "—"} / ${cpu.spHex || "—"}`;
-        document.getElementById("dbg-af-bc").textContent = `${cpu.regAHex || "—"} / ${cpu.regBcHex || "—"}`;
-        document.getElementById("dbg-de-hl").textContent = `${cpu.regDeHex || "—"} / ${cpu.regHlHex || "—"}`;
-        document.getElementById("dbg-sio").textContent = `${cpu.serialSbHex || "0x00"} / ${pkt.audioFreqHz || 0} Hz`;
-        document.getElementById("tel-rewind").textContent = `${pkt.rewindSnapshotsCount} clichés (${Math.round(pkt.rewindMemoryBytes / 1024)} Ko)`;
+          const cpu = meta.cpu || {};
+          const score = cpu.score ?? 0;
+          document.getElementById("emu-score-pill").textContent = `Score : ${score}`;
+          document.getElementById("p1-reg-readout").textContent = `${cpu.arch || "—"} · PC:${cpu.pcHex || "—"}`;
+          document.getElementById("rewind-readout").textContent = `Frame #${pkt.frameNumber}`;
+          document.getElementById("dbg-pc-sp").textContent = `${cpu.pcHex || "—"} / ${cpu.spHex || "—"}`;
+          document.getElementById("dbg-af-bc").textContent = `${cpu.regAHex || "—"} / ${cpu.regBcHex || "—"}`;
+          document.getElementById("dbg-de-hl").textContent = `${cpu.regDeHex || "—"} / ${cpu.regHlHex || "—"}`;
+          document.getElementById("dbg-sio").textContent = `${cpu.serialSbHex || "0x00"} / ${pkt.audioFreqHz || 0} Hz`;
+          document.getElementById("tel-rewind").textContent = `${pkt.rewindSnapshotsCount} clichés (${Math.round(pkt.rewindMemoryBytes / 1024)} Ko)`;
 
-        const link = meta.linkTelemetry;
-        if (link?.enabled) {
-          const modePrefix = link.quadMode ? "4P Tournoi" : "2P Sync";
-          document.getElementById("tel-link").textContent =
-            `${modePrefix} (${link.packetsTransferred} pkts · ${link.lastP1ToP2Hex})`;
+          const link = meta.linkTelemetry;
+          if (link?.enabled) {
+            const modePrefix = link.quadMode ? "4P Tournoi" : "2P Sync";
+            document.getElementById("tel-link").textContent =
+              `${modePrefix} (${link.packetsTransferred} pkts · ${link.lastP1ToP2Hex})`;
+          }
         }
         if ((pkt.frameNumber & 15) === 1 || state.debuggerPaused) {
           await refreshDebuggerDrawer();

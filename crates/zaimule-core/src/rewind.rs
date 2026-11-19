@@ -26,6 +26,7 @@ pub struct RewindFrameEntry {
     pub frame: u64,
     pub uncompressed_len: usize,
     pub crc32: u32,
+    pub already_compressed: bool,
     pub compressed_payload: Vec<u8>,
 }
 
@@ -45,16 +46,24 @@ impl RewindBuffer {
     }
 
     /// Captures and compresses a raw emulator state snapshot at `frame`.
+    /// Payloads already carrying their own RLE+CRC32 container (`"ZMND"`) are stored directly
+    /// to avoid double-compressing multi-megabyte NDS savestates.
     pub fn push_snapshot(&mut self, frame: u64, raw_state: &[u8]) {
         if self.entries.len() >= self.max_entries {
             self.entries.pop_front();
         }
-        let compressed = rle_compress(raw_state);
+        let already_compressed = raw_state.starts_with(b"ZMND");
+        let compressed = if already_compressed {
+            raw_state.to_vec()
+        } else {
+            rle_compress(raw_state)
+        };
         let crc = compute_crc32(raw_state);
         self.entries.push_back(RewindFrameEntry {
             frame,
             uncompressed_len: raw_state.len(),
             crc32: crc,
+            already_compressed,
             compressed_payload: compressed,
         });
     }
@@ -71,7 +80,11 @@ impl RewindBuffer {
         let Some(target) = self.entries.back() else {
             return Ok(None);
         };
-        let raw = rle_decompress(&target.compressed_payload, target.uncompressed_len)?;
+        let raw = if target.already_compressed {
+            target.compressed_payload.clone()
+        } else {
+            rle_decompress(&target.compressed_payload, target.uncompressed_len)?
+        };
         if compute_crc32(&raw) != target.crc32 {
             return Err("intégrité du snapshot de rewind compromise (CRC32 invalide)".into());
         }

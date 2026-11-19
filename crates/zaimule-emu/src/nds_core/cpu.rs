@@ -309,18 +309,35 @@ impl<B: Bus> Cpu<B> {
     /// of every frame, so those polls dominated emulation time: skipping the
     /// slice wholesale is the single biggest speed win available. The slice
     /// length is unchanged, so cross-CPU wake latency is exactly as before.
-    pub fn run_slice(&mut self, n: u32) {
+    pub fn run_slice(&mut self, mut n: u32) {
         if self.st.spin >= n {
             self.st.spin -= n;
             return;
         }
-        if self.st.spin == 0 && self.st.halted && !self.bus.irq_pending() {
+        if self.st.spin > 0 {
+            n -= self.st.spin;
+            self.st.spin = 0;
+        }
+        if self.st.halted && !self.bus.irq_pending() {
             // The IntrWait flag is only ever set by this core's own IRQ
             // handler, which cannot run while nothing is pending.
             return;
         }
-        for _ in 0..n {
+        let mut remaining = n;
+        while remaining > 0 {
             self.step();
+            remaining -= 1;
+            if self.st.spin > 0 {
+                if self.st.spin >= remaining {
+                    self.st.spin -= remaining;
+                    return;
+                }
+                remaining -= self.st.spin;
+                self.st.spin = 0;
+            }
+            if self.st.halted && !self.bus.irq_pending() {
+                return;
+            }
         }
     }
 

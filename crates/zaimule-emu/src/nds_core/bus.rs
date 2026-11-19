@@ -459,6 +459,9 @@ pub struct Machine {
     /// Optional user-provided ARM9 BIOS (`bios9.bin`, 4 KiB). Skipped in savestates to preserve ZMND v1 format.
     #[serde(skip)]
     pub bios9: Option<Vec<u8>>,
+    /// Whether a user-supplied `firmware.bin` dump is currently active (skipped in savestates).
+    #[serde(skip)]
+    pub custom_firmware: bool,
     /// Active touchscreen calibration extracted from loaded firmware user settings (skipped in savestates).
     #[serde(skip)]
     pub touch_cal: Option<TouchCalibration>,
@@ -775,6 +778,7 @@ impl Machine {
             toon_table: vec![0; 32],
             bios7: None,
             bios9: None,
+            custom_firmware: false,
             touch_cal: None,
             wifi: vec![0; 0x1_0000],
             rtc_reg: 0,
@@ -807,10 +811,13 @@ impl Machine {
         self.bios9 = bios9.filter(|b| b.len() == 0x1000);
         if let Some(fw) = firmware.filter(|b| matches!(b.len(), 0x2_0000 | 0x4_0000 | 0x8_0000)) {
             self.firmware = fw;
+            self.custom_firmware = true;
             if let Some(us) = extract_firmware_user_settings(&self.firmware) {
                 self.touch_cal = TouchCalibration::from_user_settings(&us);
                 return us;
             }
+        } else {
+            self.custom_firmware = false;
         }
         self.touch_cal = None;
         user_settings_block()
@@ -1011,7 +1018,11 @@ impl Machine {
                 if self.aux_addr_n == 3 {
                     // 0x0B Fast Read clocks one dummy byte after the 3-byte address.
                     self.aux_phase = if self.aux_cmd == 0x0B { 1 } else { 2 };
-                    if matches!(self.aux_cmd, 0x0A | 0xDB | 0xD8) {
+                    // Only explicit Page Erase (0xDB) and Sector Erase (0xD8) wipe to 0xFF.
+                    // ST M45PE40 Page Write (0x0A) is a partial-page overwrite that MUST
+                    // preserve all unwritten bytes in the 256-byte page (Pokémon D/P/Pt rely
+                    // on this when updating 20-byte save footers & checksums).
+                    if matches!(self.aux_cmd, 0xDB | 0xD8) {
                         let save_len = self.save.len();
                         let mask = save_len.saturating_sub(1);
                         let (start, len) = if self.aux_cmd == 0xD8 {
@@ -1020,13 +1031,9 @@ impl Machine {
                             (((self.aux_addr as usize) & mask) & !0xFF, 0x100)
                         };
                         let end = start.saturating_add(len).min(save_len);
-                        for slot in &mut self.save[start..end] {
-                            *slot = 0xFF;
-                        }
+                        self.save[start..end].fill(0xFF);
                         self.save_dirty = true;
-                        if self.aux_cmd != 0x0A {
-                            self.aux_wren = false;
-                        }
+                        self.aux_wren = false;
                     }
                 } else if self.aux_addr_n > 3 {
                     self.aux_phase = 2; // 0x0B dummy byte consumed
@@ -1045,15 +1052,21 @@ impl Machine {
                 match self.aux_cmd {
                     0x03 | 0x0B => {
                         self.auxspi_out = self.save[a];
+                        self.aux_addr = self.aux_addr.wrapping_add(1);
                     }
                     0x02 | 0x0A => {
                         self.save[a] = v;
                         self.save_dirty = true;
                         self.auxspi_out = 0xFF;
+                        // M45PE40 page writes/programs wrap within the 256-byte page.
+                        let page = self.aux_addr & !0xFF;
+                        self.aux_addr = page | (self.aux_addr.wrapping_add(1) & 0xFF);
                     }
-                    _ => self.auxspi_out = 0xFF,
+                    _ => {
+                        self.auxspi_out = 0xFF;
+                        self.aux_addr = self.aux_addr.wrapping_add(1);
+                    }
                 }
-                self.aux_addr = self.aux_addr.wrapping_add(1);
             }
         }
         // CS releases when the hold bit (AUXSPICNT bit 6) is clear.
@@ -1246,12 +1259,9 @@ impl Machine {
                             // 0x0B fast read inserts one dummy byte; treat it
                             // as part of the address run.
                             self.spi_phase = if self.spi_cmd == 0x0B { 1 } else { 2 };
-                            // Page write (0x0A) erases its 256 byte page before
-                            // programming it, unlike page program (0x02) which
-                            // can only clear bits. Getting that wrong makes a
-                            // rewritten block read back as the AND of old and
-                            // new, which is what the ARM7's verify caught.
-                            if matches!(self.spi_cmd, 0xDB | 0xD8 | 0x0A) {
+                            // Only explicit Page Erase (0xDB) and Sector Erase (0xD8) wipe to 0xFF.
+                            // Page Write (0x0A) overwrites only addressed bytes in the 256-byte page.
+                            if matches!(self.spi_cmd, 0xDB | 0xD8) {
                                 let fw_len = self.firmware.len();
                                 let fw_mask = if fw_len.is_power_of_two() && fw_len >= 0x100 {
                                     fw_len - 1
@@ -1264,12 +1274,8 @@ impl Machine {
                                     (((self.spi_addr as usize) & fw_mask) & !0xFF, 0x100)
                                 };
                                 let end = start.saturating_add(len).min(fw_len);
-                                for slot in &mut self.firmware[start..end] {
-                                    *slot = 0xFF;
-                                }
-                                if self.spi_cmd != 0x0A {
-                                    self.fw_wel = false;
-                                }
+                                self.firmware[start..end].fill(0xFF);
+                                self.fw_wel = false;
                             }
                             if self.io_log.is_some() {
                                 static COUNT: std::sync::atomic::AtomicU32 =
@@ -1304,8 +1310,8 @@ impl Machine {
                             self.spi_addr_n += 1;
                         }
                         0x02 | 0x0A => {
-                            // Page program. Real flash can only clear bits, and
-                            // programming wraps inside the 256 byte page.
+                            // 0x02 Page Program can only clear bits; 0x0A Page Write overwrites
+                            // addressed bytes in place. Both wrap within the 256-byte page.
                             let fw_len = self.firmware.len().max(1);
                             let fw_mask = if fw_len.is_power_of_two() {
                                 fw_len - 1
@@ -1314,7 +1320,11 @@ impl Machine {
                             };
                             let i = ((self.spi_addr as usize) & fw_mask) % fw_len;
                             if self.fw_wel {
-                                self.firmware[i] &= v;
+                                if self.spi_cmd == 0x0A {
+                                    self.firmware[i] = v;
+                                } else {
+                                    self.firmware[i] &= v;
+                                }
                             }
                             let page = self.spi_addr & !0xFF;
                             self.spi_addr = page | (self.spi_addr.wrapping_add(1) & 0xFF);
@@ -2062,10 +2072,9 @@ impl View {
             }
             0x01A0 => {
                 m.auxspicnt = v;
-                // Disabling AUXSPI deselects immediately; a cleared hold bit
-                // only takes effect after the in-flight byte (handled in
-                // auxspi_transfer).
-                if v & 0x8000 == 0 {
+                // Disabling AUXSPI or switching back to ROM mode deselects immediately;
+                // a cleared hold bit only takes effect after the in-flight byte.
+                if v & 0xA000 != 0xA000 {
                     m.aux_deselect();
                 }
             }
@@ -2297,8 +2306,8 @@ impl View {
     /// size is a multiple of 4), so a 4-byte slice is always contiguous.
     /// Bypassed entirely while NDS_WATCH is set, so the watch tool still sees
     /// every access.
-    #[inline]
-    fn fast_read(&self, a: u32, bytes: usize) -> Option<u32> {
+    #[inline(always)]
+    fn fast_read<const BYTES: usize>(&self, a: u32) -> Option<u32> {
         if WATCH_ADDR.is_some() {
             return None;
         }
@@ -2310,12 +2319,19 @@ impl View {
         }
         let cpu = self.cpu;
         let get = |buf: &[u8], off: usize| -> Option<u32> {
-            let s = buf.get(off..off + bytes)?;
-            let mut v = 0u32;
-            for (i, b) in s.iter().enumerate() {
-                v |= (*b as u32) << (i * 8);
+            if off + BYTES > buf.len() {
+                return None;
             }
-            Some(v)
+            if BYTES == 4 {
+                Some(u32::from_le_bytes([
+                    buf[off],
+                    buf[off + 1],
+                    buf[off + 2],
+                    buf[off + 3],
+                ]))
+            } else {
+                Some(u16::from_le_bytes([buf[off], buf[off + 1]]) as u32)
+            }
         };
         if cpu == 0 {
             if a >= m.dtcm_base && a < m.dtcm_base + 0x4000 {
@@ -2343,8 +2359,8 @@ impl View {
     }
 
     /// Write counterpart of `fast_read`.
-    #[inline]
-    fn fast_write(&mut self, a: u32, v: u32, bytes: usize) -> bool {
+    #[inline(always)]
+    fn fast_write<const BYTES: usize>(&mut self, a: u32, v: u32) -> bool {
         if WATCH_ADDR.is_some() {
             return false;
         }
@@ -2354,11 +2370,13 @@ impl View {
         }
         let cpu = self.cpu;
         let put = |buf: &mut [u8], off: usize| -> bool {
-            let Some(s) = buf.get_mut(off..off + bytes) else {
+            if off + BYTES > buf.len() {
                 return false;
-            };
-            for (i, b) in s.iter_mut().enumerate() {
-                *b = (v >> (i * 8)) as u8;
+            }
+            if BYTES == 4 {
+                buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            } else {
+                buf[off..off + 2].copy_from_slice(&(v as u16).to_le_bytes());
             }
             true
         };
@@ -2601,9 +2619,10 @@ impl Bus for View {
         }
     }
 
+    #[inline(always)]
     fn read16(&mut self, a: u32) -> u16 {
         let a = a & !1;
-        if let Some(v) = self.fast_read(a, 2) {
+        if let Some(v) = self.fast_read::<2>(a) {
             return v as u16;
         }
         if self.is_wifi(a) {
@@ -2615,9 +2634,10 @@ impl Bus for View {
         }
     }
 
+    #[inline(always)]
     fn read32(&mut self, a: u32) -> u32 {
         let a = a & !3;
-        if let Some(v) = self.fast_read(a, 4) {
+        if let Some(v) = self.fast_read::<4>(a) {
             return v;
         }
         if self.is_wifi(a) {
@@ -2660,9 +2680,10 @@ impl Bus for View {
         }
     }
 
+    #[inline(always)]
     fn write16(&mut self, a: u32, v: u16) {
         let a = a & !1;
-        if self.fast_write(a, v as u32, 2) {
+        if self.fast_write::<2>(a, v as u32) {
             return;
         }
         if self.is_wifi(a) {
@@ -2677,9 +2698,10 @@ impl Bus for View {
         }
     }
 
+    #[inline(always)]
     fn write32(&mut self, a: u32, v: u32) {
         let a = a & !3;
-        if self.fast_write(a, v, 4) {
+        if self.fast_write::<4>(a, v) {
             return;
         }
         if self.is_wifi(a) {
@@ -2699,21 +2721,28 @@ impl Bus for View {
         }
     }
 
+    #[inline(always)]
     fn irq_pending(&mut self) -> bool {
         let m = self.m.borrow();
         m.ie[self.cpu] & m.if_[self.cpu] != 0
     }
 
+    #[inline(always)]
     fn ime(&mut self) -> bool {
         self.m.borrow().ime[self.cpu]
     }
 
+    #[inline(always)]
     fn set_ime(&mut self, on: bool) {
         let cpu = self.cpu;
         self.m.borrow_mut().ime[cpu] = on;
     }
 
+    #[inline(always)]
     fn note_pc(&mut self, pc: u32) {
+        if WATCH_ADDR.is_none() && self.m.borrow().io_log.is_none() {
+            return;
+        }
         let cpu = self.cpu;
         self.m.borrow_mut().last_pc[cpu] = pc;
     }
@@ -2894,5 +2923,42 @@ mod touch_tests {
         m.auxspi_transfer(0x00);
         assert_eq!(m.save[0x1_0005], 0xFF);
         assert!(!m.aux_wren);
+    }
+
+    #[test]
+    fn auxspi_page_write_0x0a_preserves_unwritten_bytes_in_page() {
+        let mut m = Machine::new();
+        // Simulate an already-written 256-byte page (e.g., Pokémon save block tail)
+        for i in 0..0x100 {
+            m.save[0x0C000 + i] = (i as u8).wrapping_mul(3).wrapping_add(1);
+        }
+
+        // Partial-page 0x0A write of a 20-byte footer at 0x0C0EC..0x0C100
+        m.auxspicnt = 0xA000;
+        m.auxspi_transfer(0x06); // WREN
+        m.auxspicnt = 0xA040; // enabled + SPI + hold CS
+        m.auxspi_transfer(0x0A); // Page Write
+        m.auxspi_transfer(0x00);
+        m.auxspi_transfer(0xC0);
+        m.auxspi_transfer(0xEC);
+        for i in 0..20u8 {
+            if i == 19 {
+                m.auxspicnt = 0xA000; // release CS on last byte
+            }
+            m.auxspi_transfer(0xA0 + i);
+        }
+
+        // Preceding bytes in the same 256-byte page MUST remain intact
+        for i in 0..0xEC {
+            assert_eq!(
+                m.save[0x0C000 + i],
+                (i as u8).wrapping_mul(3).wrapping_add(1),
+                "byte 0x{i:02X} in page was unexpectedly clobbered by 0x0A partial write"
+            );
+        }
+        // Written footer bytes MUST reflect the new values
+        for i in 0..20 {
+            assert_eq!(m.save[0x0C0EC + i], 0xA0 + i as u8);
+        }
     }
 }

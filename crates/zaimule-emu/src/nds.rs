@@ -229,12 +229,14 @@ impl EmulatorBackend for NdsCore {
             code_tag
         );
         let (has_b7, has_b9) = nds.has_custom_bios();
-        let bios_mode = if has_b7 && has_b9 {
-            "BIOS"
-        } else if has_b7 || has_b9 {
-            "BIOS/HLE"
-        } else {
-            "HLE"
+        let has_fw = nds.has_custom_firmware();
+        let bios_mode = match (has_b7 && has_b9, has_b7 || has_b9, has_fw) {
+            (true, _, true) => "BIOS+FW",
+            (true, _, false) => "BIOS",
+            (false, true, true) => "BIOS/HLE+FW",
+            (false, true, false) => "BIOS/HLE",
+            (false, false, true) => "HLE+FW",
+            (false, false, false) => "HLE",
         };
         let arch = if thumb {
             format!("ARM946E-S (NDS · Thumb · {bios_mode} · SPU 16-ch)")
@@ -396,9 +398,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(core.debug_snapshot().arch.contains("BIOS"));
+        assert!(core.debug_snapshot().arch.contains("BIOS+FW"));
         let inner = core.inner.as_mut().unwrap();
         assert_eq!(inner.has_custom_bios(), (true, true));
+        assert!(inner.has_custom_firmware());
         assert_eq!(inner.cpu_overclock_pct(), 150);
         assert_eq!(inner.read_mem8(0xFFFF_0100), 0xA5);
 
@@ -406,6 +409,7 @@ mod tests {
         core.load_state(&snap).unwrap();
         let inner2 = core.inner.as_mut().unwrap();
         assert_eq!(inner2.has_custom_bios(), (true, true));
+        assert!(inner2.has_custom_firmware());
         assert_eq!(inner2.read_mem8(0xFFFF_0100), 0xA5);
     }
 

@@ -166,9 +166,74 @@ fn wrap_texcoord(mut c: i32, size: i32, repeat: bool, flip: bool) -> i32 {
     }
 }
 
-/// Sample a texture; `None` = transparent texel, `Some((rgb15, alpha 0..=31))`.
+/// Pre-resolved VRAM slices for 3D textures (4 × 128 KiB slots) and palettes (8 × 16 KiB chunks),
+/// built once per 3D frame to eliminate per-texel VRAM bank loops.
+struct TexVramCache<'a> {
+    tex_slots: [Option<&'a [u8]>; 4],
+    pal_chunks: [Option<&'a [u8]>; 8],
+}
+
+impl<'a> TexVramCache<'a> {
+    fn new(m: &'a Machine) -> Self {
+        let mut tex_slots = [None; 4];
+        for slot in 0..4u8 {
+            for i in 0..4 {
+                let cnt = m.vramcnt[i];
+                if cnt & 0x87 == 0x83 && (cnt >> 3 & 3) == slot {
+                    tex_slots[slot as usize] = Some(m.vram[i].as_slice());
+                    break;
+                }
+            }
+        }
+        let mut pal_chunks = [None; 8];
+        if m.vramcnt[4] & 0x87 == 0x83 {
+            for chunk in 0..4usize {
+                let start = chunk * 0x4000;
+                pal_chunks[chunk] = Some(&m.vram[4][start..start + 0x4000]);
+            }
+        }
+        for i in [5usize, 6] {
+            let cnt = m.vramcnt[i];
+            if cnt & 0x87 == 0x83 {
+                let ofs = (cnt >> 3 & 3) as usize;
+                let chunk = (ofs & 1) + ((ofs >> 1) & 1) * 4;
+                if chunk < 8 && pal_chunks[chunk].is_none() {
+                    pal_chunks[chunk] = Some(m.vram[i].as_slice());
+                }
+            }
+        }
+        Self {
+            tex_slots,
+            pal_chunks,
+        }
+    }
+
+    #[inline(always)]
+    fn tex_read8(&self, off: u32) -> u8 {
+        let slot = ((off >> 17) & 3) as usize;
+        if let Some(buf) = self.tex_slots[slot] {
+            buf[(off & 0x1_FFFF) as usize]
+        } else {
+            0
+        }
+    }
+
+    #[inline(always)]
+    fn texpal_read16(&self, off: u32) -> u16 {
+        let off = off & 0x1_FFFE;
+        let chunk = (off >> 14) as usize;
+        if let Some(buf) = self.pal_chunks[chunk] {
+            let o = (off & 0x3FFF) as usize;
+            u16::from_le_bytes([buf[o], buf[o + 1]])
+        } else {
+            0
+        }
+    }
+}
+
+/// Sample a texture using pre-resolved VRAM slices; `None` = transparent texel, `Some((rgb15, alpha 0..=31))`.
 #[inline]
-fn sample_tex(m: &Machine, tex: &TexInfo, s: f64, t: f64) -> Option<(u16, u32)> {
+fn sample_tex_cached(cache: &TexVramCache<'_>, tex: &TexInfo, s: f64, t: f64) -> Option<(u16, u32)> {
     let x = wrap_texcoord(
         (s + tex.bias).floor() as i32,
         tex.tw,
@@ -186,53 +251,53 @@ fn sample_tex(m: &Machine, tex: &TexInfo, s: f64, t: f64) -> Option<(u16, u32)> 
     match tex.format {
         2 => {
             // 4-color paletted, 4 texels per byte; palette base in 8-byte steps.
-            let b = m.tex_read8(base + (i >> 2));
+            let b = cache.tex_read8(base + (i >> 2));
             let idx = ((b >> ((i & 3) * 2)) & 3) as u32;
             if idx == 0 && tex.color0_clear {
                 return None;
             }
-            Some((m.texpal_read16((tex.pltt << 3) + idx * 2), 31))
+            Some((cache.texpal_read16((tex.pltt << 3) + idx * 2), 31))
         }
         3 => {
-            let b = m.tex_read8(base + (i >> 1));
+            let b = cache.tex_read8(base + (i >> 1));
             let idx = (if i & 1 == 0 { b & 0xF } else { b >> 4 }) as u32;
             if idx == 0 && tex.color0_clear {
                 return None;
             }
-            Some((m.texpal_read16((tex.pltt << 4) + idx * 2), 31))
+            Some((cache.texpal_read16((tex.pltt << 4) + idx * 2), 31))
         }
         4 => {
-            let idx = m.tex_read8(base + i) as u32;
+            let idx = cache.tex_read8(base + i) as u32;
             if idx == 0 && tex.color0_clear {
                 return None;
             }
-            Some((m.texpal_read16((tex.pltt << 4) + idx * 2), 31))
+            Some((cache.texpal_read16((tex.pltt << 4) + idx * 2), 31))
         }
         1 => {
             // A3I5: 3-bit alpha expanded to 5 bits.
-            let b = m.tex_read8(base + i);
+            let b = cache.tex_read8(base + i);
             let a3 = (b >> 5) as u32;
             if a3 == 0 {
                 return None;
             }
             Some((
-                m.texpal_read16((tex.pltt << 4) + (b as u32 & 0x1F) * 2),
+                cache.texpal_read16((tex.pltt << 4) + (b as u32 & 0x1F) * 2),
                 (a3 << 2) | (a3 >> 1),
             ))
         }
         6 => {
-            let b = m.tex_read8(base + i);
+            let b = cache.tex_read8(base + i);
             if b >> 3 == 0 {
                 return None;
             }
             Some((
-                m.texpal_read16((tex.pltt << 4) + (b as u32 & 7) * 2),
+                cache.texpal_read16((tex.pltt << 4) + (b as u32 & 7) * 2),
                 (b >> 3) as u32,
             ))
         }
         7 => {
-            let lo = m.tex_read8(base + i * 2) as u16;
-            let hi = m.tex_read8(base + i * 2 + 1) as u16;
+            let lo = cache.tex_read8(base + i * 2) as u16;
+            let hi = cache.tex_read8(base + i * 2 + 1) as u16;
             let c = lo | (hi << 8);
             if c & 0x8000 == 0 {
                 return None;
@@ -246,13 +311,14 @@ fn sample_tex(m: &Machine, tex: &TexInfo, s: f64, t: f64) -> Option<(u16, u32)> 
             let bw = tex.tw >> 2;
             let blk = ((y >> 2) * bw + (x >> 2)) as u32;
             let block_addr = (base + blk * 4) & 0x7_FFFF;
-            let row = m.tex_read8(block_addr + (y & 3) as u32);
+            let row = cache.tex_read8(block_addr + (y & 3) as u32);
             let v = ((row >> ((x & 3) * 2)) as u32) & 3;
             let idx_addr =
                 0x2_0000 + ((block_addr & 0x1_FFFF) >> 1) + ((block_addr & 0x4_0000) >> 2);
-            let info = m.tex_read8(idx_addr) as u32 | ((m.tex_read8(idx_addr + 1) as u32) << 8);
+            let info =
+                cache.tex_read8(idx_addr) as u32 | ((cache.tex_read8(idx_addr + 1) as u32) << 8);
             let pal = (tex.pltt << 4) + (info & 0x3FFF) * 4;
-            let c = |n: u32| m.texpal_read16(pal + n * 2);
+            let c = |n: u32| cache.texpal_read16(pal + n * 2);
             let mix = |a: u16, b: u16, wa: u32, wb: u32, d: u32| -> u16 {
                 let ch = |sh: u32| {
                     (((a as u32 >> sh & 0x1F) * wa + (b as u32 >> sh & 0x1F) * wb) / d) & 0x1F
@@ -272,6 +338,14 @@ fn sample_tex(m: &Machine, tex: &TexInfo, s: f64, t: f64) -> Option<(u16, u32)> 
         }
         _ => None,
     }
+}
+
+/// Sample a texture; `None` = transparent texel, `Some((rgb15, alpha 0..=31))`.
+#[cfg(test)]
+#[inline]
+fn sample_tex(m: &Machine, tex: &TexInfo, s: f64, t: f64) -> Option<(u16, u32)> {
+    let cache = TexVramCache::new(m);
+    sample_tex_cached(&cache, tex, s, t)
 }
 
 #[inline]
@@ -295,6 +369,7 @@ fn blend_modulate(t: u32, v: f64) -> u32 {
 /// pixels, TRANSPARENT where nothing was drawn (clear alpha 0).
 pub fn render(m: &Machine) -> Vec<u32> {
     let gx = &m.gx;
+    let tex_cache = TexVramCache::new(m);
     let wbuffer = gx.swap_param & 2 != 0;
     let clear_rgb = (gx.clear_color & 0x7FFF) as u16;
     let clear_alpha = gx.clear_color >> 16 & 0x1F;
@@ -534,6 +609,7 @@ pub fn render(m: &Machine) -> Vec<u32> {
             }
             raster_poly(
                 m,
+                &tex_cache,
                 poly,
                 &prep_verts[vs..ve],
                 poly_alpha,
@@ -585,6 +661,7 @@ pub fn render(m: &Machine) -> Vec<u32> {
 #[allow(clippy::too_many_arguments)]
 fn raster_poly(
     m: &Machine,
+    tex_cache: &TexVramCache<'_>,
     poly: &super::gpu3d::Polygon,
     pv: &[V],
     poly_alpha: u32,
@@ -725,7 +802,7 @@ fn raster_poly(
                         if textured {
                             let s = (l0 * s0 + l1 * s1 + l2 * s2) * inv_rw;
                             let t = (l0 * t0 + l1 * t1 + l2 * t2) * inv_rw;
-                            match sample_tex(m, &tex, s, t) {
+                            match sample_tex_cached(tex_cache, &tex, s, t) {
                                 None => (v_rgb, poly_alpha),
                                 Some((tc, ta)) if ta >= 31 => (tc, poly_alpha),
                                 Some((tc, ta)) => {
@@ -759,7 +836,7 @@ fn raster_poly(
                             if textured {
                                 let s = (l0 * s0 + l1 * s1 + l2 * s2) * inv_rw;
                                 let t = (l0 * t0 + l1 * t1 + l2 * t2) * inv_rw;
-                                let Some((tc, ta)) = sample_tex(m, &tex, s, t) else {
+                                let Some((tc, ta)) = sample_tex_cached(tex_cache, &tex, s, t) else {
                                     continue;
                                 };
                                 let rgb = (blend_modulate((tc & 0x1F) as u32, tr_n as f64) as u16)
@@ -777,7 +854,7 @@ fn raster_poly(
                             let (base_r, base_g, base_b, ta) = if textured {
                                 let s = (l0 * s0 + l1 * s1 + l2 * s2) * inv_rw;
                                 let t = (l0 * t0 + l1 * t1 + l2 * t2) * inv_rw;
-                                let Some((tc, ta)) = sample_tex(m, &tex, s, t) else {
+                                let Some((tc, ta)) = sample_tex_cached(tex_cache, &tex, s, t) else {
                                     continue;
                                 };
                                 (
@@ -801,7 +878,7 @@ fn raster_poly(
                         if textured {
                             let s = (l0 * s0 + l1 * s1 + l2 * s2) * inv_rw;
                             let t = (l0 * t0 + l1 * t1 + l2 * t2) * inv_rw;
-                            match sample_tex(m, &tex, s, t) {
+                            match sample_tex_cached(tex_cache, &tex, s, t) {
                                 None => {
                                     if dbg {
                                         eprintln!("[pix]   texel transparent at s={s:.2} t={t:.2}");

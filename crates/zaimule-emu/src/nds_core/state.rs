@@ -54,7 +54,7 @@ struct BinarySerializer {
 impl BinarySerializer {
     fn new() -> Self {
         Self {
-            buf: Vec::with_capacity(256 * 1024),
+            buf: Vec::with_capacity(6 * 1024 * 1024),
         }
     }
 }
@@ -705,15 +705,7 @@ impl<'de> de::Deserializer<'de> for &mut BinaryDeserializer<'de> {
 }
 
 fn crc32_ieee(bytes: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in bytes {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
+    zaimule_core::catalog::compute_crc32(bytes)
 }
 
 /// PackBits-style RLE encoding:
@@ -865,12 +857,14 @@ pub fn restore_snapshot<B: Bus>(
         let io_log = mm.io_log.take();
         let bios7 = mm.bios7.take();
         let bios9 = mm.bios9.take();
+        let custom_firmware = mm.custom_firmware;
         let touch_cal = mm.touch_cal;
         *mm = restored_machine;
         mm.rom = rom.to_vec();
         mm.io_log = io_log;
         mm.bios7 = bios7;
         mm.bios9 = bios9;
+        mm.custom_firmware = custom_firmware;
         mm.touch_cal = super::bus::extract_firmware_user_settings(&mm.firmware)
             .and_then(|us| super::bus::TouchCalibration::from_user_settings(&us))
             .or(touch_cal);

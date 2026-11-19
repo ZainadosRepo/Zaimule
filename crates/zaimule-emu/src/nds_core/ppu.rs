@@ -10,12 +10,33 @@ fn rgb555(c: u16) -> u32 {
     (r << 19 | r >> 2 << 16) | (g << 11 | g >> 2 << 8) | (b << 3 | b >> 2)
 }
 
-/// Frame renderer for both 2D engines: text backgrounds (3D, affine,
-/// extended, and sprites are not implemented yet) and LCDC VRAM display.
+/// Fast 16 KiB VRAM page lookup helper built once per engine per frame.
+#[inline(always)]
+fn vram_page_read8(m: &Machine, pages: &[Option<(usize, usize)>], off: u32) -> u8 {
+    let page = (off >> 14) as usize;
+    if let Some(Some((bank, bank_off))) = pages.get(page) {
+        m.vram[*bank][*bank_off + (off & 0x3FFF) as usize]
+    } else {
+        0
+    }
+}
+
+/// Frame renderer for both 2D engines: text/affine/extended/bitmap backgrounds,
+/// 1D/2D sprites, windows, color effects, 3D BG0, Display Capture, and LCDC mode.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Ppu {
     pub fb_a: Vec<u32>,
     pub fb_b: Vec<u32>,
+    #[serde(skip)]
+    obj_col: Vec<u16>,
+    #[serde(skip)]
+    obj_prio: Vec<u8>,
+    #[serde(skip)]
+    obj_win: Vec<bool>,
+    #[serde(skip)]
+    obj_semi: Vec<bool>,
+    #[serde(skip)]
+    obj_bmp_alpha: Vec<u8>,
 }
 
 impl Ppu {
@@ -23,10 +44,27 @@ impl Ppu {
         Self {
             fb_a: vec![0; WIDTH * HEIGHT],
             fb_b: vec![0; WIDTH * HEIGHT],
+            obj_col: vec![0; WIDTH * HEIGHT],
+            obj_prio: vec![0xFF; WIDTH * HEIGHT],
+            obj_win: vec![false; WIDTH * HEIGHT],
+            obj_semi: vec![false; WIDTH * HEIGHT],
+            obj_bmp_alpha: vec![0; WIDTH * HEIGHT],
+        }
+    }
+
+    fn ensure_scratch(&mut self) {
+        let len = WIDTH * HEIGHT;
+        if self.obj_col.len() != len {
+            self.obj_col.resize(len, 0);
+            self.obj_prio.resize(len, 0xFF);
+            self.obj_win.resize(len, false);
+            self.obj_semi.resize(len, false);
+            self.obj_bmp_alpha.resize(len, 0);
         }
     }
 
     pub fn render_frame(&mut self, m: &mut Machine) {
+        self.ensure_scratch();
         for eng in 0..2 {
             let io = &m.io2d[eng];
             let dispcnt = u32::from_le_bytes([io[0], io[1], io[2], io[3]]);
@@ -50,7 +88,17 @@ impl Ppu {
                         fb[i] = rgb555(c);
                     }
                 }
-                _ => Self::render_graphics(m, eng, dispcnt, fb),
+                _ => Self::render_graphics(
+                    m,
+                    eng,
+                    dispcnt,
+                    fb,
+                    &mut self.obj_col,
+                    &mut self.obj_prio,
+                    &mut self.obj_win,
+                    &mut self.obj_semi,
+                    &mut self.obj_bmp_alpha,
+                ),
             }
         }
         self.display_capture(m);
@@ -161,7 +209,18 @@ impl Ppu {
         m.io2d[0][0x67] &= 0x7F;
     }
 
-    fn render_graphics(m: &Machine, eng: usize, dispcnt: u32, fb: &mut [u32]) {
+    #[allow(clippy::too_many_arguments)]
+    fn render_graphics(
+        m: &Machine,
+        eng: usize,
+        dispcnt: u32,
+        fb: &mut [u32],
+        obj_col: &mut [u16],
+        obj_prio: &mut [u8],
+        obj_win: &mut [bool],
+        obj_semi: &mut [bool],
+        obj_bmp_alpha: &mut [u8],
+    ) {
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum BgKind {
             None,
@@ -180,9 +239,13 @@ impl Ppu {
         };
         let pal_base = eng * 0x400;
         let backdrop = u16::from_le_bytes([m.pal[pal_base], m.pal[pal_base + 1]]);
-        // BG VRAM window for this engine.
+        // BG VRAM window for this engine (512 KiB = 32 × 16 KiB pages).
         let bg_vram_base: u32 = if eng == 0 { 0x0600_0000 } else { 0x0620_0000 };
-        let vram8 = |off: u32| m.vram_read8(bg_vram_base + off);
+        let mut bg_pages = [None; 32];
+        for (p, slot) in bg_pages.iter_mut().enumerate() {
+            *slot = m.vram_slot(bg_vram_base + ((p as u32) << 14));
+        }
+        let vram8 = |off: u32| vram_page_read8(m, &bg_pages, off);
         let char_bank_off = if eng == 0 {
             (dispcnt >> 24 & 7) * 0x10000
         } else {
@@ -202,21 +265,19 @@ impl Ppu {
             None
         };
 
-        let mut obj_col = vec![0u16; WIDTH * HEIGHT];
-        let mut obj_prio = vec![0xFFu8; WIDTH * HEIGHT];
-        let mut obj_win = vec![false; WIDTH * HEIGHT];
-        let mut obj_semi = vec![false; WIDTH * HEIGHT];
-        let mut obj_bmp_alpha = vec![0u8; WIDTH * HEIGHT];
-        if dispcnt & 1 << 12 != 0 {
+        let objs_enabled = dispcnt & (1 << 12) != 0;
+        if objs_enabled {
+            obj_prio.fill(0xFF);
+            obj_win.fill(false);
             Self::render_objs(
                 m,
                 eng,
                 dispcnt,
-                &mut obj_col,
-                &mut obj_prio,
-                &mut obj_win,
-                &mut obj_semi,
-                &mut obj_bmp_alpha,
+                obj_col,
+                obj_prio,
+                obj_win,
+                obj_semi,
+                obj_bmp_alpha,
             );
         }
 
@@ -235,7 +296,7 @@ impl Ppu {
         let bg_extpal_on = dispcnt & 1 << 30 != 0;
         let win0_on = dispcnt & 1 << 13 != 0;
         let win1_on = dispcnt & 1 << 14 != 0;
-        let objwin_on = dispcnt & 1 << 15 != 0;
+        let objwin_on = objs_enabled && (dispcnt & (1 << 15) != 0);
         let windows_on = dispcnt & 0xE000 != 0;
         let winin = r16(0x48);
         let winout = r16(0x4A);
@@ -561,22 +622,24 @@ impl Ppu {
             // same or lower priority (higher or equal value).
             let mut semi_top = [false; WIDTH];
             let mut bmp_alpha_top = [0u8; WIDTH];
-            for x in 0..WIDTH as u32 {
-                let i = y as usize * WIDTH + x as usize;
-                if obj_prio[i] == 0xFF {
-                    continue;
-                }
-                if windows_on && layers_at(x) & 0x10 == 0 {
-                    continue;
-                }
-                if obj_prio[i] <= top_prio[x as usize] {
-                    let x = x as usize;
-                    sec_col[x] = top_col[x];
-                    sec_layer[x] = top_layer[x];
-                    top_col[x] = rgb555(obj_col[i]);
-                    top_layer[x] = 4;
-                    semi_top[x] = obj_semi[i];
-                    bmp_alpha_top[x] = obj_bmp_alpha[i];
+            if objs_enabled {
+                for x in 0..WIDTH as u32 {
+                    let i = y as usize * WIDTH + x as usize;
+                    if obj_prio[i] == 0xFF {
+                        continue;
+                    }
+                    if windows_on && layers_at(x) & 0x10 == 0 {
+                        continue;
+                    }
+                    if obj_prio[i] <= top_prio[x as usize] {
+                        let x = x as usize;
+                        sec_col[x] = top_col[x];
+                        sec_layer[x] = top_layer[x];
+                        top_col[x] = rgb555(obj_col[i]);
+                        top_layer[x] = 4;
+                        semi_top[x] = obj_semi[i];
+                        bmp_alpha_top[x] = obj_bmp_alpha[i];
+                    }
                 }
             }
 
@@ -638,6 +701,11 @@ impl Ppu {
     ) {
         let oam_base = eng * 0x400;
         let obj_vram_base: u32 = if eng == 0 { 0x0640_0000 } else { 0x0660_0000 };
+        let mut obj_pages = [None; 16];
+        for (p, slot) in obj_pages.iter_mut().enumerate() {
+            *slot = m.vram_slot(obj_vram_base + ((p as u32) << 14));
+        }
+        let obj_vram8 = |addr: u32| vram_page_read8(m, &obj_pages, addr.wrapping_sub(obj_vram_base));
         let pal_base = eng * 0x400 + 0x200;
         let one_d = dispcnt & 0x10 != 0;
         let bmp_one_d = dispcnt & 0x40 != 0;
@@ -751,7 +819,7 @@ impl Ppu {
                             let py = (tile >> 4) * 8 + ty as u32;
                             obj_vram_base + (py * 128 + px) * 2
                         };
-                        let raw = u16::from_le_bytes([m.vram_read8(addr), m.vram_read8(addr + 1)]);
+                        let raw = u16::from_le_bytes([obj_vram8(addr), obj_vram8(addr + 1)]);
                         if raw & 0x8000 == 0 {
                             continue;
                         }
@@ -773,9 +841,9 @@ impl Ppu {
                         obj_vram_base + (tile + cty * 32 + ctx) * 32
                     };
                     let color = if eight_bpp {
-                        m.vram_read8(tile_addr + fy * 8 + fx) as u32
+                        obj_vram8(tile_addr + fy * 8 + fx) as u32
                     } else {
-                        let b = m.vram_read8(tile_addr + fy * 4 + fx / 2) as u32;
+                        let b = obj_vram8(tile_addr + fy * 4 + fx / 2) as u32;
                         if fx & 1 == 0 {
                             b & 0xF
                         } else {

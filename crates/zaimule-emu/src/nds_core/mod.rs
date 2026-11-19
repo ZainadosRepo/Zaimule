@@ -206,6 +206,10 @@ impl NdsMachine {
         (mm.bios7.is_some(), mm.bios9.is_some())
     }
 
+    pub fn has_custom_firmware(&self) -> bool {
+        self.machine.borrow().custom_firmware
+    }
+
     pub fn game_code(&self) -> String {
         if self.rom.len() >= 0x10 {
             String::from_utf8_lossy(&self.rom[0x0C..0x10])
@@ -249,7 +253,8 @@ impl NdsMachine {
             }
         }
 
-        let sub_slices = ARM7_INSTR_PER_LINE / 8;
+        const ARM7_SLICE_QUANTUM: u32 = 32;
+        let sub_slices = (ARM7_INSTR_PER_LINE / ARM7_SLICE_QUANTUM).max(4);
         let hdraw_slices = (sub_slices * 3) / 4;
         let hblank_slices = sub_slices - hdraw_slices;
         let arm9_per_line = ((u64::from(ARM9_INSTR_PER_LINE) * u64::from(self.cpu_overclock_pct))
@@ -293,7 +298,7 @@ impl NdsMachine {
             // HDraw phase (~74% of scanline)
             for _ in 0..hdraw_slices {
                 self.cpu9.run_slice(arm9_per_slice);
-                self.cpu7.run_slice(8);
+                self.cpu7.run_slice(ARM7_SLICE_QUANTUM);
             }
             // Enter HBlank: assert DISPSTAT bit 1, fire HBlank IRQ (if enabled), and service ARM9 HBlank DMA on visible lines.
             {
@@ -311,7 +316,7 @@ impl NdsMachine {
             // HBlank phase (~26% of scanline)
             for _ in 0..hblank_slices {
                 self.cpu9.run_slice(arm9_per_slice);
-                self.cpu7.run_slice(8);
+                self.cpu7.run_slice(ARM7_SLICE_QUANTUM);
             }
             self.machine
                 .borrow_mut()

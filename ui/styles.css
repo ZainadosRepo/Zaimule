@@ -1158,6 +1158,9 @@ body {
 .bezel-header {
   display: flex;
   justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
   font-size: var(--text-xs);
   color: var(--text-secondary);
   margin-bottom: 8px;
