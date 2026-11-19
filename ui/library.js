@@ -1,6 +1,6 @@
 /**
  * Pure ES module for Zaimule's multi-console ROM catalog filtering,
- * CRC32/accent-insensitive search, playtime formatting, and Yuzu-style override resolution.
+ * CRC32/accent-insensitive search, playtime formatting, and Switch engine routing labels.
  */
 
 export function normalizeSearchText(input) {
@@ -39,15 +39,22 @@ export function filterCatalogEntries(entries, filterOptions = {}) {
   } = filterOptions;
 
   const normalizedQuery = normalizeSearchText(query);
+  const rawFilter = String(consoleFilter || "ALL").toUpperCase();
+  const allowedConsoles =
+    rawFilter === "ALL"
+      ? null
+      : rawFilter
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
 
   return entries.filter((item) => {
     if (!item) return false;
-    if (
-      consoleFilter &&
-      consoleFilter !== "ALL" &&
-      String(item.console).toUpperCase() !== String(consoleFilter).toUpperCase()
-    ) {
-      return false;
+    if (allowedConsoles && allowedConsoles.length > 0) {
+      const itemConsole = String(item.console || "").toUpperCase();
+      if (!allowedConsoles.includes(itemConsole)) {
+        return false;
+      }
     }
     if (onlyNativeRust && item.engineKind !== "nativeRust") {
       return false;
@@ -89,3 +96,10 @@ export function formatHardwareProfileLabel(cpuOverclockPct = 100, pgxpSubpixel =
   return `${clamped}% ${mode} · ${pgxp}`;
 }
 
+export function formatSwitchEngineLabel(overrideChoice, consoleKind) {
+  const choice = String(overrideChoice || "auto").toLowerCase();
+  const c = String(consoleKind || "").toUpperCase();
+  if (choice === "torzu") return "Torzu";
+  if (choice === "fritchii") return "Fritchii";
+  return c === "SWITCH2" ? "Auto (Fritchii)" : "Auto (Torzu)";
+}

@@ -1,0 +1,15 @@
+[package]
+name = "termboy-gba"
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+description = "Vendored MIT Game Boy Advance core for Zaimule (from roma-888/termboy)."
+
+[lib]
+name = "termboy_gba"
+path = "src/lib.rs"
+
+[dependencies]
+termboy-core = { path = "../termboy-core" }

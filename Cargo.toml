@@ -13,3 +13,9 @@ strip = true
 # Emulation loops, PPU/APU stepping and audio resampling need optimization even in dev builds.
 [profile.dev.package."*"]
 opt-level = 2
+
+[profile.dev.package.zaimule-emu]
+opt-level = 2
+
+[profile.dev.package.zaimule-core]
+opt-level = 2

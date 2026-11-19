@@ -1,20 +1,13 @@
-//! Native Rust emulation engines (`Chip8Core`, `GameBoyCore`, `GbaCore`, `NdsCore`, `NesCore`, `SnesCore`),
-//! Multi-Instance Virtual Link Cable (`step_dual_link_frame`, `step_quad_link_frame`),
-//! Libretro C-ABI host bridge, BGB/Mesen VRAM/Disassembler debugger, and `EmulatorSession`.
+//! Pure-Rust native emulation cores (`GameBoyCore` via `termboy-gb`, `GbaCore` via `termboy-gba`,
+//! and `NdsCore` via `nds_core`), Multi-Instance Virtual Link Cable (`step_dual_link_frame`,
+//! `step_quad_link_frame`), debugger/VRAM inspector, binary frame/PCM packet encoder, and
+//! Option-A Switch Vault session coordinator (`Torzu` Switch 1 & `Fritchii` Switch 2).
 
-pub mod chip8;
 pub mod debugger;
 pub mod gb;
 pub mod gba;
-pub mod libretro;
-pub mod libretro_host;
 pub mod link;
-pub mod megadrive;
-pub mod n64;
 pub mod nds;
-pub mod nes;
-pub mod ps1;
-pub mod psp;
+pub mod nds_core;
 pub mod session;
-pub mod snes;
 pub mod traits;

@@ -734,11 +734,7 @@ body {
 }
 
 /* Authentic Console Aspect Ratios */
-.game-card[data-console="PS1"] .game-cover {
-  --cover-ratio: 1 / 1;       /* Boîtier CD Cristal Carré */
-  padding-left: 24px;         /* Espace pour la tranche latérale PS1 */
-}
-
+.game-card[data-console="GB"] .game-cover,
 .game-card[data-console="GBC"] .game-cover,
 .game-card[data-console="GBA"] .game-cover {
   --cover-ratio: 4 / 5;       /* Boîte Carton Portable Nintendo */
@@ -751,18 +747,13 @@ body {
 .game-card[data-console="SWITCH"] .game-cover {
   --cover-ratio: 5 / 8;       /* Boîtier fin Nintendo Switch */
   border-color: #7D262E;
+  padding-left: 22px;
 }
 
-.game-card[data-console="NES"] .game-cover,
-.game-card[data-console="SNES"] .game-cover,
-.game-card[data-console="N64"] .game-cover,
-.game-card[data-console="MEGADRIVE"] .game-cover,
-.game-card[data-console="CHIP8"] .game-cover {
-  --cover-ratio: 3 / 4;       /* Boîtier Vertical Cartouche */
-}
-
-.game-card[data-console="PSP"] .game-cover {
-  --cover-ratio: 2 / 3;       /* Boîtier Vertical UMD */
+.game-card[data-console="SWITCH2"] .game-cover {
+  --cover-ratio: 5 / 8;       /* Boîtier Nintendo Switch 2 */
+  border-color: #0D9488;
+  padding-left: 22px;
 }
 
 /* Physical Spine detail for optical/cartridge packaging */
@@ -825,10 +816,6 @@ body {
 
 .core-rust {
   color: var(--text-primary);
-}
-
-.core-libretro {
-  color: var(--text-secondary);
 }
 
 /* Editorial Geometric SVG Cover Art */
@@ -1492,7 +1479,7 @@ canvas.game-canvas {
 }
 
 /* ==========================================================================
-   EXTERNAL LAUNCHERS, SWITCH / ROMSTATION UX, DRAG-DROP & TOASTS
+   EXTERNAL LAUNCHERS, SWITCH VAULT UX, DRAG-DROP & TOASTS
    ========================================================================== */
 
 .library-toolbar {
@@ -1581,6 +1568,10 @@ canvas.game-canvas {
   flex-wrap: wrap;
 }
 
+.emu-external-banner.info {
+  border-color: var(--accent-primary-border);
+}
+
 .emu-banner-text {
   display: flex;
   flex-direction: column;
@@ -1592,6 +1583,10 @@ canvas.game-canvas {
 .emu-banner-text strong {
   color: var(--accent-secondary);
   font-size: var(--text-sm);
+}
+
+.emu-external-banner.info .emu-banner-text strong {
+  color: var(--accent-primary);
 }
 
 .emu-banner-text span {
@@ -1607,12 +1602,31 @@ canvas.game-canvas {
   flex-wrap: wrap;
 }
 
-.discovered-folder-chips {
+.switch-vault-row {
   display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
+  flex-direction: column;
   gap: 8px;
-  margin-top: 6px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.switch-vault-row:last-of-type {
+  border-bottom: none;
+}
+
+.switch-vault-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.vault-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .empty-catalog-actions {

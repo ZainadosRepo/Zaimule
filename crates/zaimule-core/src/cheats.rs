@@ -102,59 +102,14 @@ pub fn scan_ram_for_exact_byte(
         .collect()
 }
 
-/// Built-in GameShark codes ready to toggle in Zaimule.
+/// Starts empty so only user-added GameShark/RAM codes appear.
 pub fn default_cheat_codes() -> Vec<CheatCodeEntry> {
-    vec![
-        CheatCodeEntry {
-            id: "cheat-c104-ff".into(),
-            label: "⚡ Tir Plasma Continu & Cadence Maximale".into(),
-            code_text: "010104C1".into(),
-            addr: 0xC104,
-            value: 0x01,
-            enabled: false,
-        },
-        CheatCodeEntry {
-            id: "cheat-c108-64".into(),
-            label: "💎 Bonus Score Instantané (+100 pts SRAM)".into(),
-            code_text: "016404A0".into(),
-            addr: 0xA004,
-            value: 0x64,
-            enabled: false,
-        },
-    ]
+    Vec::new()
 }
 
-/// Built-in RetroAchievements tracked live during gameplay.
+/// Starts empty with zero pre-populated fake achievements.
 pub fn default_achievements() -> Vec<AchievementEntry> {
-    vec![
-        AchievementEntry {
-            id: "ach-first-orb".into(),
-            title: "Premier Contact Phosphore".into(),
-            description: "Atteindre 10 points dans l'arène ou sur une ROM active.".into(),
-            points: 10,
-            target_score: 10,
-            unlocked: false,
-            badge_symbol: "🟢".into(),
-        },
-        AchievementEntry {
-            id: "ach-plasma-hunter".into(),
-            title: "Chasseur Plasma 60 FPS".into(),
-            description: "Dépasser 50 points en détruisant les orbes au tir A.".into(),
-            points: 25,
-            target_score: 50,
-            unlocked: false,
-            badge_symbol: "🔥".into(),
-        },
-        AchievementEntry {
-            id: "ach-link-master".into(),
-            title: "Maître du Câble Link".into(),
-            description: "Atteindre 100 points ou synchroniser une session 2P.".into(),
-            points: 50,
-            target_score: 100,
-            unlocked: false,
-            badge_symbol: "🏆".into(),
-        },
-    ]
+    Vec::new()
 }
 
 /// Live RAM Watchpoint with delta tracking (`previous_value -> current_value`) and Freeze/Pin support.
@@ -184,55 +139,19 @@ pub fn parse_watchpoint_address(raw_addr: &str) -> Result<u16, String> {
         .map_err(|_| format!("adresse hexadécimale Watchpoint invalide : {raw_addr}"))
 }
 
-/// Built-in Memory Watchpoints for live RAM inspection and 1-click value freezing.
+/// Starts empty so only user-created watchpoints exist.
 pub fn default_memory_watchpoints() -> Vec<MemoryWatchpoint> {
-    vec![
-        MemoryWatchpoint {
-            id: "wp-c100".into(),
-            label: "Coordonnée X / Vélocité Joueur".into(),
-            addr: 0xC100,
-            addr_hex: "0xC100".into(),
-            current_value: 0x48,
-            previous_value: 0x48,
-            frozen: false,
-            frozen_value: 0x48,
-        },
-        MemoryWatchpoint {
-            id: "wp-c104".into(),
-            label: "État & Cadence Tir Plasma".into(),
-            addr: 0xC104,
-            addr_hex: "0xC104".into(),
-            current_value: 0x01,
-            previous_value: 0x00,
-            frozen: false,
-            frozen_value: 0x01,
-        },
-        MemoryWatchpoint {
-            id: "wp-c108".into(),
-            label: "Compteur Score / Énergie Arène".into(),
-            addr: 0xC108,
-            addr_hex: "0xC108".into(),
-            current_value: 0x64,
-            previous_value: 0x50,
-            frozen: false,
-            frozen_value: 0x64,
-        },
-    ]
+    Vec::new()
 }
 
-/// Resolves a deterministic Libretro No-Intro thumbnail URL for a given console and game title.
+/// Resolves a deterministic Libretro No-Intro thumbnail URL for a supported console and game title.
 pub fn resolve_cover_thumbnail_url(console_badge: &str, title: &str) -> String {
     let repo_dir = match console_badge {
         "GB" => "Nintendo - Game Boy",
         "GBC" => "Nintendo - Game Boy Color",
         "GBA" => "Nintendo - Game Boy Advance",
-        "NES" => "Nintendo - Nintendo Entertainment System",
-        "SNES" => "Nintendo - Super Nintendo Entertainment System",
         "NDS" => "Nintendo - Nintendo DS",
-        "PS1" => "Sony - PlayStation",
-        "N64" => "Nintendo - Nintendo 64",
-        "PSP" => "Sony - PlayStation Portable",
-        "MEGADRIVE" => "Sega - Mega Drive - Genesis",
+        "SWITCH" | "SWITCH2" => "Nintendo - Nintendo Switch",
         _ => "Nintendo - Game Boy Color",
     };
     let sanitized: String = title
@@ -272,6 +191,8 @@ mod tests {
         assert_eq!(hits, vec![0xC001, 0xC003]);
 
         assert_eq!(parse_watchpoint_address("0xC108").unwrap(), 0xC108);
-        assert_eq!(default_memory_watchpoints().len(), 3);
+        assert!(default_cheat_codes().is_empty());
+        assert!(default_achievements().is_empty());
+        assert!(default_memory_watchpoints().is_empty());
     }
 }

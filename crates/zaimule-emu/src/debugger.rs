@@ -1,11 +1,11 @@
-//! Visual VRAM Tilemap / Sprite Atlas Inspector & Multi-Architecture Step-by-Step Disassembler
-//! (Sharp LR35902, MOS 6502, ARM7TDMI, and CHIP-8) inspired by BGB & Mesen.
+//! Visual VRAM Tilemap / Sprite Atlas Inspector & Step-by-Step Disassembler
+//! for supported pure-Rust architectures: Sharp LR35902 (GB/GBC) and ARM7TDMI/ARM946E-S (GBA/NDS).
 
 use crate::traits::CpuDebugSnapshot;
 use serde::{Deserialize, Serialize};
 use zaimule_core::catalog::ConsoleKind;
 
-/// Single disassembled instruction row for the BGB/Mesen-style step-by-step debugger.
+/// Single disassembled instruction row for the BGB/No$GBA-style step-by-step debugger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DisassembledLine {
@@ -46,34 +46,27 @@ pub fn disassemble_window(
     breakpoints: &[u32],
     count: usize,
 ) -> Vec<DisassembledLine> {
+    if !matches!(
+        console,
+        ConsoleKind::Gb | ConsoleKind::Gbc | ConsoleKind::Gba | ConsoleKind::Nds
+    ) {
+        return Vec::new();
+    }
+
     let mut lines = Vec::with_capacity(count);
     let mut cursor = pc;
 
     for i in 0..count {
         let (step_len, bytes_hex, mnemonic) = match console {
-            ConsoleKind::Gba | ConsoleKind::Nds => decode_arm7tdmi(rom, cursor),
-            ConsoleKind::Ps1 | ConsoleKind::N64 | ConsoleKind::Psp => {
-                decode_mips_r3000a(rom, cursor)
-            }
-            ConsoleKind::Megadrive => decode_m68k(rom, cursor),
-            ConsoleKind::Chip8 => decode_chip8(rom, cursor),
-            ConsoleKind::Nes | ConsoleKind::Snes => decode_mos6502(rom, cursor),
-            _ => decode_lr35902(rom, cursor),
+            ConsoleKind::Gba => decode_arm32_gba(rom, cursor),
+            ConsoleKind::Nds => decode_arm32_nds(rom, cursor),
+            ConsoleKind::Gb | ConsoleKind::Gbc => decode_lr35902(rom, cursor),
+            _ => unreachable!(),
         };
 
-        let addr_hex = if matches!(
-            console,
-            ConsoleKind::Gba
-                | ConsoleKind::Nds
-                | ConsoleKind::Ps1
-                | ConsoleKind::N64
-                | ConsoleKind::Psp
-        ) {
-            format!("0x{cursor:08X}")
-        } else if console == ConsoleKind::Megadrive {
-            format!("0x{:06X}", cursor & 0x00FF_FFFF)
-        } else {
-            format!("0x{:04X}", cursor & 0xFFFF)
+        let addr_hex = match console {
+            ConsoleKind::Gba | ConsoleKind::Nds => format!("0x{cursor:08X}"),
+            _ => format!("0x{:04X}", cursor & 0xFFFF),
         };
 
         lines.push(DisassembledLine {
@@ -180,65 +173,13 @@ fn decode_lr35902(rom: &[u8], pc: u32) -> (u32, String, String) {
     }
 }
 
-fn decode_mos6502(rom: &[u8], pc: u32) -> (u32, String, String) {
-    let idx = if pc >= 0x8000 {
-        let base = if rom.starts_with(b"NES\x1A") { 16 } else { 0 };
-        base + ((pc as usize - 0x8000) % rom.len().max(1))
-    } else {
-        (pc as usize) % rom.len().max(1)
-    };
-    let op = read_rom_byte(rom, idx);
-    let b1 = read_rom_byte(rom, idx + 1);
-    let b2 = read_rom_byte(rom, idx + 2);
-    let u16_imm = u16::from_le_bytes([b1, b2]);
-
-    match op {
-        0x18 => (1, "18".into(), "CLC".into()),
-        0xFB => (1, "FB".into(), "XCE".into()),
-        0xC2 => (2, format!("C2 {b1:02X}"), format!("REP #${b1:02X}")),
-        0xE2 => (2, format!("E2 {b1:02X}"), format!("SEP #${b1:02X}")),
-        0xA9 => (2, format!("A9 {b1:02X}"), format!("LDA #${b1:02X}")),
-        0xA2 => (2, format!("A2 {b1:02X}"), format!("LDX #${b1:02X}")),
-        0xA0 => (2, format!("A0 {b1:02X}"), format!("LDY #${b1:02X}")),
-        0x85 => (2, format!("85 {b1:02X}"), format!("STA ${b1:02X}")),
-        0x8D => (
-            3,
-            format!("8D {b1:02X} {b2:02X}"),
-            format!("STA ${u16_imm:04X}"),
-        ),
-        0xE8 => (1, "E8".into(), "INX".into()),
-        0xC8 => (1, "C8".into(), "INY".into()),
-        0x4C => (
-            3,
-            format!("4C {b1:02X} {b2:02X}"),
-            format!("JMP ${u16_imm:04X}"),
-        ),
-        0x20 => (
-            3,
-            format!("20 {b1:02X} {b2:02X}"),
-            format!("JSR ${u16_imm:04X}"),
-        ),
-        0x60 => (1, "60".into(), "RTS".into()),
-        0xEA => (1, "EA".into(), "NOP".into()),
-        _ => (1, format!("{op:02X}"), format!("DCB ${op:02X}")),
-    }
-}
-
-fn decode_arm7tdmi(rom: &[u8], pc: u32) -> (u32, String, String) {
-    let offset = (pc.saturating_sub(0x0800_0000) as usize) & !3;
-    let b0 = read_rom_byte(rom, offset);
-    let b1 = read_rom_byte(rom, offset + 1);
-    let b2 = read_rom_byte(rom, offset + 2);
-    let b3 = read_rom_byte(rom, offset + 3);
-    let word = u32::from_le_bytes([b0, b1, b2, b3]);
-    let hex = format!("{b3:02X}{b2:02X}{b1:02X}{b0:02X}");
-
+fn decode_arm32_word(word: u32, pc: u32) -> String {
     if (word & 0x0E00_0000) == 0x0A00_0000 {
         let link = if (word & 0x0100_0000) != 0 { "BL" } else { "B" };
         let raw24 = (word & 0x00FF_FFFF) as i32;
         let signed_offset = (raw24 << 8) >> 6;
         let target = (pc as i32).wrapping_add(8).wrapping_add(signed_offset) as u32;
-        return (4, hex, format!("{link} 0x{target:08X}"));
+        return format!("{link} 0x{target:08X}");
     }
 
     if (word & 0x0C00_0000) == 0x0000_0000 {
@@ -246,145 +187,55 @@ fn decode_arm7tdmi(rom: &[u8], pc: u32) -> (u32, String, String) {
         let rd = (word >> 12) & 0x0F;
         let rn = (word >> 16) & 0x0F;
         let imm = word & 0xFF;
-        let mnem = match opcode {
+        return match opcode {
             0x04 => format!("ADD R{rd}, R{rn}, #{imm}"),
             0x02 => format!("SUB R{rd}, R{rn}, #{imm}"),
             0x0D => format!("MOV R{rd}, #{imm}"),
             _ => format!("ALU R{rd}, R{rn}, #{imm}"),
         };
-        return (4, hex, mnem);
     }
 
-    (4, hex, format!("DCD 0x{word:08X}"))
+    format!("DCD 0x{word:08X}")
 }
 
-fn decode_mips_r3000a(rom: &[u8], pc: u32) -> (u32, String, String) {
-    let raw_off = if pc >= 0x8001_0000 {
-        (pc - 0x8001_0000) as usize
-    } else {
-        (pc.saturating_sub(0x8000_0000)) as usize
-    };
-    let offset = raw_off & !3;
+fn decode_arm32_gba(rom: &[u8], pc: u32) -> (u32, String, String) {
+    let offset = (pc.saturating_sub(0x0800_0000) as usize) & !3;
     let b0 = read_rom_byte(rom, offset);
     let b1 = read_rom_byte(rom, offset + 1);
     let b2 = read_rom_byte(rom, offset + 2);
     let b3 = read_rom_byte(rom, offset + 3);
-    let instr = u32::from_le_bytes([b0, b1, b2, b3]);
+    let word = u32::from_le_bytes([b0, b1, b2, b3]);
     let hex = format!("{b3:02X}{b2:02X}{b1:02X}{b0:02X}");
-
-    if instr == 0 {
-        return (4, hex, "NOP".into());
-    }
-    let op = instr >> 26;
-    let rs = (instr >> 21) & 0x1F;
-    let rt = (instr >> 16) & 0x1F;
-    let rd = (instr >> 11) & 0x1F;
-    let imm = instr & 0xFFFF;
-
-    let mnem = match op {
-        0x00 => {
-            let funct = instr & 0x3F;
-            match funct {
-                0x08 => format!("JR ${rs}"),
-                0x21 => format!("ADDU ${rd}, ${rs}, ${rt}"),
-                0x23 => format!("SUBU ${rd}, ${rs}, ${rt}"),
-                _ => format!("SPECIAL 0x{funct:02X}"),
-            }
-        }
-        0x02 => {
-            let target = (pc & 0xF000_0000) | ((instr & 0x03FF_FFFF) << 2);
-            format!("J 0x{target:08X}")
-        }
-        0x09 => format!("ADDIU ${rt}, ${rs}, 0x{imm:04X}"),
-        0x0D => format!("ORI ${rt}, ${rs}, 0x{imm:04X}"),
-        0x0F => format!("LUI ${rt}, 0x{imm:04X}"),
-        0x12 => {
-            let gte_cmd = instr & 0x3F;
-            match gte_cmd {
-                0x01 => "COP2 GTE RTPS".into(),
-                0x06 => "COP2 GTE NCLIP".into(),
-                _ => format!("COP2 GTE 0x{gte_cmd:02X}"),
-            }
-        }
-        0x18 => "VFPU VADD.Q C000, C010, C020".into(),
-        0x2B => format!("SW ${rt}, 0x{imm:04X}(${rs})"),
-        _ => format!("DW 0x{instr:08X}"),
-    };
-    (4, hex, mnem)
+    (4, hex, decode_arm32_word(word, pc))
 }
 
-fn decode_m68k(rom: &[u8], pc: u32) -> (u32, String, String) {
-    let offset = (pc as usize) & !1;
-    let hi = read_rom_byte(rom, offset);
-    let lo = read_rom_byte(rom, offset + 1);
-    let op = u16::from_be_bytes([hi, lo]);
-    let hex = format!("{hi:02X} {lo:02X}");
-
-    let mnem = if op == 0x4E71 {
-        "NOP".into()
-    } else if op == 0x4E75 {
-        "RTS".into()
-    } else if (op & 0xF100) == 0x7000 {
-        let reg = (op >> 9) & 7;
-        let imm = op & 0xFF;
-        format!("MOVEQ #${imm:02X}, D{reg}")
-    } else if (op & 0xF1C0) == 0x5040 {
-        let reg = op & 7;
-        let mut imm = (op >> 9) & 7;
-        if imm == 0 {
-            imm = 8;
+fn decode_arm32_nds(rom: &[u8], pc: u32) -> (u32, String, String) {
+    let offset = if rom.len() >= 0x40 {
+        let arm9_off = u32::from_le_bytes([rom[0x20], rom[0x21], rom[0x22], rom[0x23]]);
+        let arm9_addr = u32::from_le_bytes([rom[0x28], rom[0x29], rom[0x2A], rom[0x2B]]);
+        let arm9_size = u32::from_le_bytes([rom[0x2C], rom[0x2D], rom[0x2E], rom[0x2F]]);
+        if pc >= arm9_addr && pc < arm9_addr.saturating_add(arm9_size) {
+            (arm9_off.saturating_add(pc - arm9_addr) as usize) & !3
+        } else {
+            (pc.saturating_sub(0x0200_0000) as usize) & !3
         }
-        format!("ADDQ.W #{imm}, D{reg}")
-    } else if (op & 0xF000) == 0x3000 {
-        let dst = (op >> 9) & 7;
-        let src = op & 7;
-        format!("MOVE.W D{src}, D{dst}")
-    } else if (op & 0xF000) == 0xB000 {
-        let dst = (op >> 9) & 7;
-        let src = op & 7;
-        format!("CMP.W D{src}, D{dst}")
-    } else if (op & 0xFF00) == 0x6600 {
-        let disp = (op & 0xFF) as i8;
-        let target = (pc as i32 + 2 + disp as i32) as u32;
-        format!("BNE.S 0x{target:06X}")
-    } else if (op & 0xFF00) == 0x6000 {
-        let disp = (op & 0xFF) as i8;
-        let target = (pc as i32 + 2 + disp as i32) as u32;
-        format!("BRA.S 0x{target:06X}")
     } else {
-        format!("DC.W ${op:04X}")
+        (pc.saturating_sub(0x0200_0000) as usize) & !3
     };
-    (2, hex, mnem)
-}
-
-fn decode_chip8(rom: &[u8], pc: u32) -> (u32, String, String) {
-    let offset = pc.saturating_sub(0x200) as usize;
-    let hi = read_rom_byte(rom, offset);
-    let lo = read_rom_byte(rom, offset + 1);
-    let op = u16::from_be_bytes([hi, lo]);
-    let nnn = op & 0x0FFF;
-    let x = (op >> 8) & 0x0F;
-    let y = (op >> 4) & 0x0F;
-    let kk = op & 0xFF;
-
-    let mnem = match op & 0xF000 {
-        0x0000 if op == 0x00E0 => "CLS".into(),
-        0x0000 if op == 0x00EE => "RET".into(),
-        0x1000 => format!("JP 0x{nnn:03X}"),
-        0x6000 => format!("LD V{x:X}, 0x{kk:02X}"),
-        0x7000 => format!("ADD V{x:X}, 0x{kk:02X}"),
-        0xA000 => format!("LD I, 0x{nnn:03X}"),
-        0xD000 => format!("DRW V{x:X}, V{y:X}, {}", op & 0x0F),
-        _ => format!("DW 0x{op:04X}"),
-    };
-    (2, format!("{hi:02X} {lo:02X}"), mnem)
+    let b0 = read_rom_byte(rom, offset);
+    let b1 = read_rom_byte(rom, offset + 1);
+    let b2 = read_rom_byte(rom, offset + 2);
+    let b3 = read_rom_byte(rom, offset + 3);
+    let word = u32::from_le_bytes([b0, b1, b2, b3]);
+    let hex = format!("{b3:02X}{b2:02X}{b1:02X}{b0:02X}");
+    (4, hex, decode_arm32_word(word, pc))
 }
 
 const INSPECTOR_PALETTE: [[u8; 4]; 4] = [
-    [9, 12, 16, 255],    // #090C10 Obsidian
-    [56, 189, 248, 255], // #38BDF8 Cyan Link
-    [52, 211, 153, 255], // #34D399 Emerald
-    [245, 186, 66, 255], // #F5BA42 Phosphor Gold
+    [9, 12, 16, 255],
+    [56, 189, 248, 255],
+    [52, 211, 153, 255],
+    [245, 186, 66, 255],
 ];
 
 /// Renders a `128x64` RGBA8888 2bpp tile sheet (16 columns x 8 rows = 128 tiles of 8x8px)
@@ -476,29 +327,33 @@ pub fn compute_2bpp_pixel_mutation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gb::build_gb_pocket_arena_rom;
-    use crate::gba::build_gba_golden_horizon_rom;
-    use crate::ps1::build_ps1_cyber_ridge_rom;
 
     #[test]
     fn disassembler_decodes_lr35902_and_arm7tdmi_mnemonics() {
-        let gb_rom = build_gb_pocket_arena_rom();
-        let gb_lines = disassemble_window(ConsoleKind::Gbc, &gb_rom, 0x0150, &[0x0152], 5);
-        assert_eq!(gb_lines.len(), 5);
+        let mut gb_rom = vec![0u8; 0x8000];
+        gb_rom[0x0150..0x0155].copy_from_slice(&[0xF0, 0x00, 0x04, 0x18, 0xFE]);
+        let gb_lines = disassemble_window(ConsoleKind::Gbc, &gb_rom, 0x0150, &[0x0152], 3);
+        assert_eq!(gb_lines.len(), 3);
         assert!(gb_lines[0].is_pc);
         assert_eq!(gb_lines[0].mnemonic, "LDH A, ($FF00)");
         assert_eq!(gb_lines[1].mnemonic, "INC B");
         assert!(gb_lines[1].has_breakpoint);
+        assert_eq!(gb_lines[2].mnemonic, "JR $0153");
 
-        let gba_rom = build_gba_golden_horizon_rom();
+        let mut gba_rom = vec![0u8; 0x100];
+        gba_rom[0xC0..0xC4].copy_from_slice(&0xE282_2001u32.to_le_bytes()); // ADD R2, R2, #1
+        gba_rom[0xC4..0xC8].copy_from_slice(&0xEAFF_FFFDu32.to_le_bytes()); // B 0x0800_00C0
         let gba_lines = disassemble_window(ConsoleKind::Gba, &gba_rom, 0x0800_00C0, &[], 2);
         assert_eq!(gba_lines[0].mnemonic, "ADD R2, R2, #1");
-        assert!(gba_lines[1].mnemonic.starts_with("B 0x080000C0"));
+        assert_eq!(gba_lines[1].mnemonic, "B 0x080000C0");
 
-        let ps1_rom = build_ps1_cyber_ridge_rom();
-        let ps1_lines = disassemble_window(ConsoleKind::Ps1, &ps1_rom, 0x8001_0000, &[], 5);
-        assert_eq!(ps1_lines[0].mnemonic, "LUI $8, 0x8001");
-        assert_eq!(ps1_lines[3].mnemonic, "COP2 GTE RTPS");
+        let mut nds_rom = vec![0u8; 0x300];
+        nds_rom[0x20..0x24].copy_from_slice(&0x200u32.to_le_bytes());
+        nds_rom[0x28..0x2C].copy_from_slice(&0x0200_0800u32.to_le_bytes());
+        nds_rom[0x2C..0x30].copy_from_slice(&0x20u32.to_le_bytes());
+        nds_rom[0x200..0x204].copy_from_slice(&0xE3A0_1055u32.to_le_bytes()); // MOV R1, #85
+        let nds_lines = disassemble_window(ConsoleKind::Nds, &nds_rom, 0x0200_0800, &[], 1);
+        assert_eq!(nds_lines[0].mnemonic, "MOV R1, #85");
     }
 
     #[test]

@@ -77,44 +77,9 @@ impl MacroSequence {
     }
 }
 
-/// Built-in TAS / QoL macros available out of the box.
+/// Starts empty so only user-recorded TAS macros appear.
 pub fn default_macros() -> Vec<MacroSequence> {
-    vec![
-        MacroSequence {
-            id: "macro-shiny-reset".into(),
-            name: "✨ Soft-Reset Starter & Dialogue Rapide".into(),
-            loop_playback: true,
-            segments: vec![
-                InputRunSegment {
-                    buttons_mask: BTN_A | BTN_B | BTN_START,
-                    duration_frames: 15,
-                },
-                InputRunSegment {
-                    buttons_mask: 0,
-                    duration_frames: 45,
-                },
-                InputRunSegment {
-                    buttons_mask: BTN_A,
-                    duration_frames: 120,
-                },
-            ],
-        },
-        MacroSequence {
-            id: "macro-fast-battle".into(),
-            name: "⚔ Boucle Expédition & Validation A".into(),
-            loop_playback: true,
-            segments: vec![
-                InputRunSegment {
-                    buttons_mask: BTN_RIGHT | BTN_B,
-                    duration_frames: 30,
-                },
-                InputRunSegment {
-                    buttons_mask: BTN_UP | BTN_A,
-                    duration_frames: 30,
-                },
-            ],
-        },
-    ]
+    Vec::new()
 }
 
 /// Verified deterministic Ghost Replay & Leaderboard entry.
@@ -249,65 +214,9 @@ impl MacroSequence {
     }
 }
 
-/// Curated global Ghost Leaderboard runs ready for 1-click TAS Ghost Challenge.
+/// Starts empty with zero pre-seeded ghost leaderboard runs.
 pub fn default_ghost_leaderboard() -> Vec<GhostLeaderboardEntry> {
-    vec![
-        verify_and_build_ghost_entry(
-            "ghost-ps1-wr",
-            "ps1-ff7-fr",
-            "Cyber Ridge GP Type-R4 (PS1 3D)",
-            "PS1",
-            "Zainados_WR",
-            480,
-            vec![
-                (BTN_RIGHT | BTN_A) as u8,
-                (BTN_UP | BTN_A) as u8,
-                (BTN_LEFT | BTN_A) as u8,
-                (BTN_UP | BTN_A | BTN_B) as u8,
-            ],
-        ),
-        verify_and_build_ghost_entry(
-            "ghost-psp-pulse",
-            "psp-pulse-horizon",
-            "Pulse Horizon : Widescreen 333MHz (PSP)",
-            "PSP",
-            "Valkyrie_333",
-            540,
-            vec![
-                (BTN_RIGHT | BTN_A | BTN_B) as u8,
-                (BTN_LEFT | BTN_A) as u8,
-                (BTN_UP | BTN_A) as u8,
-                (BTN_RIGHT | BTN_A) as u8,
-            ],
-        ),
-        verify_and_build_ghost_entry(
-            "ghost-gb-arena",
-            "gb-pocket-arena",
-            "Pocket Monster Link Arena (GBC)",
-            "GBC",
-            "Kaelen_TAS",
-            365,
-            vec![
-                (BTN_RIGHT | BTN_A) as u8,
-                (BTN_DOWN | BTN_A) as u8,
-                (BTN_LEFT | BTN_B) as u8,
-                (BTN_UP | BTN_A) as u8,
-            ],
-        ),
-        verify_and_build_ghost_entry(
-            "ghost-snes-mode7",
-            "snes-alttp-fr",
-            "Valkyrie Trigger Mode 7 (SNES)",
-            "SNES",
-            "Aether_60FPS",
-            310,
-            vec![
-                (BTN_UP | BTN_A) as u8,
-                (BTN_RIGHT | BTN_A) as u8,
-                (BTN_UP | BTN_B) as u8,
-            ],
-        ),
-    ]
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -332,16 +241,23 @@ mod tests {
         let rows = seq.timeline_rows();
         assert_eq!(rows[0].buttons_mask, BTN_A | BTN_RIGHT);
         assert!(rows[0].buttons_label.contains("→"));
+        assert!(default_macros().is_empty());
     }
 
     #[test]
     fn ghost_leaderboard_entries_verify_crc32_determinism() {
-        let ghosts = default_ghost_leaderboard();
-        assert_eq!(ghosts.len(), 4);
-        for g in &ghosts {
-            assert!(verify_ghost_entry_integrity(g));
-        }
-        let mut tampered = ghosts[0].clone();
+        assert!(default_ghost_leaderboard().is_empty());
+        let entry = verify_and_build_ghost_entry(
+            "ghost-gb-1",
+            "rom-gb",
+            "Game Boy Test",
+            "GBC",
+            "Joueur1",
+            365,
+            vec![(BTN_RIGHT | BTN_A) as u8, (BTN_DOWN | BTN_A) as u8],
+        );
+        assert!(verify_ghost_entry_integrity(&entry));
+        let mut tampered = entry.clone();
         tampered.score += 10;
         assert!(!verify_ghost_entry_integrity(&tampered));
     }

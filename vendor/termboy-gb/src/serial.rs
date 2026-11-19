@@ -1,0 +1,67 @@
+//! Serial port stub. Captures outgoing bytes; this is how Blargg test ROMs
+//! report pass/fail, so the test harness reads `output()`.
+
+use termboy_core::state::{Reader, StateError, Writer};
+
+#[derive(Default)]
+pub struct Serial {
+    sb: u8,
+    out: Vec<u8>,
+    pending_tx: Option<u8>,
+}
+
+impl Serial {
+    pub fn read_sb(&self) -> u8 {
+        self.sb
+    }
+    pub fn write_sb(&mut self, value: u8) {
+        self.sb = value;
+    }
+    /// SC reads back with unused bits high and the transfer already complete.
+    pub fn read_sc(&self) -> u8 {
+        0x7E
+    }
+    pub fn write_sc(&mut self, value: u8) {
+        if value & 0x80 != 0 {
+            self.out.push(self.sb);
+            if value & 0x01 != 0 {
+                self.pending_tx = Some(self.sb);
+            }
+        }
+    }
+    pub fn output(&self) -> &[u8] {
+        &self.out
+    }
+    pub fn take_tx(&mut self) -> Option<u8> {
+        self.pending_tx.take()
+    }
+    pub fn set_rx_byte(&mut self, value: u8) {
+        self.sb = value;
+    }
+
+    pub(crate) fn serialize(&self, w: &mut Writer) {
+        w.put_u8(self.sb);
+    }
+
+    pub(crate) fn deserialize(&mut self, r: &mut Reader) -> Result<(), StateError> {
+        self.sb = r.get_u8()?;
+        self.pending_tx = None;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_to_sc_with_start_bit_captures_sb() {
+        let mut s = Serial::default();
+        s.write_sb(b'H');
+        s.write_sc(0x81);
+        s.write_sb(b'i');
+        s.write_sc(0x81);
+        s.write_sc(0x01); // no start bit -> nothing captured
+        assert_eq!(s.output(), b"Hi");
+    }
+}

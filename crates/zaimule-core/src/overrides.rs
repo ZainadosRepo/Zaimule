@@ -141,9 +141,7 @@ pub fn resolve_effective_config(
     let core_id = ov
         .and_then(|o| o.preferred_core_id.clone())
         .unwrap_or_else(|| console.default_core_id().to_string());
-    let active_ips_mods = ov
-        .map(|o| o.active_ips_mods.clone())
-        .unwrap_or_else(|| vec!["fr_translation_v2.ips".into()]);
+    let active_ips_mods = ov.map(|o| o.active_ips_mods.clone()).unwrap_or_default();
 
     EffectiveGameConfig {
         game_id: game_id.to_string(),

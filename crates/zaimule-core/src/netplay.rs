@@ -200,52 +200,9 @@ pub fn parse_deep_link(uri: &str) -> Result<DeepLinkInvite, String> {
     })
 }
 
-/// Default Netplay rooms available in the hub.
+/// Starts empty with no mock Netplay rooms.
 pub fn default_netplay_rooms() -> Vec<NetplayRoom> {
-    vec![
-        NetplayRoom {
-            room_code: "PKMN-LINK-01".into(),
-            title: "Colisée & Échange Câble Link (SIO 256 Kbps)".into(),
-            game_title: "Pocket Monster Link Arena (DMG/GBC)".into(),
-            console: "GBC".into(),
-            rom_crc32_hex: "DCE0682B".into(),
-            host_name: "Zainados".into(),
-            players_current: 2,
-            players_max: 2,
-            ping_ms: 9,
-            rollback_frames: 1,
-            link_cable_mode: true,
-            deep_link_uri: format_deep_link("PKMN-LINK-01", "DCE0682B", "zaimule-rust-gb"),
-        },
-        NetplayRoom {
-            room_code: "SNES-CUP-88".into(),
-            title: "Tournoi Rétro 60 FPS Sans File d'Attente".into(),
-            game_title: "The Legend of Zelda : A Link to the Past".into(),
-            console: "SNES".into(),
-            rom_crc32_hex: "D3974B58".into(),
-            host_name: "Kaelen_FR".into(),
-            players_current: 1,
-            players_max: 2,
-            ping_ms: 14,
-            rollback_frames: 1,
-            link_cable_mode: false,
-            deep_link_uri: format_deep_link("SNES-CUP-88", "D3974B58", "snes9x_libretro"),
-        },
-        NetplayRoom {
-            room_code: "NDS-MK-42".into(),
-            title: "Grand Prix Wi-Fi Local Émulé".into(),
-            game_title: "Dual Screen Phantom & Kart DS (NDS)".into(),
-            console: "NDS".into(),
-            rom_crc32_hex: "4A99C10E".into(),
-            host_name: "RetroPulse".into(),
-            players_current: 3,
-            players_max: 4,
-            ping_ms: 18,
-            rollback_frames: 2,
-            link_cable_mode: true,
-            deep_link_uri: format_deep_link("NDS-MK-42", "4A99C10E", "zaimule-rust-nds"),
-        },
-    ]
+    Vec::new()
 }
 
 /// STUN / UDP Hole-Punching NAT traversal discovery report.
@@ -284,32 +241,9 @@ pub struct NetplayChatMessage {
     pub shared_state_crc32_hex: Option<String>,
 }
 
-/// Default Netplay lobby chat messages showing live coordination and Save State sharing.
+/// Starts empty with zero fake lobby messages.
 pub fn default_netplay_chat() -> Vec<NetplayChatMessage> {
-    vec![
-        NetplayChatMessage {
-            id: "chat-1".into(),
-            room_code: "PKMN-LINK-01".into(),
-            sender: "Zainados".into(),
-            text:
-                "STUN UDP Hole Punching synchronisé (0 file d'attente) ! Prêt pour l'échange SIO."
-                    .into(),
-            timestamp_ms: 1_700_000_010_000,
-            shared_state_slot: Some(1),
-            shared_state_crc32_hex: Some("DCE0682B".into()),
-        },
-        NetplayChatMessage {
-            id: "chat-2".into(),
-            room_code: "SNES-CUP-88".into(),
-            sender: "Kaelen_FR".into(),
-            text:
-                "Mode 7 60 FPS ultra fluide, rejoignez via le Deep-Link ou chargez mon Save State !"
-                    .into(),
-            timestamp_ms: 1_700_000_025_000,
-            shared_state_slot: None,
-            shared_state_crc32_hex: None,
-        },
-    ]
+    Vec::new()
 }
 
 /// A single match node in an automated 4P/8P elimination tournament bracket.
@@ -370,45 +304,14 @@ impl TournamentBracket {
     }
 }
 
-/// Builds the default 4-Player Championship Tournament Bracket (`Demi-Finales` + `Grande Finale`).
+/// Starts with an empty tournament bracket (no pre-populated players or matches).
 pub fn default_tournament_bracket() -> TournamentBracket {
     TournamentBracket {
-        id: "tourney-zaimule-cup-1".into(),
-        title: "🏆 Zaimule Championship Cup (Arbre 4P + Spectateur)".into(),
-        console: "Multi-Consoles (GBC / N64 / PS1 / MD)".into(),
-        game_title: "Pocket Monster Link Arena & Star Wing 64".into(),
-        matches: vec![
-            TournamentMatch {
-                id: "match-semi-1".into(),
-                round_label: "Demi-Finale #1".into(),
-                player_a: "Zainados".into(),
-                player_b: "ShadowLink".into(),
-                score_a: 185,
-                score_b: 140,
-                winner: Some("Zainados".into()),
-                spectators_count: 14,
-            },
-            TournamentMatch {
-                id: "match-semi-2".into(),
-                round_label: "Demi-Finale #2".into(),
-                player_a: "Kaelen_FR".into(),
-                player_b: "RetroPulse".into(),
-                score_a: 210,
-                score_b: 175,
-                winner: Some("Kaelen_FR".into()),
-                spectators_count: 19,
-            },
-            TournamentMatch {
-                id: "match-final".into(),
-                round_label: "Grande Finale".into(),
-                player_a: "Zainados".into(),
-                player_b: "Kaelen_FR".into(),
-                score_a: 0,
-                score_b: 0,
-                winner: None,
-                spectators_count: 42,
-            },
-        ],
+        id: "tourney-empty".into(),
+        title: "Tournoi P2P Zaimule".into(),
+        console: "GB / GBC / GBA".into(),
+        game_title: "En attente d'un salon actif".into(),
+        matches: Vec::new(),
         champion: None,
         spectator_mode_active: false,
     }
@@ -450,20 +353,62 @@ mod tests {
     }
 
     #[test]
-    fn stun_candidate_and_chat_messages_initialize_cleanly() {
+    fn stun_candidate_and_empty_defaults_initialize_cleanly() {
         let stun = discover_stun_candidate(54920);
         assert!(stun.hole_punch_ready);
         assert!(stun.public_endpoint.ends_with(":54920"));
-        let chat = default_netplay_chat();
-        assert_eq!(chat.len(), 2);
-        assert_eq!(chat[0].shared_state_slot, Some(1));
+        assert!(default_netplay_rooms().is_empty());
+        assert!(default_netplay_chat().is_empty());
     }
 
     #[test]
     fn tournament_bracket_advances_semifinals_and_crowns_champion() {
-        let mut bracket = default_tournament_bracket();
-        assert_eq!(bracket.champion, None);
-        bracket.advance_match("match-final", 260, 215).unwrap();
-        assert_eq!(bracket.champion.as_deref(), Some("Zainados"));
+        let empty = default_tournament_bracket();
+        assert!(empty.matches.is_empty());
+
+        let mut bracket = TournamentBracket {
+            id: "cup".into(),
+            title: "Cup".into(),
+            console: "GBC".into(),
+            game_title: "Link".into(),
+            matches: vec![
+                TournamentMatch {
+                    id: "semi-1".into(),
+                    round_label: "Demi 1".into(),
+                    player_a: "J1".into(),
+                    player_b: "J2".into(),
+                    score_a: 0,
+                    score_b: 0,
+                    winner: None,
+                    spectators_count: 0,
+                },
+                TournamentMatch {
+                    id: "semi-2".into(),
+                    round_label: "Demi 2".into(),
+                    player_a: "J3".into(),
+                    player_b: "J4".into(),
+                    score_a: 0,
+                    score_b: 0,
+                    winner: None,
+                    spectators_count: 0,
+                },
+                TournamentMatch {
+                    id: "final".into(),
+                    round_label: "Finale".into(),
+                    player_a: "TBD".into(),
+                    player_b: "TBD".into(),
+                    score_a: 0,
+                    score_b: 0,
+                    winner: None,
+                    spectators_count: 0,
+                },
+            ],
+            champion: None,
+            spectator_mode_active: false,
+        };
+        bracket.advance_match("semi-1", 10, 4).unwrap();
+        bracket.advance_match("semi-2", 2, 9).unwrap();
+        bracket.advance_match("final", 260, 215).unwrap();
+        assert_eq!(bracket.champion.as_deref(), Some("J1"));
     }
 }

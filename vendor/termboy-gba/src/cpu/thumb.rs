@@ -1,0 +1,510 @@
+//! Thumb (16-bit) instruction set: 19 formats, all thin encodings over the
+//! ARM helpers — semantics live in one place (cpu/mod.rs and the shifter).
+
+use super::Cpu;
+use super::psr::{C, Mode, T};
+
+impl Cpu {
+    pub(crate) fn exec_thumb(&mut self, op: u16) {
+        match op >> 12 {
+            0x0 | 0x1 => {
+                if op >> 11 == 0b00011 {
+                    self.t_add_sub(op)
+                } else {
+                    self.t_shift_imm(op)
+                }
+            }
+            0x2 | 0x3 => self.t_alu_imm(op),
+            0x4 => match (op >> 10) & 3 {
+                0 => self.t_alu_reg(op),
+                1 => self.t_hi_reg_bx(op),
+                _ => self.t_pc_load(op),
+            },
+            0x5 => {
+                if op & (1 << 9) == 0 {
+                    self.t_mem_reg(op)
+                } else {
+                    self.t_mem_signed(op)
+                }
+            }
+            0x6 | 0x7 => self.t_mem_imm(op),
+            0x8 => self.t_mem_half(op),
+            0x9 => self.t_mem_sp(op),
+            0xA => self.t_load_addr(op),
+            0xB => {
+                // 0xB0 = SP adjust; 0xB4/B5/BC/BD = push/pop. Other 0xBx
+                // encodings don't exist on ARMv4T.
+                if (op >> 8) & 0xF == 0 {
+                    self.t_adjust_sp(op)
+                } else {
+                    self.t_push_pop(op)
+                }
+            }
+            0xC => self.t_multiple(op),
+            0xD => {
+                if (op >> 8) & 0xF == 0xF {
+                    self.t_swi(op)
+                } else {
+                    self.t_cond_branch(op)
+                }
+            }
+            0xE => self.t_branch(op),
+            _ => self.t_long_branch(op),
+        }
+    }
+
+    // ---- Format 1: move shifted register ----
+    fn t_shift_imm(&mut self, op: u16) {
+        let ty = ((op >> 11) & 3) as u32;
+        let amount = ((op >> 6) & 0x1F) as u32;
+        let value = self.regs.get(((op >> 3) & 7) as usize);
+        let (result, carry) = self.shift(ty, value, amount, true);
+        self.set_nzc(result, carry);
+        self.regs.set((op & 7) as usize, result);
+    }
+
+    // ---- Format 2: add/subtract (register or 3-bit immediate) ----
+    fn t_add_sub(&mut self, op: u16) {
+        let rs = self.regs.get(((op >> 3) & 7) as usize);
+        let field = ((op >> 6) & 7) as u32;
+        let operand = if op & (1 << 10) != 0 {
+            field
+        } else {
+            self.regs.get(field as usize)
+        };
+        let result = if op & (1 << 9) != 0 {
+            self.sub_flags(rs, operand, 1, true)
+        } else {
+            self.add_flags(rs, operand, 0, true)
+        };
+        self.regs.set((op & 7) as usize, result);
+    }
+
+    // ---- Format 3: MOV/CMP/ADD/SUB with 8-bit immediate ----
+    fn t_alu_imm(&mut self, op: u16) {
+        let rd = ((op >> 8) & 7) as usize;
+        let imm = (op & 0xFF) as u32;
+        let value = self.regs.get(rd);
+        match (op >> 11) & 3 {
+            0 => {
+                self.set_nz(imm);
+                self.regs.set(rd, imm);
+            }
+            1 => {
+                self.sub_flags(value, imm, 1, true);
+            }
+            2 => {
+                let r = self.add_flags(value, imm, 0, true);
+                self.regs.set(rd, r);
+            }
+            _ => {
+                let r = self.sub_flags(value, imm, 1, true);
+                self.regs.set(rd, r);
+            }
+        }
+    }
+
+    // ---- Format 4: ALU operations ----
+    fn t_alu_reg(&mut self, op: u16) {
+        let rd = (op & 7) as usize;
+        let rs = ((op >> 3) & 7) as usize;
+        let a = self.regs.get(rd);
+        let b = self.regs.get(rs);
+        let c = self.regs.cpsr.flag(C) as u32;
+        match (op >> 6) & 0xF {
+            0x0 => {
+                let r = a & b;
+                self.set_nz(r);
+                self.regs.set(rd, r);
+            } // AND
+            0x1 => {
+                let r = a ^ b;
+                self.set_nz(r);
+                self.regs.set(rd, r);
+            } // EOR
+            0x2 | 0x3 | 0x4 | 0x7 => {
+                // LSL/LSR/ASR/ROR by register: bottom byte, internal cycle
+                let ty = match (op >> 6) & 0xF {
+                    0x2 => 0,
+                    0x3 => 1,
+                    0x4 => 2,
+                    _ => 3,
+                };
+                self.bus.idle();
+                let (r, carry) = self.shift(ty, a, b & 0xFF, false);
+                self.set_nzc(r, carry);
+                self.regs.set(rd, r);
+            }
+            0x5 => {
+                let r = self.add_flags(a, b, c, true);
+                self.regs.set(rd, r);
+            } // ADC
+            0x6 => {
+                let r = self.sub_flags(a, b, c, true);
+                self.regs.set(rd, r);
+            } // SBC
+            0x8 => {
+                self.set_nz(a & b);
+            } // TST
+            0x9 => {
+                let r = self.sub_flags(0, b, 1, true);
+                self.regs.set(rd, r);
+            } // NEG
+            0xA => {
+                self.sub_flags(a, b, 1, true);
+            } // CMP
+            0xB => {
+                self.add_flags(a, b, 0, true);
+            } // CMN
+            0xC => {
+                let r = a | b;
+                self.set_nz(r);
+                self.regs.set(rd, r);
+            } // ORR
+            0xD => {
+                self.bus.idle();
+                let r = a.wrapping_mul(b);
+                self.set_nz(r); // C unpredictable on ARM7 muls: unchanged
+                self.regs.set(rd, r);
+            }
+            0xE => {
+                let r = a & !b;
+                self.set_nz(r);
+                self.regs.set(rd, r);
+            } // BIC
+            _ => {
+                let r = !b;
+                self.set_nz(r);
+                self.regs.set(rd, r);
+            } // MVN
+        }
+    }
+
+    // ---- Format 5: hi-register ops / BX (no flags except CMP) ----
+    fn t_hi_reg_bx(&mut self, op: u16) {
+        let rd = ((op & 7) | ((op >> 4) & 8)) as usize;
+        let rs = (((op >> 3) & 7) | ((op >> 3) & 8)) as usize;
+        let vs = self.regs.get(rs);
+        match (op >> 8) & 3 {
+            0 => {
+                let r = self.regs.get(rd).wrapping_add(vs);
+                self.regs.set(rd, r);
+                if rd == 15 {
+                    self.flush();
+                }
+            }
+            1 => {
+                let vd = self.regs.get(rd);
+                self.sub_flags(vd, vs, 1, true);
+            }
+            2 => {
+                self.regs.set(rd, vs);
+                if rd == 15 {
+                    self.flush();
+                }
+            }
+            _ => {
+                // BX
+                self.regs.cpsr.set_flag(T, vs & 1 != 0);
+                self.regs.set(15, vs);
+                self.flush();
+            }
+        }
+    }
+
+    // ---- Format 6: PC-relative load ----
+    fn t_pc_load(&mut self, op: u16) {
+        let base = self.regs.get(15) & !2; // bit 1 of PC reads as 0 here
+        let addr = base.wrapping_add(((op & 0xFF) as u32) * 4);
+        let v = self.bus.read32(addr);
+        self.bus.idle();
+        self.regs.set(((op >> 8) & 7) as usize, v);
+    }
+
+    // ---- Format 7: load/store with register offset ----
+    fn t_mem_reg(&mut self, op: u16) {
+        let addr = self
+            .regs
+            .get(((op >> 3) & 7) as usize)
+            .wrapping_add(self.regs.get(((op >> 6) & 7) as usize));
+        let rd = (op & 7) as usize;
+        match (op >> 10) & 3 {
+            0 => {
+                let v = self.regs.get(rd);
+                self.bus.write32(addr, v);
+            } // STR
+            1 => {
+                let v = self.regs.get(rd);
+                self.bus.write8(addr, v as u8);
+            } // STRB
+            2 => {
+                // LDR
+                let v = self.load_rotated(addr);
+                self.bus.idle();
+                self.regs.set(rd, v);
+            }
+            _ => {
+                // LDRB
+                let v = self.bus.read8(addr) as u32;
+                self.bus.idle();
+                self.regs.set(rd, v);
+            }
+        }
+    }
+
+    // ---- Format 8: load/store sign-extended byte/halfword ----
+    fn t_mem_signed(&mut self, op: u16) {
+        let addr = self
+            .regs
+            .get(((op >> 3) & 7) as usize)
+            .wrapping_add(self.regs.get(((op >> 6) & 7) as usize));
+        let rd = (op & 7) as usize;
+        match (op >> 10) & 3 {
+            0 => {
+                // STRH
+                let v = self.regs.get(rd);
+                self.bus.write16(addr, v as u16);
+            }
+            1 => {
+                // LDRSB
+                let v = self.bus.read8(addr) as i8 as i32 as u32;
+                self.bus.idle();
+                self.regs.set(rd, v);
+            }
+            2 => {
+                // LDRH (misaligned rotates, same as ARM)
+                let v = (self.bus.read16(addr) as u32).rotate_right((addr & 1) * 8);
+                self.bus.idle();
+                self.regs.set(rd, v);
+            }
+            _ => {
+                // LDRSH (misaligned degrades to LDRSB)
+                let v = if addr & 1 != 0 {
+                    self.bus.read8(addr) as i8 as i32 as u32
+                } else {
+                    self.bus.read16(addr) as i16 as i32 as u32
+                };
+                self.bus.idle();
+                self.regs.set(rd, v);
+            }
+        }
+    }
+
+    // ---- Format 9: load/store with 5-bit immediate offset ----
+    fn t_mem_imm(&mut self, op: u16) {
+        let imm = ((op >> 6) & 0x1F) as u32;
+        let rb = self.regs.get(((op >> 3) & 7) as usize);
+        let rd = (op & 7) as usize;
+        let load = op & (1 << 11) != 0;
+        if op & (1 << 12) == 0 {
+            let addr = rb.wrapping_add(imm * 4);
+            if load {
+                let v = self.load_rotated(addr);
+                self.bus.idle();
+                self.regs.set(rd, v);
+            } else {
+                let v = self.regs.get(rd);
+                self.bus.write32(addr, v);
+            }
+        } else {
+            let addr = rb.wrapping_add(imm);
+            if load {
+                let v = self.bus.read8(addr) as u32;
+                self.bus.idle();
+                self.regs.set(rd, v);
+            } else {
+                let v = self.regs.get(rd);
+                self.bus.write8(addr, v as u8);
+            }
+        }
+    }
+
+    // ---- Format 10: load/store halfword, 5-bit immediate ----
+    fn t_mem_half(&mut self, op: u16) {
+        let addr = self
+            .regs
+            .get(((op >> 3) & 7) as usize)
+            .wrapping_add((((op >> 6) & 0x1F) as u32) * 2);
+        let rd = (op & 7) as usize;
+        if op & (1 << 11) != 0 {
+            let v = (self.bus.read16(addr) as u32).rotate_right((addr & 1) * 8);
+            self.bus.idle();
+            self.regs.set(rd, v);
+        } else {
+            let v = self.regs.get(rd);
+            self.bus.write16(addr, v as u16);
+        }
+    }
+
+    // ---- Format 11: SP-relative load/store ----
+    fn t_mem_sp(&mut self, op: u16) {
+        let addr = self.regs.get(13).wrapping_add(((op & 0xFF) as u32) * 4);
+        let rd = ((op >> 8) & 7) as usize;
+        if op & (1 << 11) != 0 {
+            let v = self.load_rotated(addr);
+            self.bus.idle();
+            self.regs.set(rd, v);
+        } else {
+            let v = self.regs.get(rd);
+            self.bus.write32(addr, v);
+        }
+    }
+
+    // ---- Format 12: load address (ADD rd, pc/sp, #imm) ----
+    fn t_load_addr(&mut self, op: u16) {
+        let base = if op & (1 << 11) != 0 {
+            self.regs.get(13)
+        } else {
+            self.regs.get(15) & !2
+        };
+        let v = base.wrapping_add(((op & 0xFF) as u32) * 4);
+        self.regs.set(((op >> 8) & 7) as usize, v);
+    }
+
+    // ---- Format 13: ADD/SUB SP, #imm ----
+    fn t_adjust_sp(&mut self, op: u16) {
+        let imm = ((op & 0x7F) as u32) * 4;
+        let sp = self.regs.get(13);
+        let sp = if op & (1 << 7) != 0 {
+            sp.wrapping_sub(imm)
+        } else {
+            sp.wrapping_add(imm)
+        };
+        self.regs.set(13, sp);
+    }
+    // ---- Format 14: push/pop ----
+    fn t_push_pop(&mut self, op: u16) {
+        let with_extra = op & (1 << 8) != 0; // LR on push, PC on pop
+        if op & (1 << 11) == 0 {
+            // PUSH = STMDB sp!
+            let count = (op as u32 & 0xFF).count_ones() + with_extra as u32;
+            let mut addr = self.regs.get(13).wrapping_sub(count * 4);
+            self.regs.set(13, addr);
+            for i in 0..8usize {
+                if op & (1 << i) != 0 {
+                    let v = self.regs.get(i);
+                    self.bus.write32(addr, v);
+                    addr = addr.wrapping_add(4);
+                }
+            }
+            if with_extra {
+                let v = self.regs.get(14);
+                self.bus.write32(addr, v);
+            }
+        } else {
+            // POP = LDMIA sp!
+            let mut addr = self.regs.get(13);
+            self.bus.idle();
+            for i in 0..8usize {
+                if op & (1 << i) != 0 {
+                    let v = self.bus.read32(addr);
+                    addr = addr.wrapping_add(4);
+                    self.regs.set(i, v);
+                }
+            }
+            if with_extra {
+                let v = self.bus.read32(addr);
+                addr = addr.wrapping_add(4);
+                self.regs.set(15, v); // flush masks bit 0; state never changes
+                self.flush();
+            }
+            self.regs.set(13, addr);
+        }
+    }
+
+    // ---- Format 15: multiple load/store (STMIA/LDMIA rb!) ----
+    fn t_multiple(&mut self, op: u16) {
+        let rb = ((op >> 8) & 7) as usize;
+        let base = self.regs.get(rb);
+        let rlist = op & 0xFF;
+        if rlist == 0 {
+            // ARMv4 quirk, same as ARM LDM/STM: r15 transfers, base +0x40
+            if op & (1 << 11) != 0 {
+                let v = self.bus.read32(base);
+                self.regs.set(15, v);
+                self.flush();
+            } else {
+                let v = self.regs.get(15).wrapping_add(2);
+                self.bus.write32(base, v);
+            }
+            self.regs.set(rb, base.wrapping_add(0x40));
+            return;
+        }
+        let count = (rlist as u32).count_ones();
+        let mut addr = base;
+        if op & (1 << 11) != 0 {
+            // LDMIA: writeback first, loaded value wins if rb is listed
+            self.bus.idle();
+            self.regs.set(rb, base.wrapping_add(count * 4));
+            for i in 0..8usize {
+                if rlist & (1 << i) != 0 {
+                    let v = self.bus.read32(addr);
+                    addr = addr.wrapping_add(4);
+                    self.regs.set(i, v);
+                }
+            }
+        } else {
+            // STMIA: rb in list stores old base if first, new base otherwise
+            let new_base = base.wrapping_add(count * 4);
+            let mut first = true;
+            for i in 0..8usize {
+                if rlist & (1 << i) != 0 {
+                    let v = if i == rb && !first {
+                        new_base
+                    } else {
+                        self.regs.get(i)
+                    };
+                    self.bus.write32(addr, v);
+                    addr = addr.wrapping_add(4);
+                    first = false;
+                }
+            }
+            self.regs.set(rb, new_base);
+        }
+    }
+
+    // ---- Format 16: conditional branch ----
+    fn t_cond_branch(&mut self, op: u16) {
+        if self.check_cond(((op >> 8) & 0xF) as u8) {
+            let offset = ((op & 0xFF) as i8 as i32 as u32) << 1;
+            let target = self.regs.get(15).wrapping_add(offset);
+            self.regs.set(15, target);
+            self.flush();
+        }
+    }
+
+    // ---- Format 17: SWI ----
+    fn t_swi(&mut self, op: u16) {
+        if self.hle_bios {
+            self.bios_call((op & 0xFF) as u32);
+        } else {
+            let lr = self.regs.get(15).wrapping_sub(2);
+            self.exception(0x08, Mode::Supervisor, lr);
+        }
+    }
+
+    // ---- Format 18: unconditional branch ----
+    fn t_branch(&mut self, op: u16) {
+        let offset = ((((op & 0x7FF) as i32) << 21) >> 20) as u32; // ±2KB
+        let target = self.regs.get(15).wrapping_add(offset);
+        self.regs.set(15, target);
+        self.flush();
+    }
+
+    // ---- Format 19: long branch with link (two halves) ----
+    fn t_long_branch(&mut self, op: u16) {
+        if op & (1 << 11) == 0 {
+            // first half: LR = PC + (signext(offset11) << 12)
+            let offset = ((((op & 0x7FF) as i32) << 21) >> 9) as u32;
+            let lr = self.regs.get(15).wrapping_add(offset);
+            self.regs.set(14, lr);
+        } else {
+            // second half: branch, LR = address after the pair, thumb bit set
+            let target = self.regs.get(14).wrapping_add(((op & 0x7FF) as u32) << 1);
+            let lr = self.regs.get(15).wrapping_sub(2) | 1;
+            self.regs.set(14, lr);
+            self.regs.set(15, target);
+            self.flush();
+        }
+    }
+}

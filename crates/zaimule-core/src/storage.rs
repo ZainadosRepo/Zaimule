@@ -434,31 +434,32 @@ mod tests {
 
     #[test]
     fn persisted_library_roundtrips_catalog_and_directories() {
-        use crate::catalog::{ConsoleKind, CoreEngineKind};
+        use crate::catalog::{ConsoleKind, CoreEngineKind, SwitchEngineOverride};
         let path = temp_path("lib_roundtrip", "json");
         let lib = PersistedLibrary {
             active_game_id: "rom-platine".into(),
-            rom_directories: vec!["C:/Users/Test/Documents/jeuxyuzu".into()],
+            rom_directories: vec!["C:/Users/Test/ROMs".into()],
             catalog: vec![GameEntry {
                 id: "rom-platine".into(),
                 title: "Pokémon Version Platine".into(),
                 console: ConsoleKind::Nds,
-                engine_kind: CoreEngineKind::LibretroAbi,
-                core_id: "melonds_libretro".into(),
+                engine_kind: CoreEngineKind::NativeRust,
+                core_id: "zaimule-rust-nds".into(),
                 region: "EUR · FR".into(),
                 crc32_hex: "AABBCCDD".into(),
                 size_bytes: 134_217_728,
-                sram_summary: "EEPROM NDS".into(),
+                sram_summary: "512 Ko Flash NDS".into(),
                 playtime_seconds: 120,
                 favorite: true,
-                link_cable_ready: true,
+                link_cable_ready: false,
                 embedded_rom_key: None,
                 cover_accent: "#1F2C38".into(),
                 cover_symbol: "NDS".into(),
-                rom_path: Some("C:/RomStation/app/games/PokemonPlatine.zip".into()),
+                rom_path: Some("C:/ROMs/PokemonPlatine.zip".into()),
                 archive_entry: Some("Pokemon - Version Platine (FR).nds".into()),
                 title_id: Some("CPUF".into()),
                 fast_fingerprint: false,
+                switch_engine: SwitchEngineOverride::Auto,
             }],
         };
         save_library_atomic(&path, &lib).unwrap();

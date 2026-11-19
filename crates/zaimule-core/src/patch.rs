@@ -141,32 +141,9 @@ pub fn diff_roms_to_ips(original: &[u8], modified: &[u8]) -> Result<Vec<u8>, Str
     Ok(patch)
 }
 
-/// Default virtual mod layers shown in the Yuzu-style inspector.
+/// Starts empty so only user-imported `.ips` patches are tracked.
 pub fn default_mod_layers() -> Vec<ModLayerEntry> {
-    vec![
-        ModLayerEntry {
-            id: "fr_translation_v2.ips".into(),
-            label: "Traduction Française Intégrale v2.1 (.ips)".into(),
-            kind: "IPS Patch".into(),
-            enabled: true,
-            description: "Appliqué en mémoire vive sans modifier le CRC32 du fichier sur disque."
-                .into(),
-        },
-        ModLayerEntry {
-            id: "pure_lcd_palette.ips".into(),
-            label: "Correction Colorimétrique AGS-101 / Trinitron".into(),
-            kind: "Shader + LUT".into(),
-            enabled: true,
-            description: "Restitue le gamma authentique des écrans rétro sans saturation.".into(),
-        },
-        ModLayerEntry {
-            id: "fast_text_60fps.ips".into(),
-            label: "Textes Instantanés & Déverrouillage 60 FPS".into(),
-            kind: "ROM Hack RAM".into(),
-            enabled: false,
-            description: "Supprime le délai d'affichage des boîtes de dialogue.".into(),
-        },
-    ]
+    Vec::new()
 }
 
 /// Curated Community Mod Hub entry with an embedded standards-compliant `.IPS` binary patch.
@@ -184,46 +161,9 @@ pub struct CommunityModPackage {
     pub ips_bytes: Vec<u8>,
 }
 
-/// Built-in Community Mod Hub packages with genuine `.IPS` binary payloads.
+/// Starts empty with no pre-installed fake community mods.
 pub fn default_community_mods() -> Vec<CommunityModPackage> {
-    vec![
-        CommunityModPackage {
-            id: "mod-ps1-pgxp-nitro".into(),
-            title: "🏎️ Cyber Ridge Type-R4 : Nitro Turbo & Horizon 60 FPS".into(),
-            author: "Zainados_ModLab".into(),
-            target_console: "PS1".into(),
-            category: "Overclock & Gameplay".into(),
-            downloads: 4_820,
-            description: "Débloque le multiplicateur Nitro GTE et stabilise l'horizon 3D PGXP."
-                .into(),
-            installed: false,
-            ips_bytes: build_ips_patch(0x0120, b"ZMR4_NITRO_60FPS").unwrap_or_default(),
-        },
-        CommunityModPackage {
-            id: "mod-gbc-boss-rush".into(),
-            title: "🐉 Pocket Monster Arena : Colisée Master & Palettes GBC".into(),
-            author: "Kaelen_FR".into(),
-            target_console: "GBC".into(),
-            category: "ROM Hack Complet".into(),
-            downloads: 9_140,
-            description:
-                "Ajoute les dresseurs Légendaires en arène SIO et rehausse le contraste GBC.".into(),
-            installed: false,
-            ips_bytes: build_ips_patch(0x0134, b"PKMN_MASTER").unwrap_or_default(),
-        },
-        CommunityModPackage {
-            id: "mod-snes-fast-mode7".into(),
-            title: "🛡️ Valkyrie Mode 7 : Rotation DSP Haute Précision".into(),
-            author: "Aether_Dev".into(),
-            target_console: "SNES".into(),
-            category: "Graphismes & PPU".into(),
-            downloads: 3_290,
-            description:
-                "Affine la matrice affine Mode 7 ($211A-$2120) et double la vitesse de vol.".into(),
-            installed: false,
-            ips_bytes: build_ips_patch(0x0180, b"SNES_M7_HD").unwrap_or_default(),
-        },
-    ]
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -250,14 +190,15 @@ mod tests {
     }
 
     #[test]
-    fn community_mods_contain_valid_ips_patches() {
-        let mods = default_community_mods();
-        assert_eq!(mods.len(), 3);
-        let dummy_rom = vec![0u8; 1024];
-        for m in &mods {
-            let patched = apply_ips_patch(&dummy_rom, &m.ips_bytes).unwrap();
-            assert_ne!(patched, dummy_rom);
-        }
+    fn mod_defaults_start_clean_and_rle_hunk_applies() {
+        assert!(default_mod_layers().is_empty());
+        assert!(default_community_mods().is_empty());
+        let mut ips = Vec::new();
+        ips.extend_from_slice(IPS_MAGIC);
+        ips.extend_from_slice(&[0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x06, 0xAA]);
+        ips.extend_from_slice(IPS_EOF);
+        let patched = apply_ips_patch(&[0u8; 16], &ips).unwrap();
+        assert_eq!(&patched[4..10], &[0xAA; 6]);
     }
 
     #[test]

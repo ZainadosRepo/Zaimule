@@ -1,0 +1,15 @@
+[package]
+name = "termboy-gb"
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+description = "Vendored MIT Game Boy / Game Boy Color core for Zaimule (from roma-888/termboy)."
+
+[lib]
+name = "termboy_gb"
+path = "src/lib.rs"
+
+[dependencies]
+termboy-core = { path = "../termboy-core" }

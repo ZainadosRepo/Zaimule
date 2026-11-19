@@ -1,5 +1,5 @@
-//! Multi-console ROM catalog, IEEE 802.3 CRC32 hashing, cartridge header parser,
-//! and accent-insensitive search filter.
+//! Multi-console ROM catalog for supported Zaimule platforms (`GB`, `GBC`, `GBA`, `NDS`,
+//! `SWITCH`, `SWITCH2`), IEEE 802.3 CRC32 hashing, cartridge header parser, and search filter.
 
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -9,84 +9,50 @@ use std::path::Path;
 const FULL_CRC_MAX_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 const SAMPLE_WINDOW_BYTES: usize = 2 * 1024 * 1024; // 2 MiB per sample slice for multi-GB Switch files
 
-/// Supported console platforms across native Rust cores, Libretro C-ABI cores, and external launchers.
+/// Supported console platforms across pure-Rust native cores and Option-A Switch vault launchers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum ConsoleKind {
-    Chip8,
     Gb,
     Gbc,
     Gba,
-    Nes,
-    Snes,
     Nds,
     Switch,
-    Ps1,
-    N64,
-    Psp,
-    Megadrive,
+    Switch2,
 }
 
 impl ConsoleKind {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Chip8 => "CHIP-8 / Super-CHIP",
             Self::Gb => "Game Boy (DMG)",
             Self::Gbc => "Game Boy Color",
             Self::Gba => "Game Boy Advance",
-            Self::Nes => "Nintendo Entertainment System",
-            Self::Snes => "Super Nintendo (SNES)",
             Self::Nds => "Nintendo DS",
-            Self::Switch => "Nintendo Switch",
-            Self::Ps1 => "PlayStation 1",
-            Self::N64 => "Nintendo 64",
-            Self::Psp => "PlayStation Portable",
-            Self::Megadrive => "Sega Mega Drive",
+            Self::Switch => "Nintendo Switch (Torzu)",
+            Self::Switch2 => "Switch 2 (Fritchii)",
         }
     }
 
     pub fn default_core_id(self) -> &'static str {
         match self {
-            Self::Chip8 => "zaimule-rust-chip8",
             Self::Gb | Self::Gbc => "zaimule-rust-gb",
             Self::Gba => "zaimule-rust-gba",
-            Self::Nes => "zaimule-rust-nes",
-            Self::Snes => "zaimule-rust-snes",
-            Self::Nds => "melonds_libretro",
-            Self::Switch => "yuzu-external",
-            Self::Ps1 => "zaimule-rust-ps1",
-            Self::N64 => "zaimule-rust-n64",
-            Self::Psp => "zaimule-rust-psp",
-            Self::Megadrive => "zaimule-rust-md",
+            Self::Nds => "zaimule-rust-nds",
+            Self::Switch => "torzu-external",
+            Self::Switch2 => "fritchii-external",
         }
     }
 
     pub fn is_native_rust(self) -> bool {
-        matches!(
-            self,
-            Self::Chip8
-                | Self::Gb
-                | Self::Gbc
-                | Self::Gba
-                | Self::Nes
-                | Self::Snes
-                | Self::Nds
-                | Self::Ps1
-                | Self::N64
-                | Self::Psp
-                | Self::Megadrive
-        )
+        matches!(self, Self::Gb | Self::Gbc | Self::Gba | Self::Nds)
     }
 
     pub fn is_external_only(self) -> bool {
-        matches!(self, Self::Switch)
+        matches!(self, Self::Switch | Self::Switch2)
     }
 
     pub fn supports_link_cable(self) -> bool {
-        matches!(
-            self,
-            Self::Gb | Self::Gbc | Self::Gba | Self::Nds | Self::N64 | Self::Psp | Self::Megadrive
-        )
+        matches!(self, Self::Gb | Self::Gbc | Self::Gba)
     }
 }
 
@@ -95,11 +61,20 @@ impl ConsoleKind {
 #[serde(rename_all = "camelCase")]
 pub enum CoreEngineKind {
     NativeRust,
-    LibretroAbi,
     ExternalLauncher,
 }
 
-/// Cartridge/disc metadata entry in the user's library.
+/// Per-game Switch engine preference inside Option-A Vault (`Auto` picks Torzu for Switch 1, Fritchii for Switch 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum SwitchEngineOverride {
+    #[default]
+    Auto,
+    Torzu,
+    Fritchii,
+}
+
+/// Cartridge/image metadata entry in the user's library.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GameEntry {
@@ -126,6 +101,8 @@ pub struct GameEntry {
     pub title_id: Option<String>,
     #[serde(default)]
     pub fast_fingerprint: bool,
+    #[serde(default)]
+    pub switch_engine: SwitchEngineOverride,
 }
 
 /// Rich inspection metadata extracted from a ROM header + streaming CRC32 fingerprint.
@@ -184,7 +161,7 @@ pub fn is_nds_nitro_header(rom_bytes: &[u8]) -> bool {
             return true;
         }
     }
-    rom_bytes.len() >= 16 && &rom_bytes[0..12] == b"DUALPHANTOM\0"
+    false
 }
 
 /// Extracts a 4-character Nintendo DS Gamecode (e.g. `CPUE` / `CPUF` for Pokémon Platinum).
@@ -221,7 +198,7 @@ pub fn extract_switch_title_id(file_name: &str) -> Option<String> {
     None
 }
 
-/// Returns `true` if a file name looks like a firmware/BIOS/key file rather than a playable game ROM.
+/// Returns `true` if a file name is a firmware, encryption key, or executable binary rather than a playable ROM.
 pub fn is_known_system_or_bios_filename(file_name: &str) -> bool {
     let lower = file_name
         .rsplit(['/', '\\'])
@@ -233,17 +210,22 @@ pub fn is_known_system_or_bios_filename(file_name: &str) -> bool {
         "prod.keys"
             | "title.keys"
             | "console.keys"
+            | "dev.keys"
             | "bios7.bin"
             | "bios9.bin"
             | "firmware.bin"
             | "gba_bios.bin"
             | "dmg_boot.bin"
             | "cgb_boot.bin"
-    ) || lower.starts_with("scph") && lower.ends_with(".bin")
-        || lower.ends_with(".keys")
+    ) || lower.ends_with(".keys")
+        || lower.ends_with(".exe")
+        || lower.ends_with(".dll")
+        || lower.ends_with(".so")
+        || lower.ends_with(".dylib")
+        || lower.ends_with(".appimage")
 }
 
-/// Classifies an explicit ROM file extension (returning `None` for non-ROM assets like `.txt`, `.jpg`, `.sav`, `.keys`).
+/// Classifies an explicit ROM file extension among supported consoles only.
 pub fn classify_rom_extension(file_name: &str) -> Option<ConsoleKind> {
     let lower = file_name.to_ascii_lowercase();
     if lower.ends_with(".gbc") {
@@ -252,12 +234,10 @@ pub fn classify_rom_extension(file_name: &str) -> Option<ConsoleKind> {
         Some(ConsoleKind::Gb)
     } else if lower.ends_with(".gba") {
         Some(ConsoleKind::Gba)
-    } else if lower.ends_with(".nes") {
-        Some(ConsoleKind::Nes)
-    } else if lower.ends_with(".sfc") || lower.ends_with(".smc") {
-        Some(ConsoleKind::Snes)
     } else if lower.ends_with(".nds") || lower.ends_with(".srl") {
         Some(ConsoleKind::Nds)
+    } else if lower.ends_with(".nx") || lower.ends_with(".nup") {
+        Some(ConsoleKind::Switch2)
     } else if lower.ends_with(".nsp")
         || lower.ends_with(".xci")
         || lower.ends_with(".nsz")
@@ -266,77 +246,55 @@ pub fn classify_rom_extension(file_name: &str) -> Option<ConsoleKind> {
         || lower.ends_with(".nso")
     {
         Some(ConsoleKind::Switch)
-    } else if lower.ends_with(".bin")
-        || lower.ends_with(".cue")
-        || lower.ends_with(".chd")
-        || lower.ends_with(".psx")
-    {
-        Some(ConsoleKind::Ps1)
-    } else if lower.ends_with(".z64") || lower.ends_with(".n64") || lower.ends_with(".v64") {
-        Some(ConsoleKind::N64)
-    } else if lower.ends_with(".cso") || lower.ends_with(".iso") || lower.ends_with(".pbp") {
-        Some(ConsoleKind::Psp)
-    } else if lower.ends_with(".md") || lower.ends_with(".gen") || lower.ends_with(".smd") {
-        Some(ConsoleKind::Megadrive)
-    } else if lower.ends_with(".ch8") || lower.ends_with(".rom") {
-        Some(ConsoleKind::Chip8)
     } else {
         None
     }
 }
 
 /// Detects the console platform from a file name extension and/or ROM magic header bytes.
-pub fn detect_console(file_name: &str, rom_bytes: &[u8]) -> ConsoleKind {
+pub fn detect_console(file_name: &str, rom_bytes: &[u8]) -> Option<ConsoleKind> {
+    let lower = file_name.to_ascii_lowercase();
+    if lower.ends_with(".nx") || lower.ends_with(".nup") {
+        return Some(ConsoleKind::Switch2);
+    }
+
     // 1. Check Nintendo Switch PFS0 (.nsp), XCI ("HEAD" @ 0x100), Homebrew NRO0/NSO0
     if rom_bytes.len() >= 4 && &rom_bytes[0..4] == b"PFS0" {
-        return ConsoleKind::Switch;
+        return Some(ConsoleKind::Switch);
     }
     if rom_bytes.len() >= 0x0104 && &rom_bytes[0x0100..0x0104] == b"HEAD" {
-        return ConsoleKind::Switch;
+        return Some(ConsoleKind::Switch);
     }
     if rom_bytes.len() >= 0x14 && &rom_bytes[0x10..0x14] == b"NRO0" {
-        return ConsoleKind::Switch;
+        return Some(ConsoleKind::Switch);
     }
     if rom_bytes.len() >= 4 && &rom_bytes[0..4] == b"NSO0" {
-        return ConsoleKind::Switch;
+        return Some(ConsoleKind::Switch);
     }
+
     // 2. Check Nintendo DS Nitro header
     if is_nds_nitro_header(rom_bytes) {
-        return ConsoleKind::Nds;
+        return Some(ConsoleKind::Nds);
     }
-    // 3. Check iNES magic header ("NES\x1A")
-    if rom_bytes.len() >= 16 && &rom_bytes[0..4] == b"NES\x1A" {
-        return ConsoleKind::Nes;
-    }
-    // 4. Check Game Boy / GBC Nintendo logo magic bytes at 0x0104..0x010C
+
+    // 3. Check Game Boy / GBC Nintendo logo magic bytes at 0x0104..0x0108
     if rom_bytes.len() >= 0x0150 && rom_bytes[0x0104..0x0108] == [0xCE, 0xED, 0x66, 0x66] {
         let cgb_flag = rom_bytes[0x0143];
         if cgb_flag == 0x80 || cgb_flag == 0xC0 {
-            return ConsoleKind::Gbc;
+            return Some(ConsoleKind::Gbc);
         }
-        return ConsoleKind::Gb;
-    }
-    // 5. Check N64 Big-Endian / Byte-swapped / Little-Endian magic headers
-    if rom_bytes.len() >= 0x40
-        && (rom_bytes[0..4] == [0x80, 0x37, 0x12, 0x40]
-            || rom_bytes[0..4] == [0x37, 0x80, 0x40, 0x12]
-            || rom_bytes[0..4] == [0x40, 0x12, 0x37, 0x80])
-    {
-        return ConsoleKind::N64;
-    }
-    // 6. Check Sega Mega Drive / Genesis magic header at 0x0100..0x0110
-    if rom_bytes.len() >= 0x0200
-        && (&rom_bytes[0x0100..0x010F] == b"SEGA MEGA DRIVE"
-            || &rom_bytes[0x0100..0x010C] == b"SEGA GENESIS")
-    {
-        return ConsoleKind::Megadrive;
-    }
-    // 7. Check PlayStation Portable EBOOT.PBP magic header ("\0PBP")
-    if rom_bytes.len() >= 0x10 && &rom_bytes[0..4] == b"\x00PBP" {
-        return ConsoleKind::Psp;
+        return Some(ConsoleKind::Gb);
     }
 
-    classify_rom_extension(file_name).unwrap_or(ConsoleKind::Chip8)
+    // 4. Check GBA Nintendo logo prefix + fixed byte 0x96 at offset 0x00B2
+    if rom_bytes.len() >= 0x00C0
+        && rom_bytes[0x0004..0x0008] == [0x24, 0xFF, 0xAE, 0x51]
+        && rom_bytes[0x00B2] == 0x96
+    {
+        return Some(ConsoleKind::Gba);
+    }
+
+    classify_rom_extension(file_name)
 }
 
 fn stem_from_filename(file_name: &str) -> String {
@@ -403,7 +361,7 @@ pub fn extract_rom_title(file_name: &str, console: ConsoleKind, rom_bytes: &[u8]
     }
 
     let stem = stem_from_filename(file_name);
-    if console == ConsoleKind::Switch {
+    if matches!(console, ConsoleKind::Switch | ConsoleKind::Switch2) {
         let clean = clean_switch_title_stem(&stem);
         let upper_stem = stem.to_ascii_uppercase();
         if upper_stem.contains("[UPD]") || upper_stem.contains("UPDATE") {
@@ -416,7 +374,6 @@ pub fn extract_rom_title(file_name: &str, console: ConsoleKind, rom_bytes: &[u8]
     }
 
     if console == ConsoleKind::Nds {
-        // Prefer readable filename stem when available (e.g. "Pokemon - Version Platine (France)")
         let readable_stem = stem.replace('_', " ").trim().to_string();
         let generic_stem = readable_stem.is_empty()
             || readable_stem.eq_ignore_ascii_case("rom")
@@ -469,8 +426,9 @@ pub fn inspect_rom_header_and_stats(
     size_bytes: u64,
     crc32: u32,
     fast_fingerprint: bool,
-) -> InspectedRomFile {
-    let console = detect_console(file_name, header_bytes);
+) -> Result<InspectedRomFile, String> {
+    let console = detect_console(file_name, header_bytes)
+        .ok_or_else(|| format!("format de ROM non pris en charge : {file_name}"))?;
     let title = extract_rom_title(file_name, console, header_bytes);
     let crc32_hex = format_crc32_hex(crc32);
 
@@ -484,12 +442,21 @@ pub fn inspect_rom_header_and_stats(
             let tid = extract_switch_title_id(file_name);
             let lower = file_name.to_ascii_lowercase();
             let fmt = if lower.ends_with(".xci") || lower.ends_with(".xcz") {
-                "Cartouche XCI · Lanceur Yuzu/Ryujinx"
-            } else if lower.ends_with(".nro") {
-                "Homebrew NRO · Lanceur Yuzu/Ryujinx"
+                "Cartouche XCI · Torzu (Switch 1)"
+            } else if lower.ends_with(".nro") || lower.ends_with(".nso") {
+                "Homebrew NRO · Torzu (Switch 1)"
             } else {
-                "Nintendo Switch NSP · Lanceur Yuzu/Ryujinx"
+                "Image Switch NSP · Torzu (Switch 1)"
             };
+            let tag = tid
+                .as_deref()
+                .map(|id| format!("{fmt} ({id})"))
+                .unwrap_or_else(|| fmt.to_string());
+            (tag, tid)
+        }
+        ConsoleKind::Switch2 => {
+            let tid = extract_switch_title_id(file_name);
+            let fmt = "Image Switch 2 · Fritchii / Lichii";
             let tag = tid
                 .as_deref()
                 .map(|id| format!("{fmt} ({id})"))
@@ -499,7 +466,7 @@ pub fn inspect_rom_header_and_stats(
         _ => ("Import Local · CRC32 Vérifié".into(), None),
     };
 
-    InspectedRomFile {
+    Ok(InspectedRomFile {
         console,
         title,
         region,
@@ -507,11 +474,11 @@ pub fn inspect_rom_header_and_stats(
         size_bytes,
         title_id,
         fast_fingerprint,
-    }
+    })
 }
 
 /// Computes either a full streaming IEEE 802.3 CRC32 (for files <= 256 MiB)
-/// or a fast sampled fingerprint (for huge multi-GB Switch `.nsp`/`.xci` images).
+/// or a fast sampled fingerprint (for huge multi-GB Switch `.nsp`/`.xci`/`.nx` images).
 pub fn compute_file_fingerprint(path: &Path, size_bytes: u64) -> Result<(u32, bool), String> {
     let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut hasher = crc32fast::Hasher::new();
@@ -531,18 +498,15 @@ pub fn compute_file_fingerprint(path: &Path, size_bytes: u64) -> Result<(u32, bo
     hasher.update(&size_bytes.to_le_bytes());
     let mut buf = vec![0u8; SAMPLE_WINDOW_BYTES];
 
-    // Head slice
     let n_head = file.read(&mut buf).map_err(|e| e.to_string())?;
     hasher.update(&buf[..n_head]);
 
-    // Middle slice
     let mid_off = (size_bytes / 2).saturating_sub((SAMPLE_WINDOW_BYTES as u64) / 2);
     file.seek(SeekFrom::Start(mid_off))
         .map_err(|e| e.to_string())?;
     let n_mid = file.read(&mut buf).map_err(|e| e.to_string())?;
     hasher.update(&buf[..n_mid]);
 
-    // Tail slice
     let tail_off = size_bytes.saturating_sub(SAMPLE_WINDOW_BYTES as u64);
     file.seek(SeekFrom::Start(tail_off))
         .map_err(|e| e.to_string())?;
@@ -572,250 +536,7 @@ pub fn inspect_rom_file(path: &Path) -> Result<InspectedRomFile, String> {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    Ok(inspect_rom_header_and_stats(
-        &file_name,
-        &header,
-        size_bytes,
-        crc32,
-        fast_fingerprint,
-    ))
-}
-
-/// Builds the default curated library including playable embedded homebrew ROMs and showcase entries.
-pub fn default_catalog() -> Vec<GameEntry> {
-    vec![
-        GameEntry {
-            id: "gb-pocket-arena".into(),
-            title: "Pocket Monster Link Arena (DMG/GBC)".into(),
-            console: ConsoleKind::Gbc,
-            engine_kind: CoreEngineKind::NativeRust,
-            core_id: "zaimule-rust-gb".into(),
-            region: "EUR · FR (Homebrew Inclus)".into(),
-            crc32_hex: "DCE0682B".into(),
-            size_bytes: 32_768,
-            sram_summary: "32 Ko SRAM Atomique + Câble Link SIO".into(),
-            playtime_seconds: 15_420,
-            favorite: true,
-            link_cable_ready: true,
-            embedded_rom_key: Some("gb_pocket_arena".into()),
-            cover_accent: "#1e3a8a".into(),
-            cover_symbol: "🐉".into(),
-            rom_path: None,
-            archive_entry: None,
-            title_id: None,
-            fast_fingerprint: false,
-        },
-        GameEntry {
-            id: "gba-golden-horizon".into(),
-            title: "Golden Horizon : Alchemy Tactics (GBA)".into(),
-            console: ConsoleKind::Gba,
-            engine_kind: CoreEngineKind::NativeRust,
-            core_id: "zaimule-rust-gba".into(),
-            region: "EUR · FR (ARM7TDMI Inclus)".into(),
-            crc32_hex: "89FA410C".into(),
-            size_bytes: 32_768,
-            sram_summary: "64 Ko FlashRAM + Multi-Link 4P".into(),
-            playtime_seconds: 19_800,
-            favorite: true,
-            link_cable_ready: true,
-            embedded_rom_key: Some("gba_golden_horizon".into()),
-            cover_accent: "#b45309".into(),
-            cover_symbol: "☀️".into(),
-            rom_path: None,
-            archive_entry: None,
-            title_id: None,
-            fast_fingerprint: false,
-        },
-        GameEntry {
-            id: "nes-cyber-knight".into(),
-            title: "Chrono Knight 6502 (NES)".into(),
-            console: ConsoleKind::Nes,
-            engine_kind: CoreEngineKind::NativeRust,
-            core_id: "zaimule-rust-nes".into(),
-            region: "WORLD (Homebrew Inclus)".into(),
-            crc32_hex: "A482910E".into(),
-            size_bytes: 40_976,
-            sram_summary: "8 Ko PRG-RAM + PPU 2C02".into(),
-            playtime_seconds: 8_190,
-            favorite: true,
-            link_cable_ready: false,
-            embedded_rom_key: Some("nes_chrono_knight".into()),
-            cover_accent: "#78350f".into(),
-            cover_symbol: "🗡️".into(),
-            rom_path: None,
-            archive_entry: None,
-            title_id: None,
-            fast_fingerprint: false,
-        },
-        GameEntry {
-            id: "chip8-space-interceptor".into(),
-            title: "Space Interceptor DX (CHIP-8)".into(),
-            console: ConsoleKind::Chip8,
-            engine_kind: CoreEngineKind::NativeRust,
-            core_id: "zaimule-rust-chip8".into(),
-            region: "WORLD (Homebrew Inclus)".into(),
-            crc32_hex: "C800FA11".into(),
-            size_bytes: 4_096,
-            sram_summary: "Save State .zst Instantané".into(),
-            playtime_seconds: 3_720,
-            favorite: false,
-            link_cable_ready: false,
-            embedded_rom_key: Some("chip8_interceptor".into()),
-            cover_accent: "#334155".into(),
-            cover_symbol: "👾".into(),
-            rom_path: None,
-            archive_entry: None,
-            title_id: None,
-            fast_fingerprint: false,
-        },
-        GameEntry {
-            id: "gba-emerald-fr".into(),
-            title: "Pokémon Version Émeraude".into(),
-            console: ConsoleKind::Gba,
-            engine_kind: CoreEngineKind::LibretroAbi,
-            core_id: "mgba_libretro".into(),
-            region: "EUR · FR".into(),
-            crc32_hex: "1F1C08FB".into(),
-            size_bytes: 16_777_216,
-            sram_summary: "128 Ko Flash (5 Backups .bak)".into(),
-            playtime_seconds: 152_280,
-            favorite: true,
-            link_cable_ready: true,
-            embedded_rom_key: Some("gb_pocket_arena".into()),
-            cover_accent: "#064e3b".into(),
-            cover_symbol: "💎".into(),
-            rom_path: None,
-            archive_entry: None,
-            title_id: None,
-            fast_fingerprint: false,
-        },
-        GameEntry {
-            id: "snes-alttp-fr".into(),
-            title: "The Legend of Zelda : A Link to the Past (Mode 7)".into(),
-            console: ConsoleKind::Snes,
-            engine_kind: CoreEngineKind::NativeRust,
-            core_id: "zaimule-rust-snes".into(),
-            region: "EUR · FR (65C816 + Mode 7)".into(),
-            crc32_hex: "D3974B58".into(),
-            size_bytes: 1_048_576,
-            sram_summary: "32 Ko SRAM Atomique + PPU Mode 7".into(),
-            playtime_seconds: 67_200,
-            favorite: true,
-            link_cable_ready: false,
-            embedded_rom_key: Some("snes_valkyrie_mode7".into()),
-            cover_accent: "#14532d".into(),
-            cover_symbol: "🛡️".into(),
-            rom_path: None,
-            archive_entry: None,
-            title_id: None,
-            fast_fingerprint: false,
-        },
-        GameEntry {
-            id: "nds-mariokart".into(),
-            title: "Dual Screen Phantom & Kart DS (NDS)".into(),
-            console: ConsoleKind::Nds,
-            engine_kind: CoreEngineKind::NativeRust,
-            core_id: "zaimule-rust-nds".into(),
-            region: "EUR · Multi5 (ARM9+ARM7 + Stylet Tactile)".into(),
-            crc32_hex: "4A99C10E".into(),
-            size_bytes: 33_554_432,
-            sram_summary: "256 Ko EEPROM + Écran Tactile 256x384".into(),
-            playtime_seconds: 57_000,
-            favorite: true,
-            link_cable_ready: true,
-            embedded_rom_key: Some("nds_dual_phantom".into()),
-            cover_accent: "#0c4a6e".into(),
-            cover_symbol: "🖊️".into(),
-            rom_path: None,
-            archive_entry: None,
-            title_id: None,
-            fast_fingerprint: false,
-        },
-        GameEntry {
-            id: "ps1-ff7-fr".into(),
-            title: "Cyber Ridge GP Type-R4 & FF7 (PS1 3D)".into(),
-            console: ConsoleKind::Ps1,
-            engine_kind: CoreEngineKind::NativeRust,
-            core_id: "zaimule-rust-ps1".into(),
-            region: "EUR · FR (MIPS R3000A + GTE PGXP Inclus)".into(),
-            crc32_hex: "9B8E71A2".into(),
-            size_bytes: 32_768,
-            sram_summary: "Carte Mémoire .mcd Atomique (Slots 1 & 2)".into(),
-            playtime_seconds: 231_120,
-            favorite: true,
-            link_cable_ready: false,
-            embedded_rom_key: Some("ps1_cyber_ridge".into()),
-            cover_accent: "#312e81".into(),
-            cover_symbol: "🏎️".into(),
-            rom_path: None,
-            archive_entry: None,
-            title_id: None,
-            fast_fingerprint: false,
-        },
-        GameEntry {
-            id: "n64-star-wing-64".into(),
-            title: "Star Wing 64 : Lylat Z-Buffer (N64)".into(),
-            console: ConsoleKind::N64,
-            engine_kind: CoreEngineKind::NativeRust,
-            core_id: "zaimule-rust-n64".into(),
-            region: "EUR · FR (MIPS VR4300 + RCP Z-Buffer 3D)".into(),
-            crc32_hex: "64FA8037".into(),
-            size_bytes: 32_768,
-            sram_summary: "32 Ko Controller Pak (.mpk) + Rumble".into(),
-            playtime_seconds: 44_200,
-            favorite: true,
-            link_cable_ready: true,
-            embedded_rom_key: Some("n64_star_wing".into()),
-            cover_accent: "#1e40af".into(),
-            cover_symbol: "🦊".into(),
-            rom_path: None,
-            archive_entry: None,
-            title_id: None,
-            fast_fingerprint: false,
-        },
-        GameEntry {
-            id: "md-supersonic-blast".into(),
-            title: "Supersonic Blast : 16-Bit FM (Mega Drive)".into(),
-            console: ConsoleKind::Megadrive,
-            engine_kind: CoreEngineKind::NativeRust,
-            core_id: "zaimule-rust-md".into(),
-            region: "EUR · FR (Motorola 68000 + VDP + YM2612)".into(),
-            crc32_hex: "68000FA1".into(),
-            size_bytes: 32_768,
-            sram_summary: "64 Ko FeRAM + Synthèse FM YM2612".into(),
-            playtime_seconds: 38_400,
-            favorite: true,
-            link_cable_ready: true,
-            embedded_rom_key: Some("md_supersonic".into()),
-            cover_accent: "#0f172a".into(),
-            cover_symbol: "🦔".into(),
-            rom_path: None,
-            archive_entry: None,
-            title_id: None,
-            fast_fingerprint: false,
-        },
-        GameEntry {
-            id: "psp-pulse-horizon".into(),
-            title: "Pulse Horizon : Widescreen 333MHz (PSP)".into(),
-            console: ConsoleKind::Psp,
-            engine_kind: CoreEngineKind::NativeRust,
-            core_id: "zaimule-rust-psp".into(),
-            region: "EUR · FR (MIPS Allegrex + VFPU 16:9)".into(),
-            crc32_hex: "333F0480".into(),
-            size_bytes: 32_768,
-            sram_summary: "64 Ko Memory Stick Duo (.msd) + Ad-Hoc WLAN".into(),
-            playtime_seconds: 51_600,
-            favorite: true,
-            link_cable_ready: true,
-            embedded_rom_key: Some("psp_wipeout_pulse".into()),
-            cover_accent: "#0369a1".into(),
-            cover_symbol: "🚀".into(),
-            rom_path: None,
-            archive_entry: None,
-            title_id: None,
-            fast_fingerprint: false,
-        },
-    ]
+    inspect_rom_header_and_stats(&file_name, &header, size_bytes, crc32, fast_fingerprint)
 }
 
 /// Filters games by console, engine type, Link Cable capability, and accent-insensitive query.
@@ -867,25 +588,27 @@ mod tests {
     }
 
     #[test]
-    fn detects_nes_and_gb_headers_accurately() {
-        let mut nes_rom = vec![0u8; 32];
-        nes_rom[0..4].copy_from_slice(b"NES\x1A");
-        assert_eq!(detect_console("unknown.bin", &nes_rom), ConsoleKind::Nes);
-
+    fn detects_gbc_gba_nds_switch_and_switch2_accurately() {
         let mut gbc_rom = vec![0u8; 0x0160];
         gbc_rom[0x0104..0x0108].copy_from_slice(&[0xCE, 0xED, 0x66, 0x66]);
         gbc_rom[0x0134..0x013F].copy_from_slice(b"POKEMON_GLD");
         gbc_rom[0x0143] = 0xC0;
-        assert_eq!(detect_console("cart.rom", &gbc_rom), ConsoleKind::Gbc);
+        assert_eq!(detect_console("cart.rom", &gbc_rom), Some(ConsoleKind::Gbc));
         assert_eq!(
             extract_rom_title("cart.rom", ConsoleKind::Gbc, &gbc_rom),
             "POKEMON_GLD"
         );
-    }
 
-    #[test]
-    fn detects_switch_nsp_xci_and_pokemon_platinum_nds() {
-        // 1. Switch NSP with PFS0 header and Title ID
+        let mut gba_rom = vec![0u8; 0xC0];
+        gba_rom[0x04..0x08].copy_from_slice(&[0x24, 0xFF, 0xAE, 0x51]);
+        gba_rom[0xA0..0xA7].copy_from_slice(b"EMERALD");
+        gba_rom[0xB2] = 0x96;
+        assert_eq!(detect_console("game.gba", &gba_rom), Some(ConsoleKind::Gba));
+        assert_eq!(
+            extract_rom_title("game.gba", ConsoleKind::Gba, &gba_rom),
+            "EMERALD"
+        );
+
         let mut nsp = vec![0u8; 256];
         nsp[0..4].copy_from_slice(b"PFS0");
         let nsp_info = inspect_rom_header_and_stats(
@@ -894,18 +617,28 @@ mod tests {
             3_800_000_000,
             0x1234_5678,
             true,
-        );
+        )
+        .unwrap();
         assert_eq!(nsp_info.console, ConsoleKind::Switch);
         assert_eq!(nsp_info.title, "Super Mario Odyssey");
         assert_eq!(nsp_info.title_id.as_deref(), Some("0100000000010000"));
         assert!(nsp_info.fast_fingerprint);
 
-        // 2. Switch XCI cartridge with "HEAD" @ 0x100
+        let nx_info = inspect_rom_header_and_stats(
+            "NextGenTitle [0100ABCD00001000].nx",
+            &nsp,
+            4_200_000_000,
+            0x8765_4321,
+            true,
+        )
+        .unwrap();
+        assert_eq!(nx_info.console, ConsoleKind::Switch2);
+        assert_eq!(nx_info.title, "NextGenTitle");
+
         let mut xci = vec![0u8; 0x120];
         xci[0x0100..0x0104].copy_from_slice(b"HEAD");
-        assert_eq!(detect_console("cart.xci", &xci), ConsoleKind::Switch);
+        assert_eq!(detect_console("cart.xci", &xci), Some(ConsoleKind::Switch));
 
-        // 3. Pokémon Platinum Nitro NDS cartridge header ("POKEMON PL" + "CPUF")
         let mut nds = vec![0u8; 0x200];
         nds[0x0000..0x000A].copy_from_slice(b"POKEMON PL");
         nds[0x000C..0x0010].copy_from_slice(b"CPUF");
@@ -917,17 +650,46 @@ mod tests {
             128 * 1024 * 1024,
             0xAABB_CCDD,
             false,
-        );
+        )
+        .unwrap();
         assert_eq!(nds_info.console, ConsoleKind::Nds);
         assert_eq!(nds_info.title, "Pokemon - Version Platine (France)");
         assert_eq!(nds_info.title_id.as_deref(), Some("CPUF"));
         assert!(nds_info.region.contains("FR"));
-
-        // Generic filename falls back to Pokémon Version Platine from game code
         assert_eq!(
             extract_rom_title("rom.nds", ConsoleKind::Nds, &nds),
             "Pokémon Version Platine"
         );
+    }
+
+    #[test]
+    fn rejects_unknown_non_rom_extension_and_filters_accents() {
+        assert!(inspect_rom_header_and_stats("readme.txt", b"hello", 5, 1, false).is_err());
+
+        let sample = vec![GameEntry {
+            id: "gba-emeraude".into(),
+            title: "Pokémon Version Émeraude".into(),
+            console: ConsoleKind::Gba,
+            engine_kind: CoreEngineKind::NativeRust,
+            core_id: "zaimule-rust-gba".into(),
+            region: "EUR · FR".into(),
+            crc32_hex: "1F1C08FB".into(),
+            size_bytes: 16_777_216,
+            sram_summary: "128 Ko Flash".into(),
+            playtime_seconds: 0,
+            favorite: true,
+            link_cable_ready: true,
+            embedded_rom_key: None,
+            cover_accent: "#3A271C".into(),
+            cover_symbol: "GBA".into(),
+            rom_path: Some("/roms/emeraude.gba".into()),
+            archive_entry: None,
+            title_id: None,
+            fast_fingerprint: false,
+            switch_engine: SwitchEngineOverride::Auto,
+        }];
+        let hits = filter_catalog(&sample, Some(ConsoleKind::Gba), true, true, "emeraude");
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]
@@ -948,13 +710,5 @@ mod tests {
         assert!(!meta.fast_fingerprint);
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn accent_insensitive_search_finds_pokemon_emeraude() {
-        let catalog = default_catalog();
-        let hits = filter_catalog(&catalog, None, false, false, "emeraude");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id, "gba-emerald-fr");
     }
 }

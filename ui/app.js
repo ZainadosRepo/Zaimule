@@ -2,7 +2,8 @@ import {
   filterCatalogEntries,
   computeConsoleCounts,
   formatPlaytime,
-  formatFileSize
+  formatFileSize,
+  formatSwitchEngineLabel
 } from "./library.js";
 import {
   BTN_UP,
@@ -20,14 +21,17 @@ import {
 import { ApuAudioEngine, synthesizeMultiChannelSamples } from "./audio.js";
 import { ViewportRecorder } from "./recorder.js";
 import { upscaleFrameIfEnabled } from "./upscaler.js";
+import { decodeViewportBinaryPacket } from "./viewport_ipc.js";
 
 const tauriInvoke = window.__TAURI__?.core?.invoke;
 const appWindow = window.__TAURI__?.window?.getCurrentWindow?.();
 const apuAudio = new ApuAudioEngine();
 const viewportRecorder = new ViewportRecorder();
+const canvasImageCache = new Map();
 
 let toastTimer = null;
 let lastSurfacedWarning = "";
+let stepInFlight = false;
 
 let state = {
   activeGameId: "",
@@ -38,17 +42,63 @@ let state = {
   cheatCodes: [],
   memoryWatchpoints: [],
   achievements: [],
-  discoveredFolders: [],
   romDirectories: [],
-  externalEmulators: [],
-  switchKeys: {
-    prodKeysFound: false,
-    titleKeysFound: false,
-    prodKeysPath: null,
-    titleKeysPath: null
-  },
   lastScanReport: null,
   warning: null,
+  nativeCores: [
+    {
+      coreId: "zaimule-rust-gb",
+      name: "Game Boy / Game Boy Color Natif",
+      consoles: "GB · GBC",
+      engine: "termboy-gb (Rust MIT)",
+      audioSummary: "APU 4 canaux 48 kHz PCM stéréo + Câble Link",
+      limitations: null
+    },
+    {
+      coreId: "zaimule-rust-gba",
+      name: "Game Boy Advance Natif",
+      consoles: "GBA",
+      engine: "termboy-gba (ARM7TDMI Rust MIT)",
+      audioSummary: "PSG + Direct Sound DMA FIFO 48 kHz stéréo",
+      limitations: "Correction LCD active ; BIOS HLE intégré."
+    },
+    {
+      coreId: "zaimule-rust-nds",
+      name: "Nintendo DS Natif",
+      consoles: "NDS",
+      engine: "nds_core (x0cero/nds Rust MIT + extensions SPU/3D/2D)",
+      audioSummary: "SPU 16 canaux (PCM8/PCM16/ADPCM/PSG/Bruit) 48 kHz stéréo",
+      limitations: "Stylet tactile inférieur, textures 3D 4×4, Decal/Toon & PPU 2D complet."
+    }
+  ],
+  switchVault: {
+    vaultRoot: "",
+    torzu: {
+      target: "torzu",
+      installed: false,
+      engineDir: "",
+      executablePath: null,
+      versionHint: null,
+      shaderCacheBytes: 0,
+      notes: "Importez votre dossier, exécutable ou archive .zip/.7z Torzu (Switch 1)."
+    },
+    fritchii: {
+      target: "fritchii",
+      installed: false,
+      engineDir: "",
+      executablePath: null,
+      versionHint: null,
+      shaderCacheBytes: 0,
+      notes: "Importez votre build, exécutable ou archive .zip/.7z Fritchii / Lichii (Switch 2)."
+    },
+    keys: {
+      keysDir: "",
+      prodKeysFound: false,
+      titleKeysFound: false,
+      prodKeysPath: null,
+      titleKeysPath: null
+    }
+  },
   saveSlots: [
     { slot: 1, occupied: false, frame: 0, crc32Hex: "00000000", label: "Slot #1 Vide" },
     { slot: 2, occupied: false, frame: 0, crc32Hex: "00000000", label: "Slot #2 Vide" },
@@ -82,66 +132,24 @@ let state = {
     rows: []
   },
   tournamentBracket: null,
-  libretroCores: [
-    {
-      coreId: "mgba_libretro",
-      displayName: "mGBA (Game Boy Advance · ARM7TDMI)",
-      libraryWindows: "mgba_libretro.dll",
-      libraryMacos: "mgba_libretro.dylib",
-      libraryLinux: "mgba_libretro.so",
-      installed: false,
-      isNativeBinary: false,
-      statusLabel: "Pont C-ABI Prêt · Télécharger ou charger .dll"
-    },
-    {
-      coreId: "snes9x_libretro",
-      displayName: "Snes9x Current (Super Nintendo · Ricoh 5A22)",
-      libraryWindows: "snes9x_libretro.dll",
-      libraryMacos: "snes9x_libretro.dylib",
-      libraryLinux: "snes9x_libretro.so",
-      installed: false,
-      isNativeBinary: false,
-      statusLabel: "Pont C-ABI Prêt · Télécharger ou charger .dll"
-    },
-    {
-      coreId: "melonds_libretro",
-      displayName: "melonDS (Nintendo DS + Stylet Tactile)",
-      libraryWindows: "melonds_libretro.dll",
-      libraryMacos: "melonds_libretro.dylib",
-      libraryLinux: "melonds_libretro.so",
-      installed: false,
-      isNativeBinary: false,
-      statusLabel: "Requis pour jeux DS commerciaux (.nds / .zip)"
-    },
-    {
-      coreId: "swanstation_libretro",
-      displayName: "SwanStation (PlayStation 1 PGXP 4x)",
-      libraryWindows: "swanstation_libretro.dll",
-      libraryMacos: "swanstation_libretro.dylib",
-      libraryLinux: "swanstation_libretro.so",
-      installed: false,
-      isNativeBinary: false,
-      statusLabel: "Pont C-ABI Prêt · Télécharger ou charger .dll"
-    }
-  ],
   biosEntries: [
+    {
+      console: "GB",
+      fileName: "dmg_boot.bin",
+      expectedCrc32Hex: "59C8598E",
+      notes: "Séquence de démarrage DMG/CGB Rust intégrée (termboy-gb 0.5.0)."
+    },
     {
       console: "GBA",
       fileName: "gba_bios.bin",
       expectedCrc32Hex: "81977335",
-      notes: "Optionnel (remplacement HLE Rust inclus)"
+      notes: "BIOS GBA HLE Rust intégré (termboy-gba 0.5.0, SWI + DMA complets)."
     },
     {
       console: "NDS",
-      fileName: "bios7.bin",
+      fileName: "bios7.bin / bios9.bin",
       expectedCrc32Hex: "DF692A80",
-      notes: "Optionnel en mode Direct Boot"
-    },
-    {
-      console: "PS1",
-      fileName: "scph5502.bin",
-      expectedCrc32Hex: "32736F17",
-      notes: "Optionnel (BIOS HLE MIPS R3000A Rust inclus)"
+      notes: "BIOS HLE ARM9/ARM7 + key1.bin + firmware synthétique Zaimule (SPU 16 canaux 48 kHz + 3D 4×4/Toon/Decal + PPU affine/étendu)."
     }
   ],
   linkTelemetry: { enabled: false, quadMode: false, packetsTransferred: 0 },
@@ -213,6 +221,21 @@ function getSelectedGame() {
   return state.catalog.find((g) => g.id === state.activeGameId) || state.catalog[0] || null;
 }
 
+function isSwitchGame(game) {
+  if (!game) return false;
+  const c = String(game.console || "").toUpperCase();
+  return c === "SWITCH" || c === "SWITCH2" || game.engineKind === "externalLauncher";
+}
+
+function resolveTargetEngineForGame(game) {
+  if (!game) return "torzu";
+  const override = String(game.switchEngine || "auto").toLowerCase();
+  if (override === "torzu" || override === "fritchii") {
+    return override;
+  }
+  return String(game.console || "").toUpperCase() === "SWITCH2" ? "fritchii" : "torzu";
+}
+
 async function handleImportRomsTrigger() {
   if (tauriInvoke) {
     const boot = await invokeBackend("pick_and_import_roms");
@@ -220,7 +243,7 @@ async function handleImportRomsTrigger() {
       applyBootstrap(boot);
       const added = boot.lastScanReport?.importedEntries?.length || 0;
       if (added > 0) {
-        showToast(`${added} jeu(x) importé(s) dans la bibliothèque`, "ok");
+        showToast(`${added} jeu(x) importé(s) dans la bibliothèque.`, "ok");
       }
     }
     return;
@@ -239,98 +262,101 @@ async function handleScanFolderTrigger() {
     const added = boot.lastScanReport?.importedEntries?.length || 0;
     showToast(
       added > 0
-        ? `${added} jeu(x) trouvé(s) dans le dossier scanné`
+        ? `${added} jeu(x) trouvé(s) dans le dossier scanné.`
         : "Dossier scanné (aucun nouveau jeu reconnu).",
       added > 0 ? "ok" : "info"
     );
   }
 }
 
-async function handleScanKnownTrigger() {
+async function handleImportSwitchEngine(target, mode, buttonEl = null) {
   if (!tauriInvoke) {
-    showToast("L'auto-détection locale requiert l'application desktop Zaimule.", "error");
-    return;
-  }
-  const boot = await invokeBackend("scan_known_folders");
-  if (boot) {
-    applyBootstrap(boot);
-    const added = boot.lastScanReport?.importedEntries?.length || 0;
-    const foldersCount = boot.discoveredFolders?.length || 0;
-    showToast(
-      added > 0
-        ? `Auto-scan terminé : ${added} jeu(x) trouvé(s) (${foldersCount} dossier(s) inspecté(s))`
-        : `Aucun nouveau jeu trouvé dans les ${foldersCount} dossier(s) détecté(s).`,
-      added > 0 ? "ok" : "info"
-    );
-  }
-}
-
-async function handleDownloadCore(coreId, buttonEl = null) {
-  if (!tauriInvoke) {
-    showToast("Le téléchargement automatique C-ABI requiert l'application desktop Zaimule.", "error");
+    showToast("L'importation d'un émulateur Switch requiert l'application desktop Zaimule.", "error");
     return;
   }
   const prevText = buttonEl ? buttonEl.textContent : "";
   if (buttonEl) {
     buttonEl.disabled = true;
-    buttonEl.textContent = "Téléchargement...";
+    buttonEl.textContent = "Importation...";
   }
-  showToast(`Téléchargement de ${coreId} depuis Libretro Buildbot...`, "info", 10000);
-  const boot = await invokeBackend("download_and_install_libretro_core", { coreId });
+  const label = target === "fritchii" ? "Fritchii (Switch 2)" : "Torzu (Switch 1)";
+  showToast(`Importation de ${label} dans le coffre isolé...`, "info", 8000);
+  const boot = await invokeBackend("pick_and_import_switch_engine", { target, mode });
   if (buttonEl) {
     buttonEl.disabled = false;
     buttonEl.textContent = prevText;
   }
   if (boot) {
     applyBootstrap(boot);
-    hideEmuBanner();
-    showToast(`Cœur natif ${coreId} installé et activé.`, "ok");
-  }
-}
-
-async function handlePickCoreFile(coreId) {
-  if (!tauriInvoke) {
-    showToast("La sélection de cœur .dll/.so requiert l'application desktop Zaimule.", "error");
-    return;
-  }
-  const boot = await invokeBackend("pick_libretro_core_file", { coreId });
-  if (boot) {
-    applyBootstrap(boot);
-    hideEmuBanner();
-    const core = (boot.libretroCores || []).find((c) => c.coreId === coreId);
-    if (core?.isNativeBinary) {
-      showToast(`Cœur C-ABI vérifié : ${core.libraryPath}`, "ok");
+    const install = target === "fritchii" ? boot.switchVault?.fritchii : boot.switchVault?.torzu;
+    if (install?.installed) {
+      showToast(`${label} prêt (${install.versionHint || "binaire vérifié"}).`, "ok");
     }
   }
 }
 
-async function launchExternalForActiveGame(preferredEmuId = null) {
+async function handleImportSwitchKeys(buttonEl = null) {
   if (!tauriInvoke) {
-    showToast("Le lancement d'un émulateur externe requiert l'application desktop Zaimule.", "error");
-    return false;
+    showToast("L'importation de clés Switch (.keys) requiert l'application desktop Zaimule.", "error");
+    return;
   }
-  const status = await invokeBackend("launch_active_external_emulator", { preferredEmuId });
-  if (status) {
-    showToast(status, "ok", 6000);
-    return true;
+  const prevText = buttonEl ? buttonEl.textContent : "";
+  if (buttonEl) {
+    buttonEl.disabled = true;
+    buttonEl.textContent = "Importation...";
   }
-  // Error toast was shown by invokeBackend; direct user to Cœurs & BIOS to locate exe
-  switchTab("view-cores");
-  return false;
+  const boot = await invokeBackend("pick_and_import_switch_keys");
+  if (buttonEl) {
+    buttonEl.disabled = false;
+    buttonEl.textContent = prevText;
+  }
+  if (boot) {
+    applyBootstrap(boot);
+    if (boot.switchVault?.keys?.prodKeysFound) {
+      showToast("Clés Switch synchronisées dans le coffre isolé.", "ok");
+    }
+  }
+}
+
+async function handleClearSwitchShaders(target, buttonEl = null) {
+  if (!tauriInvoke) {
+    showToast("Le nettoyage du cache shaders requiert l'application desktop Zaimule.", "error");
+    return;
+  }
+  const prevText = buttonEl ? buttonEl.textContent : "";
+  if (buttonEl) {
+    buttonEl.disabled = true;
+    buttonEl.textContent = "Nettoyage...";
+  }
+  const res = await invokeBackend("clear_switch_shader_cache", { target });
+  if (buttonEl) {
+    buttonEl.disabled = false;
+    buttonEl.textContent = prevText;
+  }
+  if (res) {
+    if (res.bootstrap) applyBootstrap(res.bootstrap);
+    const label = target === "fritchii" ? "Fritchii" : "Torzu";
+    showToast(
+      `Cache shaders ${label} vidé (${formatFileSize(res.clearedBytes || 0)} libérés).`,
+      "ok"
+    );
+  }
 }
 
 function hideEmuBanner() {
   const banner = document.getElementById("emu-external-banner");
   if (banner) {
     banner.style.display = "none";
+    banner.classList.remove("info");
     banner.dataset.modeKey = "";
   }
 }
 
-function showEmuBanner(modeKey, title, desc, actions) {
+function showEmuBanner(modeKey, title, desc, actions = [], variant = "warn") {
   const banner = document.getElementById("emu-external-banner");
   if (!banner) return;
   banner.style.display = "flex";
+  banner.classList.toggle("info", variant === "info");
   if (banner.dataset.modeKey === modeKey) return;
   banner.dataset.modeKey = modeKey;
 
@@ -366,18 +392,49 @@ async function launchSelectedGame() {
     return;
   }
 
-  const consoleKey = String(game.console || "").toUpperCase();
-  if (consoleKey === "SWITCH" || game.engineKind === "externalLauncher") {
+  if (isSwitchGame(game)) {
     state.isEmulationRunning = false;
-    await launchExternalForActiveGame(null);
+    if (!tauriInvoke) {
+      showToast(
+        "Le lancement Switch (Torzu / Fritchii) requiert l'application desktop Zaimule.",
+        "error"
+      );
+      return;
+    }
+    const status = await invokeBackend("launch_switch_game", { gameId: game.id });
+    if (status) {
+      showToast(status, "ok", 6500);
+    } else {
+      switchTab("view-cores");
+    }
     return;
   }
 
-  hideEmuBanner();
+  apuAudio.ensureContext();
+  apuAudio.reset();
+
+  const consoleKey = String(game.console || "").toUpperCase();
+  if (consoleKey === "NDS") {
+    showEmuBanner(
+      `nds-info-${game.id}`,
+      "Nintendo DS Natif (nds_core Rust)",
+      "Exécution locale ARM9/ARM7 256×384 : stylet tactile inférieur, audio SPU 16 canaux 48 kHz, moteur 3D (textures 4×4, Decal/Toon) et PPU 2D affine/étendu.",
+      [
+        {
+          label: "Masquer",
+          onClick: () => hideEmuBanner()
+        }
+      ],
+      "info"
+    );
+  } else {
+    hideEmuBanner();
+  }
+
   syncViewportScreenAspect(game);
   state.isEmulationRunning = true;
   const fpsEl = document.getElementById("tel-fps");
-  if (fpsEl) fpsEl.textContent = `${(60 * state.speedMult).toFixed(1)} FPS`;
+  if (fpsEl) fpsEl.textContent = `${(60 * state.speedMult).toFixed(0)} FPS`;
   const ftEl = document.getElementById("tel-ft");
   if (ftEl) ftEl.textContent = `${(16.6 / state.speedMult).toFixed(1)} ms`;
   switchTab("view-emulator");
@@ -472,49 +529,28 @@ function renderSidebarCounts() {
   setTxt("count-all", counts.ALL);
   setTxt("count-gbc", (counts.GB || 0) + (counts.GBC || 0));
   setTxt("count-gba", counts.GBA);
-  setTxt("count-nes", counts.NES);
-  setTxt("count-snes", counts.SNES);
-  setTxt("count-n64", counts.N64);
-  setTxt("count-megadrive", counts.MEGADRIVE);
   setTxt("count-nds", counts.NDS);
   setTxt("count-switch", counts.SWITCH);
-  setTxt("count-ps1", counts.PS1);
-  setTxt("count-psp", counts.PSP);
-  setTxt("count-chip8", counts.CHIP8);
+  setTxt("count-switch2", counts.SWITCH2);
   setTxt("count-rust", counts.RUST);
   setTxt("count-link", counts.LINK);
 }
 
 const EDITORIAL_COVER_PALETTE = {
-  GBC: {
+  GB: {
     bg: "#1F2A33",
-    spine: "DMG-GBC",
+    spine: "DMG-GB",
+    svg: `<svg viewBox="0 0 64 64"><circle cx="32" cy="32" r="20"/><circle cx="32" cy="32" r="7"/><line x1="12" y1="32" x2="25" y2="32"/><line x1="39" y1="32" x2="52" y2="32"/></svg>`
+  },
+  GBC: {
+    bg: "#21323F",
+    spine: "CGB-GBC",
     svg: `<svg viewBox="0 0 64 64"><circle cx="32" cy="32" r="20"/><circle cx="32" cy="32" r="7"/><line x1="12" y1="32" x2="25" y2="32"/><line x1="39" y1="32" x2="52" y2="32"/></svg>`
   },
   GBA: {
     bg: "#3A271C",
     spine: "AGB-GBA",
     svg: `<svg viewBox="0 0 64 64"><circle cx="32" cy="32" r="18"/><path d="M32 8v10M32 46v10M8 32h10M46 32h10M15 15l7 7M42 42l7 7M49 15l-7 7M22 42l-7 7"/></svg>`
-  },
-  NES: {
-    bg: "#3B1F1E",
-    spine: "HVC-NES",
-    svg: `<svg viewBox="0 0 64 64"><polygon points="32,10 50,22 50,44 32,54 14,44 14,22"/><line x1="32" y1="10" x2="32" y2="54"/><line x1="14" y1="28" x2="50" y2="28"/></svg>`
-  },
-  SNES: {
-    bg: "#1F2F27",
-    spine: "SHVC-SFC",
-    svg: `<svg viewBox="0 0 64 64"><circle cx="32" cy="32" r="22"/><polyline points="32,16 32,32 43,39"/><circle cx="32" cy="32" r="3"/></svg>`
-  },
-  N64: {
-    bg: "#1C2E2B",
-    spine: "NUS-N64",
-    svg: `<svg viewBox="0 0 64 64"><polygon points="32,12 52,46 12,46"/><polygon points="32,24 44,46 20,46"/><line x1="32" y1="12" x2="32" y2="46"/></svg>`
-  },
-  MEGADRIVE: {
-    bg: "#1D283A",
-    spine: "HAA-MD",
-    svg: `<svg viewBox="0 0 64 64"><circle cx="32" cy="32" r="20"/><circle cx="32" cy="32" r="12"/><path d="M12 32h40"/></svg>`
   },
   NDS: {
     bg: "#1F2C38",
@@ -526,20 +562,10 @@ const EDITORIAL_COVER_PALETTE = {
     spine: "HAC-NSW",
     svg: `<svg viewBox="0 0 64 64"><rect x="14" y="12" width="14" height="40" rx="6"/><rect x="36" y="12" width="14" height="40" rx="6"/><circle cx="21" cy="24" r="3"/><circle cx="43" cy="38" r="3"/></svg>`
   },
-  PS1: {
-    bg: "#25232E",
-    spine: "PAL-SCES",
-    svg: `<svg viewBox="0 0 64 64"><circle cx="32" cy="32" r="22"/><circle cx="32" cy="32" r="6"/><path d="M18 18l8 8M38 38l8 8"/></svg>`
-  },
-  PSP: {
-    bg: "#1E2D3B",
-    spine: "UCES-UMD",
-    svg: `<svg viewBox="0 0 64 64"><ellipse cx="32" cy="32" rx="22" ry="12"/><circle cx="32" cy="32" r="6"/><line x1="10" y1="32" x2="54" y2="32"/></svg>`
-  },
-  CHIP8: {
-    bg: "#262925",
-    spine: "COSMAC-8",
-    svg: `<svg viewBox="0 0 64 64"><rect x="14" y="14" width="36" height="36" rx="2"/><rect x="24" y="24" width="16" height="16"/></svg>`
+  SWITCH2: {
+    bg: "#11312F",
+    spine: "NX2-NS2",
+    svg: `<svg viewBox="0 0 64 64"><rect x="12" y="12" width="14" height="40" rx="6"/><rect x="38" y="12" width="14" height="40" rx="6"/><circle cx="19" cy="24" r="3"/><circle cx="45" cy="38" r="3"/><path d="M29 24h6l-6 12h6"/></svg>`
   }
 };
 
@@ -564,24 +590,21 @@ function renderCatalogGrid() {
     const emptyEl = document.createElement("div");
     emptyEl.className = "empty-catalog-state";
     if (state.catalog.length === 0) {
-      const chipsHtml = (state.discoveredFolders || [])
-        .map(
-          (f, idx) =>
-            `<button class="btn mono discovered-chip" data-folder-idx="${idx}" type="button" title="${escapeHtml(f.path)}">${escapeHtml(f.label)} (${escapeHtml(f.hint)})</button>`
-        )
-        .join("");
       emptyEl.innerHTML = `
         <div class="empty-catalog-icon" aria-hidden="true">
           <svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 7h8M9 14h6M12 11v6"/></svg>
         </div>
-        <div class="empty-catalog-title">Aucune cartouche ou image disque dans la bibliothèque</div>
-        <div class="empty-catalog-desc">Importez des jeux Switch (.nsp, .xci, .nsz), Nintendo DS (.nds, .zip RomStation), GBA/GB/SNES/PS1 ou glissez-déposez un dossier directement dans la fenêtre.</div>
+        <div class="empty-catalog-title">Aucune cartouche ou image dans votre bibliothèque</div>
+        <div class="empty-catalog-desc">
+          Importez vos jeux <strong>Game Boy / GBC</strong> (.gb, .gbc), <strong>GBA</strong> (.gba), <strong>Nintendo DS</strong> (.nds),
+          <strong>Switch 1</strong> (.nsp, .xci, .nsz) ou <strong>Switch 2</strong> (.nx, .nup) — y compris compressés en <strong>.zip</strong> ou <strong>.7z</strong> —
+          ou glissez-déposez vos fichiers directement dans cette fenêtre.
+        </div>
         <div class="empty-catalog-actions">
           <button class="btn btn-primary" id="btn-empty-import-rom" type="button">Importer ROM / Archive...</button>
           <button class="btn" id="btn-empty-scan-folder" type="button">Scanner un dossier...</button>
-          <button class="btn" id="btn-empty-scan-known" type="button">Auto-détecter (jeuxyuzu / RomStation)</button>
+          <button class="btn btn-ghost" id="btn-empty-open-vault" type="button">Configurer Coffre Switch (Torzu / Fritchii)</button>
         </div>
-        ${chipsHtml ? `<div class="discovered-folder-chips">${chipsHtml}</div>` : ""}
       `;
       emptyEl.querySelector("#btn-empty-import-rom")?.addEventListener("click", () => {
         handleImportRomsTrigger();
@@ -589,25 +612,8 @@ function renderCatalogGrid() {
       emptyEl.querySelector("#btn-empty-scan-folder")?.addEventListener("click", () => {
         handleScanFolderTrigger();
       });
-      emptyEl.querySelector("#btn-empty-scan-known")?.addEventListener("click", () => {
-        handleScanKnownTrigger();
-      });
-      emptyEl.querySelectorAll(".discovered-chip").forEach((chip) => {
-        chip.addEventListener("click", async () => {
-          const folder = state.discoveredFolders[Number(chip.dataset.folderIdx)];
-          if (!folder) return;
-          const boot = await invokeBackend("scan_rom_directory", { dirPath: folder.path });
-          if (boot) {
-            applyBootstrap(boot);
-            const added = boot.lastScanReport?.importedEntries?.length || 0;
-            showToast(
-              added > 0
-                ? `${added} jeu(x) trouvé(s) dans ${folder.label}`
-                : `Dossier ${folder.label} scanné`,
-              added > 0 ? "ok" : "info"
-            );
-          }
-        });
+      emptyEl.querySelector("#btn-empty-open-vault")?.addEventListener("click", () => {
+        switchTab("view-cores");
       });
     } else {
       emptyEl.innerHTML = `
@@ -622,16 +628,18 @@ function renderCatalogGrid() {
   for (const game of filtered) {
     const consoleKey = String(game.console || "GBC").toUpperCase();
     const spec = EDITORIAL_COVER_PALETTE[consoleKey] || EDITORIAL_COVER_PALETTE.GBC;
-    const isRust = game.engineKind === "nativeRust";
-    const isExternal = game.engineKind === "externalLauncher" || consoleKey === "SWITCH";
-    const hasSpine = consoleKey === "PS1" || consoleKey === "SWITCH";
-    const engineClass = isRust ? "core-rust" : isExternal ? "core-external" : "core-libretro";
-    const engineLabel = isRust ? "RUST" : isExternal ? "EXTERNE" : "C-ABI";
-    const subTag = game.titleId
-      ? game.titleId
-      : game.archiveEntry
-        ? "ZIP → ROM"
-        : "";
+    const switchMode = isSwitchGame(game);
+    const hasSpine = consoleKey === "SWITCH" || consoleKey === "SWITCH2";
+    const engineClass = switchMode ? "core-external" : "core-rust";
+    const engineLabel = switchMode
+      ? resolveTargetEngineForGame(game) === "fritchii"
+        ? "FRITCHII"
+        : "TORZU"
+      : "RUST";
+    const archiveType = String(game.romPath || "").toLowerCase().endsWith(".7z")
+      ? "7Z → ROM"
+      : "ZIP → ROM";
+    const subTag = game.titleId ? game.titleId : game.archiveEntry ? archiveType : "";
 
     const card = document.createElement("article");
     card.className = `game-card${game.id === state.activeGameId ? " selected" : ""}`;
@@ -649,9 +657,9 @@ function renderCatalogGrid() {
               : ""
           }
           <div class="cover-top">
-            <span class="console-tag mono">${escapeHtml(game.console)}</span>
+            <span class="console-tag mono">${escapeHtml(consoleKey === "SWITCH2" ? "SWITCH 2" : consoleKey)}</span>
             <span class="core-tag mono ${engineClass}">
-              ${engineLabel}
+              ${escapeHtml(engineLabel)}
             </span>
           </div>
           ${subTag ? `<div class="cover-subtag mono">${escapeHtml(subTag)}</div>` : ""}
@@ -708,21 +716,25 @@ function renderCatalogGrid() {
 function renderInspector() {
   const g = getSelectedGame();
   const playLabelEl = document.querySelector("#btn-insp-play span:first-child");
-  const extBtn = document.getElementById("btn-insp-external");
   const titleIdRow = document.getElementById("insp-titleid-row");
   const titleIdVal = document.getElementById("insp-titleid");
   const pathRow = document.getElementById("insp-path-row");
   const pathVal = document.getElementById("insp-path");
+  const switchEngineRow = document.getElementById("insp-switch-engine-row");
+  const switchEngineSel = document.getElementById("insp-switch-engine");
   const sramActionsRow = document.getElementById("sram-actions-row");
 
   if (g) {
     const consoleKey = String(g.console || "").toUpperCase();
-    const isSwitchOrExternal = consoleKey === "SWITCH" || g.engineKind === "externalLauncher";
-    const isNds = consoleKey === "NDS";
+    const isSwitch = isSwitchGame(g);
+    const targetEngine = resolveTargetEngineForGame(g);
 
     document.getElementById("insp-title").textContent = g.title;
-    document.getElementById("insp-console").textContent = g.console;
-    document.getElementById("insp-core").textContent = g.coreId;
+    document.getElementById("insp-console").textContent =
+      consoleKey === "SWITCH2" ? "SWITCH 2" : consoleKey;
+    document.getElementById("insp-core").textContent = isSwitch
+      ? formatSwitchEngineLabel(g.switchEngine, consoleKey)
+      : g.coreId;
     document.getElementById("insp-region").textContent = String(g.region || "—").split("(")[0].trim();
     document.getElementById("insp-crc").textContent = g.fastFingerprint
       ? `${g.crc32Hex} (Échantillon)`
@@ -731,8 +743,10 @@ function renderInspector() {
     if (crcTop) crcTop.textContent = `CRC · ${g.crc32Hex}`;
     document.getElementById("insp-sram").textContent = g.sramSummary;
     document.getElementById("insp-playtime").textContent = formatPlaytime(g.playtimeSeconds);
-    document.getElementById("active-emu-game").textContent = `${g.console} · ${g.title}`;
-    document.getElementById("tel-core").textContent = `${g.coreId} (${g.console})`;
+    document.getElementById("active-emu-game").textContent = `${consoleKey} · ${g.title}`;
+    document.getElementById("tel-core").textContent = isSwitch
+      ? `${targetEngine} (${consoleKey})`
+      : `${g.coreId} (${consoleKey})`;
 
     if (titleIdRow && titleIdVal) {
       if (g.titleId) {
@@ -752,16 +766,27 @@ function renderInspector() {
         pathRow.style.display = "none";
       }
     }
+    if (switchEngineRow && switchEngineSel) {
+      if (isSwitch) {
+        switchEngineRow.style.display = "flex";
+        const autoLabel =
+          consoleKey === "SWITCH2" ? "Auto (Fritchii · Switch 2)" : "Auto (Torzu · Switch 1)";
+        const autoOpt = switchEngineSel.querySelector('option[value="auto"]');
+        if (autoOpt) autoOpt.textContent = autoLabel;
+        switchEngineSel.value = g.switchEngine || "auto";
+      } else {
+        switchEngineRow.style.display = "none";
+      }
+    }
     if (playLabelEl) {
-      playLabelEl.textContent = isSwitchOrExternal
-        ? "Lancer avec Yuzu / Eden / Ryujinx"
+      playLabelEl.textContent = isSwitch
+        ? targetEngine === "fritchii"
+          ? "Lancer avec Fritchii (Switch 2)"
+          : "Lancer avec Torzu (Switch 1)"
         : "Lancer dans le Viewport 60 Hz";
     }
-    if (extBtn) {
-      extBtn.style.display = isNds ? "inline-flex" : "none";
-    }
     if (sramActionsRow) {
-      sramActionsRow.style.display = isSwitchOrExternal ? "none" : "grid";
+      sramActionsRow.style.display = isSwitch ? "none" : "grid";
     }
     syncViewportScreenAspect(g);
   } else {
@@ -778,8 +803,8 @@ function renderInspector() {
     document.getElementById("tel-core").textContent = "En veille";
     if (titleIdRow) titleIdRow.style.display = "none";
     if (pathRow) pathRow.style.display = "none";
+    if (switchEngineRow) switchEngineRow.style.display = "none";
     if (playLabelEl) playLabelEl.textContent = "Lancer dans le Viewport 60 Hz";
-    if (extBtn) extBtn.style.display = "none";
     if (sramActionsRow) sramActionsRow.style.display = "grid";
     syncViewportScreenAspect(null);
   }
@@ -788,7 +813,7 @@ function renderInspector() {
   if (sramHexEl) {
     const sramRows = state.sramHexInspection?.hexRows || state.sramHexInspection?.rows || [];
     if (sramRows.length > 0) {
-      sramHexEl.innerHTML = sramRows.map((r) => `<div>${r}</div>`).join("");
+      sramHexEl.innerHTML = sramRows.map((r) => `<div>${escapeHtml(r)}</div>`).join("");
     } else {
       sramHexEl.innerHTML = `<div class="empty-list-hint">Aucune donnée SRAM chargée</div>`;
     }
@@ -827,7 +852,7 @@ function renderInspector() {
         row.innerHTML = `
           <span style="display:flex; align-items:center; gap:8px;">
             <input type="checkbox" ${m.enabled ? "checked" : ""} />
-            <span>${m.label}</span>
+            <span>${escapeHtml(m.label)}</span>
           </span>
           <span class="mono" style="font-size:10.5px; color:${m.enabled ? "var(--status-ok)" : "var(--text-muted)"};">
             ${m.enabled ? "ACTIF" : "OFF"}
@@ -859,9 +884,9 @@ function renderInspector() {
         row.innerHTML = `
           <span style="display:flex; align-items:center; gap:8px;">
             <input type="checkbox" ${c.enabled ? "checked" : ""} />
-            <span>${c.label.replace(/^[^\w]+/, "")}</span>
+            <span>${escapeHtml(String(c.label || "").replace(/^[^\w]+/, ""))}</span>
           </span>
-          <span class="mono" style="font-size:10.5px; color:var(--accent-primary);">${c.codeText}</span>
+          <span class="mono" style="font-size:10.5px; color:var(--accent-primary);">${escapeHtml(c.codeText)}</span>
         `;
         row.querySelector("input").addEventListener("change", async (e) => {
           c.enabled = e.target.checked;
@@ -887,7 +912,7 @@ function renderInspector() {
         const row = document.createElement("div");
         row.className = "mod-item";
         row.innerHTML = `
-          <span>${a.title}</span>
+          <span>${escapeHtml(a.title)}</span>
           <span class="mono" style="font-size:10.5px; color:${a.unlocked ? "var(--status-ok)" : "var(--text-muted)"};">
             ${a.unlocked ? `+${a.points} pts` : `${a.points} pts`}
           </span>
@@ -905,7 +930,7 @@ function renderInspector() {
       card.className = "slot-card";
       card.innerHTML = `
         <div class="slot-num mono">SLOT #${slot.slot}</div>
-        <div class="slot-time mono">${slot.occupied ? slot.label : "Vide — Cliquer pour sauver"}</div>
+        <div class="slot-time mono">${slot.occupied ? escapeHtml(slot.label) : "Vide — Cliquer pour sauver"}</div>
       `;
       card.addEventListener("click", async () => {
         if (!getSelectedGame()) return;
@@ -988,7 +1013,7 @@ function renderKeymapperAndMacros() {
         const row = document.createElement("div");
         row.className = "mod-item";
         row.innerHTML = `
-          <span>${mac.name}</span>
+          <span>${escapeHtml(mac.name)}</span>
           <button class="btn mono" style="padding:3px 8px; font-size:11px;">
             ${isRunning ? "Stop" : "TAS"}
           </button>
@@ -1018,7 +1043,7 @@ function renderKeymapperAndMacros() {
         row.className = "mod-item";
         row.style.fontSize = "10.5px";
         row.innerHTML = `
-          <span>F${seg.startFrame}..${seg.endFrame} (${seg.durationFrames}f) · <strong style="color:var(--accent-secondary)">${seg.buttonsLabel}</strong></span>
+          <span>F${seg.startFrame}..${seg.endFrame} (${seg.durationFrames}f) · <strong style="color:var(--accent-secondary)">${escapeHtml(seg.buttonsLabel)}</strong></span>
           <button class="btn mono" style="padding:1px 6px; font-size:9.5px;">+A</button>
         `;
         row.querySelector("button").addEventListener("click", async () => {
@@ -1052,7 +1077,7 @@ function renderKeymapperAndMacros() {
         row.style.fontSize = "10.5px";
         const hexVal = `0x${(wp.currentValue ?? 0).toString(16).padStart(2, "0").toUpperCase()}`;
         row.innerHTML = `
-          <span><strong style="color:var(--accent-primary)">${wp.addrHex}</strong> ${wp.label} : <strong style="color:var(--status-ok)">${hexVal}</strong></span>
+          <span><strong style="color:var(--accent-primary)">${escapeHtml(wp.addrHex)}</strong> ${escapeHtml(wp.label)} : <strong style="color:var(--status-ok)">${hexVal}</strong></span>
           <button class="btn mono" style="padding:1px 6px; font-size:9.5px; color:${wp.frozen ? "var(--accent-secondary)" : "var(--text-muted)"};">
             ${wp.frozen ? "Gelé" : "Pin"}
           </button>
@@ -1069,6 +1094,48 @@ function renderKeymapperAndMacros() {
       }
     }
   }
+}
+
+function buildSwitchEngineBlock(install, target, displayName) {
+  const installed = Boolean(install?.installed);
+  const shaderText = formatFileSize(install?.shaderCacheBytes || 0);
+  const block = document.createElement("div");
+  block.className = "switch-vault-row";
+  block.innerHTML = `
+    <div class="switch-vault-head">
+      <div style="font-weight:600; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+        <span>${escapeHtml(displayName)}</span>
+        <span class="pill-badge ${installed ? "pill-green" : "pill-terracotta"} mono">
+          ${installed ? `Prêt · ${escapeHtml(install.versionHint || "installé")}` : "À importer"}
+        </span>
+      </div>
+      <span class="mono" style="font-size:10.5px; color:var(--text-muted);">Shaders : ${escapeHtml(shaderText)}</span>
+    </div>
+    <div class="mono path-ellipsis" style="font-size:10.5px; color:${installed ? "var(--status-ok)" : "var(--text-muted)"};" title="${escapeHtml(install?.executablePath || install?.engineDir || "")}">
+      ${escapeHtml(installed && install.executablePath ? install.executablePath : install?.notes || "")}
+    </div>
+    <div class="vault-actions">
+      <button class="btn btn-primary mono btn-vault-file" type="button" style="padding:4px 9px; font-size:11px;">
+        ${installed ? "Remplacer (.zip / .7z / .exe)..." : "Importer Archive / .exe..."}
+      </button>
+      <button class="btn mono btn-vault-folder" type="button" style="padding:4px 9px; font-size:11px;">
+        Importer Dossier...
+      </button>
+      <button class="btn btn-ghost mono btn-vault-clear-cache" type="button" style="padding:4px 9px; font-size:11px;">
+        Vider Cache Shaders
+      </button>
+    </div>
+  `;
+  block.querySelector(".btn-vault-file")?.addEventListener("click", (ev) => {
+    handleImportSwitchEngine(target, "file", ev.currentTarget);
+  });
+  block.querySelector(".btn-vault-folder")?.addEventListener("click", (ev) => {
+    handleImportSwitchEngine(target, "folder", ev.currentTarget);
+  });
+  block.querySelector(".btn-vault-clear-cache")?.addEventListener("click", (ev) => {
+    handleClearSwitchShaders(target, ev.currentTarget);
+  });
+  return block;
 }
 
 function renderNetplayAndCores() {
@@ -1107,10 +1174,10 @@ function renderNetplayAndCores() {
         row.style.cssText =
           "display:flex; align-items:center; justify-content:space-between; font-size:11px; padding:4px 0; border-bottom:1px solid var(--border-subtle);";
         row.innerHTML = `
-          <span><strong style="color:var(--accent-secondary)">[${msg.sender}]</strong> ${msg.text}</span>
+          <span><strong style="color:var(--accent-secondary)">[${escapeHtml(msg.sender)}]</strong> ${escapeHtml(msg.text)}</span>
           ${
             sharedCrc
-              ? `<button class="btn mono" style="padding:1px 6px; font-size:10px; border-color:var(--status-ok); color:var(--status-ok);">Charger State #${sharedSlot} (${sharedCrc})</button>`
+              ? `<button class="btn mono" style="padding:1px 6px; font-size:10px; border-color:var(--status-ok); color:var(--status-ok);">Charger State #${sharedSlot} (${escapeHtml(sharedCrc)})</button>`
               : ""
           }
         `;
@@ -1137,9 +1204,9 @@ function renderNetplayAndCores() {
       tourneyCard.id = "tournament-bracket-card";
       tourneyCard.innerHTML = `
         <div class="section-title">
-          <span>${t.title}</span>
+          <span>${escapeHtml(t.title)}</span>
           <span class="pill-badge pill-gold mono">
-            ${t.champion ? `Champion : ${t.champion}` : `${specTotal} Spectateurs`}
+            ${t.champion ? `Champion : ${escapeHtml(t.champion)}` : `${specTotal} Spectateurs`}
           </span>
         </div>
         <div class="bracket-matches"></div>
@@ -1151,15 +1218,15 @@ function renderNetplayAndCores() {
         mRow.className = "mod-item";
         mRow.innerHTML = `
           <div>
-            <div class="mono" style="font-size:10.5px; color:var(--accent-primary)">${m.roundLabel}</div>
-            <div style="font-weight:600">${m.playerA} <span style="color:var(--text-muted)">vs</span> ${m.playerB}</div>
+            <div class="mono" style="font-size:10.5px; color:var(--accent-primary)">${escapeHtml(m.roundLabel)}</div>
+            <div style="font-weight:600">${escapeHtml(m.playerA)} <span style="color:var(--text-muted)">vs</span> ${escapeHtml(m.playerB)}</div>
             <div class="mono" style="font-size:10.5px; color:${m.winner ? "var(--status-ok)" : "var(--text-muted)"}">
-              ${m.winner ? `Vainqueur : ${m.winner}` : `Score Live : ${m.scoreA} - ${m.scoreB}`}
+              ${m.winner ? `Vainqueur : ${escapeHtml(m.winner)}` : `Score Live : ${m.scoreA} - ${m.scoreB}`}
             </div>
           </div>
           <div style="display:flex; gap:4px;">
-            <button class="btn mono btn-win-a" style="padding:3px 7px; font-size:10px;">${m.playerA}</button>
-            <button class="btn mono btn-win-b" style="padding:3px 7px; font-size:10px;">${m.playerB}</button>
+            <button class="btn mono btn-win-a" style="padding:3px 7px; font-size:10px;">${escapeHtml(m.playerA)}</button>
+            <button class="btn mono btn-win-b" style="padding:3px 7px; font-size:10px;">${escapeHtml(m.playerB)}</button>
           </div>
         `;
         mRow.querySelector(".btn-win-a")?.addEventListener("click", async () => {
@@ -1188,12 +1255,12 @@ function renderNetplayAndCores() {
       card.className = "panel-card";
       card.innerHTML = `
         <div class="section-title">
-          <span>${r.title}</span>
+          <span>${escapeHtml(r.title)}</span>
           <span class="pill-badge pill-green mono">${r.pingMs} ms · Rollback ${r.rollbackFrames}f</span>
         </div>
-        <div class="kv-row"><span class="kv-label">Jeu</span><span class="kv-val">${r.gameTitle} (${r.console})</span></div>
-        <div class="kv-row"><span class="kv-label">Hôte &amp; Joueurs</span><span class="kv-val mono">${r.hostName} (${r.playersCurrent}/${r.playersMax})</span></div>
-        <div class="kv-row"><span class="kv-label">Invitation Deep-Link</span><span class="kv-val mono" style="color:var(--accent-secondary)">${r.deepLinkUri}</span></div>
+        <div class="kv-row"><span class="kv-label">Jeu</span><span class="kv-val">${escapeHtml(r.gameTitle)} (${escapeHtml(r.console)})</span></div>
+        <div class="kv-row"><span class="kv-label">Hôte &amp; Joueurs</span><span class="kv-val mono">${escapeHtml(r.hostName)} (${r.playersCurrent}/${r.playersMax})</span></div>
+        <div class="kv-row"><span class="kv-label">Invitation Deep-Link</span><span class="kv-val mono" style="color:var(--accent-secondary)">${escapeHtml(r.deepLinkUri)}</span></div>
         <div style="margin-top:10px; display:flex; justify-content:flex-end;">
           <button class="btn btn-primary mono" style="font-size:11px;">Synchroniser Salon &amp; Link 2P</button>
         </div>
@@ -1217,10 +1284,10 @@ function renderNetplayAndCores() {
       card.className = "panel-card";
       card.innerHTML = `
         <div class="section-title">
-          <span>Record Fantôme TAS · ${ghost.playerName}</span>
-          <span class="pill-badge pill-cobalt mono">${ghost.score} pts · CRC ${ghost.traceCrc32Hex}</span>
+          <span>Record Fantôme TAS · ${escapeHtml(ghost.playerName)}</span>
+          <span class="pill-badge pill-cobalt mono">${ghost.score} pts · CRC ${escapeHtml(ghost.traceCrc32Hex)}</span>
         </div>
-        <div class="kv-row"><span class="kv-label">Jeu &amp; Console</span><span class="kv-val">${ghost.gameTitle} (${ghost.console})</span></div>
+        <div class="kv-row"><span class="kv-label">Jeu &amp; Console</span><span class="kv-val">${escapeHtml(ghost.gameTitle)} (${escapeHtml(ghost.console)})</span></div>
         <div class="kv-row"><span class="kv-label">Trace Déterministe</span><span class="kv-val mono" style="color:var(--status-ok)">Vérifié (${ghost.framesCount} frames)</span></div>
         <div style="margin-top:10px; display:flex; justify-content:flex-end;">
           <button class="btn mono" style="font-size:11px; border-color:var(--accent-primary); color:var(--accent-primary);">Défier Fantôme TAS</button>
@@ -1250,26 +1317,108 @@ function renderNetplayAndCores() {
   if (coresGrid) {
     coresGrid.innerHTML = "";
 
-    const activeGame = getSelectedGame();
-    const activeConsole = activeGame ? String(activeGame.console || "").toUpperCase() : "";
+    const vault = state.switchVault || {};
+    const keys = vault.keys || {};
+    const prodOk = Boolean(keys.prodKeysFound);
+    const titleOk = Boolean(keys.titleKeysFound);
 
+    // 1. Coffre Switch (Option A)
+    const vaultCard = document.createElement("div");
+    vaultCard.className = "panel-card";
+    vaultCard.innerHTML = `
+      <div class="section-title">
+        <span>Coffre Switch (Option A : Torzu &amp; Fritchii)</span>
+        <button class="btn mono" id="btn-refresh-vault" type="button" style="padding:2px 8px; font-size:10px;">Actualiser</button>
+      </div>
+      <div class="switch-vault-row">
+        <div class="switch-vault-head">
+          <div style="font-weight:600;">Clés Nintendo Switch (prod.keys / title.keys)</div>
+          <span class="pill-badge ${prodOk ? "pill-green" : "pill-terracotta"} mono">
+            ${prodOk ? (titleOk ? "prod + title OK" : "prod.keys OK") : "Clés requises"}
+          </span>
+        </div>
+        <div class="mono path-ellipsis" style="font-size:10.5px; color:${prodOk ? "var(--status-ok)" : "var(--text-muted)"};" title="${escapeHtml(keys.prodKeysPath || keys.keysDir || "")}">
+          ${
+            prodOk
+              ? `prod.keys : ${escapeHtml(keys.prodKeysPath)}`
+              : "Importez manuellement vos fichiers prod.keys / title.keys (synchronisés à chaque lancement)."
+          }
+        </div>
+        <div class="vault-actions">
+          <button class="btn btn-primary mono" id="btn-import-switch-keys" type="button" style="padding:4px 9px; font-size:11px;">
+            Importer Clés (.keys)...
+          </button>
+        </div>
+      </div>
+      <div id="vault-engines-wrap"></div>
+      ${
+        vault.vaultRoot
+          ? `<div class="mono path-ellipsis" style="margin-top:8px; font-size:10px; color:var(--text-muted);" title="${escapeHtml(vault.vaultRoot)}">Coffre : ${escapeHtml(vault.vaultRoot)}</div>`
+          : ""
+      }
+    `;
+    vaultCard.querySelector("#btn-refresh-vault")?.addEventListener("click", async () => {
+      const boot = await invokeBackend("refresh_switch_vault");
+      if (boot) {
+        applyBootstrap(boot);
+        showToast("État du coffre Switch actualisé.", "ok");
+      }
+    });
+    vaultCard.querySelector("#btn-import-switch-keys")?.addEventListener("click", (ev) => {
+      handleImportSwitchKeys(ev.currentTarget);
+    });
+    const enginesWrap = vaultCard.querySelector("#vault-engines-wrap");
+    if (enginesWrap) {
+      enginesWrap.appendChild(
+        buildSwitchEngineBlock(vault.torzu, "torzu", "Torzu (Nintendo Switch 1)")
+      );
+      enginesWrap.appendChild(
+        buildSwitchEngineBlock(vault.fritchii, "fritchii", "Fritchii / Lichii (Switch 2)")
+      );
+    }
+
+    // 2. Cœurs Natifs Rust Purs
+    const nativeCard = document.createElement("div");
+    nativeCard.className = "panel-card";
+    nativeCard.innerHTML = `<div class="section-title"><span>Cœurs Natifs Rust Purs (Viewport 60 Hz)</span></div>`;
+    for (const c of state.nativeCores || []) {
+      const row = document.createElement("div");
+      row.className = "mod-item";
+      row.innerHTML = `
+        <div style="min-width:0; flex:1;">
+          <div style="font-weight:600; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+            <span>${escapeHtml(c.name)}</span>
+            <span class="pill-badge mono" style="font-size:9.5px;">${escapeHtml(c.consoles)}</span>
+          </div>
+          <div class="mono" style="font-size:10.5px; color:var(--accent-primary);">${escapeHtml(c.engine)}</div>
+          <div style="font-size:11px; color:var(--text-secondary);">${escapeHtml(c.audioSummary)}</div>
+          ${
+            c.limitations
+              ? `<div style="font-size:10.5px; color:var(--accent-secondary); margin-top:2px;">${escapeHtml(c.limitations)}</div>`
+              : ""
+          }
+        </div>
+        <span class="pill-badge pill-green mono">ACTIF</span>
+      `;
+      nativeCard.appendChild(row);
+    }
+
+    // 3. Importation & Dossiers ROMs (manuel uniquement)
     const foldersCard = document.createElement("div");
     foldersCard.className = "panel-card";
     foldersCard.innerHTML = `
       <div class="section-title">
-        <span>Dossiers de Jeux &amp; Scan (jeuxyuzu / RomStation)</span>
+        <span>Importation &amp; Dossiers ROMs (Manuel)</span>
         <span class="mono" style="font-size:10px; color:var(--text-muted);">${state.romDirectories.length} dossier(s)</span>
       </div>
-      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;">
+      <div class="vault-actions" style="margin-bottom:10px;">
         <button class="btn btn-primary" id="btn-cores-import-files" type="button">Importer fichiers...</button>
         <button class="btn" id="btn-cores-scan-folder" type="button">Scanner un dossier...</button>
-        <button class="btn" id="btn-cores-scan-known" type="button">Auto-détecter maintenant</button>
       </div>
-      <div id="cores-discovered-folders"></div>
       ${
         state.romDirectories.length > 0
-          ? `<div style="margin-top:10px; padding-top:8px; border-top:1px solid var(--border-subtle);">
-               <div class="mono" style="font-size:10px; color:var(--text-muted); margin-bottom:4px;">DOSSIERS ENREGISTRÉS</div>
+          ? `<div style="padding-top:8px; border-top:1px solid var(--border-subtle);">
+               <div class="mono" style="font-size:10px; color:var(--text-muted); margin-bottom:4px;">DOSSIERS SCANNÉS</div>
                ${state.romDirectories
                  .map(
                    (dir) =>
@@ -1277,12 +1426,12 @@ function renderNetplayAndCores() {
                  )
                  .join("")}
              </div>`
-          : ""
+          : `<div class="empty-list-hint">Aucun scan automatique au démarrage. Ajoutez vos fichiers ou dossiers manuellement, ou par glisser-déposer.</div>`
       }
       ${
         state.lastScanReport
           ? `<div class="mono" style="margin-top:10px; font-size:10.5px; color:var(--text-secondary);">
-               Dernier scan (${escapeHtml(state.lastScanReport.scannedRoot)}) : ${state.lastScanReport.importedEntries?.length || 0} importé(s) · ${state.lastScanReport.skippedFiles || 0} ignoré(s)
+               Dernier import (${escapeHtml(state.lastScanReport.scannedRoot)}) : ${state.lastScanReport.importedEntries?.length || 0} importé(s) · ${state.lastScanReport.skippedFiles || 0} ignoré(s)
              </div>`
           : ""
       }
@@ -1293,141 +1442,16 @@ function renderNetplayAndCores() {
     foldersCard.querySelector("#btn-cores-scan-folder")?.addEventListener("click", () => {
       handleScanFolderTrigger();
     });
-    foldersCard.querySelector("#btn-cores-scan-known")?.addEventListener("click", () => {
-      handleScanKnownTrigger();
-    });
-    const discWrap = foldersCard.querySelector("#cores-discovered-folders");
-    if (discWrap) {
-      if ((state.discoveredFolders || []).length === 0) {
-        discWrap.innerHTML = `<div class="empty-list-hint">Aucun dossier jeuxyuzu ou RomStation auto-détecté pour l'instant. Utilisez « Scanner un dossier... » ou glissez-déposez un dossier dans l'application.</div>`;
-      } else {
-        for (const f of state.discoveredFolders) {
-          const row = document.createElement("div");
-          row.className = "mod-item";
-          row.innerHTML = `
-            <div style="min-width:0; flex:1;">
-              <div style="font-weight:600">${escapeHtml(f.label)}</div>
-              <div class="mono path-ellipsis" style="font-size:10.5px; color:var(--text-muted);" title="${escapeHtml(f.path)}">${escapeHtml(f.path)}</div>
-              <div class="mono" style="font-size:10px; color:var(--accent-primary);">${escapeHtml(f.hint)}</div>
-            </div>
-            <button class="btn mono" type="button" style="padding:4px 10px; font-size:11px;">Scanner</button>
-          `;
-          row.querySelector("button")?.addEventListener("click", async () => {
-            const boot = await invokeBackend("scan_rom_directory", { dirPath: f.path });
-            if (boot) {
-              applyBootstrap(boot);
-              const added = boot.lastScanReport?.importedEntries?.length || 0;
-              showToast(
-                added > 0
-                  ? `${added} jeu(x) trouvé(s) dans ${f.label}`
-                  : `Dossier ${f.label} scanné`,
-                added > 0 ? "ok" : "info"
-              );
-            }
-          });
-          discWrap.appendChild(row);
-        }
-      }
-    }
 
-    const extCard = document.createElement("div");
-    extCard.className = "panel-card";
-    const prodOk = Boolean(state.switchKeys?.prodKeysFound);
-    const titleOk = Boolean(state.switchKeys?.titleKeysFound);
-    extCard.innerHTML = `
-      <div class="section-title">
-        <span>Switch (prod.keys) &amp; Émulateurs Externes</span>
-        <button class="btn mono" id="btn-refresh-ext-env" type="button" style="padding:2px 8px; font-size:10px;">Actualiser</button>
-      </div>
-      <div class="mod-item">
-        <div style="min-width:0; flex:1;">
-          <div class="mono" style="font-weight:600">Clés Nintendo Switch (prod.keys / title.keys)</div>
-          <div class="mono path-ellipsis" style="font-size:10.5px; color:${prodOk ? "var(--status-ok)" : "var(--accent-secondary)"};" title="${escapeHtml(state.switchKeys?.prodKeysPath || "")}">
-            ${
-              prodOk
-                ? `prod.keys : ${escapeHtml(state.switchKeys.prodKeysPath)}`
-                : "prod.keys absent des dossiers Yuzu / Eden / Ryujinx standard"
-            }
-          </div>
-        </div>
-        <span class="pill-badge ${prodOk ? "pill-green" : "pill-terracotta"} mono">
-          ${prodOk ? (titleOk ? "prod + title OK" : "prod.keys OK") : "Clés requises"}
-        </span>
-      </div>
-      <div id="cores-external-list"></div>
-    `;
-    extCard.querySelector("#btn-refresh-ext-env")?.addEventListener("click", async () => {
-      const boot = await invokeBackend("refresh_external_environment");
-      if (boot) {
-        applyBootstrap(boot);
-        showToast("Environnement d'émulateurs externes actualisé.", "ok");
-      }
-    });
-    const extList = extCard.querySelector("#cores-external-list");
-    if (extList) {
-      if ((state.externalEmulators || []).length === 0) {
-        extList.innerHTML = `<div class="empty-list-hint">Lancez l'application desktop pour détecter Yuzu, Eden, Sudachi, Citron, Ryujinx, melonDS, DeSmuME et RetroArch.</div>`;
-      } else {
-        for (const emu of state.externalEmulators) {
-          const supportsActive =
-            Boolean(activeConsole) &&
-            Array.isArray(emu.supportedConsoles) &&
-            emu.supportedConsoles.map((c) => String(c).toUpperCase()).includes(activeConsole);
-          const row = document.createElement("div");
-          row.className = "mod-item";
-          row.innerHTML = `
-            <div style="min-width:0; flex:1;">
-              <div style="font-weight:600; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-                <span>${escapeHtml(emu.name)}</span>
-                <span class="pill-badge mono" style="font-size:9.5px;">${escapeHtml((emu.supportedConsoles || []).join(", "))}</span>
-              </div>
-              <div class="mono path-ellipsis" style="font-size:10.5px; color:${emu.installed ? "var(--status-ok)" : "var(--text-muted)"};" title="${escapeHtml(emu.executablePath || "")}">
-                ${
-                  emu.installed && emu.executablePath
-                    ? escapeHtml(emu.executablePath)
-                    : "Non détecté automatiquement — localisez l'exécutable"
-                }
-              </div>
-              <div style="font-size:10.5px; color:var(--text-muted);">${escapeHtml(emu.notes)}</div>
-            </div>
-            <div style="display:flex; gap:6px; flex-shrink:0;">
-              <button class="btn mono btn-pick-emu" type="button" style="padding:4px 8px; font-size:11px;">Localiser .exe...</button>
-              ${
-                emu.installed && supportsActive
-                  ? `<button class="btn btn-primary mono btn-launch-emu" type="button" style="padding:4px 8px; font-size:11px;">Lancer</button>`
-                  : ""
-              }
-            </div>
-          `;
-          row.querySelector(".btn-pick-emu")?.addEventListener("click", async () => {
-            if (!tauriInvoke) {
-              showToast("La sélection d'exécutable requiert l'application desktop.", "error");
-              return;
-            }
-            const boot = await invokeBackend("pick_external_emulator", { emuId: emu.id });
-            if (boot) {
-              applyBootstrap(boot);
-              const updated = (boot.externalEmulators || []).find((e) => e.id === emu.id);
-              if (updated?.installed) {
-                showToast(`${emu.name} configuré : ${updated.executablePath}`, "ok");
-              }
-            }
-          });
-          row.querySelector(".btn-launch-emu")?.addEventListener("click", async () => {
-            await launchExternalForActiveGame(emu.id);
-          });
-          extList.appendChild(row);
-        }
-      }
-    }
-
+    // 4. Patchs .IPS Non-Destructifs
     const communityCard = document.createElement("div");
     communityCard.className = "panel-card";
     communityCard.innerHTML = `<div class="section-title"><span>Patchs .IPS Non-Destructifs</span></div>`;
     if ((state.communityMods || []).length === 0) {
       const hint = document.createElement("div");
       hint.className = "empty-list-hint";
-      hint.textContent = "Aucun patch .IPS préchargé. Utilisez « Patch .IPS » dans la barre supérieure pour charger un patch local.";
+      hint.textContent =
+        "Aucun patch .IPS chargé. Utilisez « Patch .IPS » dans la barre supérieure pour appliquer un patch local sans modifier la ROM d'origine.";
       communityCard.appendChild(hint);
     } else {
       for (const mod of state.communityMods) {
@@ -1461,68 +1485,11 @@ function renderNetplayAndCores() {
       }
     }
 
-    const libCard = document.createElement("div");
-    libCard.className = "panel-card";
-    libCard.innerHTML = `<div class="section-title"><span>Hôte Dynamique Libretro C-ABI (libretro.h v1)</span></div>`;
-
-    for (const c of state.libretroCores) {
-      const row = document.createElement("div");
-      row.className = "mod-item";
-      const cid = c.coreId || c.id;
-      const isNative = Boolean(c.isNativeBinary);
-      row.innerHTML = `
-        <div style="min-width:0; flex:1;">
-          <div style="font-weight:600">${escapeHtml(c.displayName)}</div>
-          <div class="mono" style="font-size:11px; color:var(--text-muted)">${escapeHtml(c.libraryWindows)} / ${escapeHtml(c.libraryMacos)}${c.libraryLinux ? ` / ${escapeHtml(c.libraryLinux)}` : ""}</div>
-          <div class="mono" style="font-size:10.5px; color:${isNative ? "var(--status-ok)" : c.installed ? "var(--accent-primary)" : "var(--text-secondary)"};">${escapeHtml(c.statusLabel)}</div>
-          ${
-            c.libraryPath
-              ? `<div class="mono path-ellipsis" style="font-size:10px; color:var(--text-muted);" title="${escapeHtml(c.libraryPath)}">${escapeHtml(c.libraryPath)}</div>`
-              : ""
-          }
-        </div>
-        <div style="display:flex; gap:6px; flex-wrap:wrap; flex-shrink:0;">
-          <button class="btn btn-primary mono btn-core-dl" type="button" style="padding:4px 8px; font-size:11px;">
-            ${isNative ? "Mettre à jour" : "Télécharger (.zip)"}
-          </button>
-          <button class="btn mono btn-core-pick" type="button" style="padding:4px 8px; font-size:11px;">
-            Charger .dll/.so...
-          </button>
-          ${
-            !isNative
-              ? `<button class="btn btn-ghost mono btn-core-stub" type="button" style="padding:4px 8px; font-size:10.5px;" title="Vérifier un stub descripteur hors-ligne">
-                   ${c.installed ? "Stub Actif" : "Stub Dev"}
-                 </button>`
-              : ""
-          }
-        </div>
-      `;
-      row.querySelector(".btn-core-dl")?.addEventListener("click", async (ev) => {
-        await handleDownloadCore(cid, ev.currentTarget);
-      });
-      row.querySelector(".btn-core-pick")?.addEventListener("click", async () => {
-        await handlePickCoreFile(cid);
-      });
-      row.querySelector(".btn-core-stub")?.addEventListener("click", async () => {
-        const boot = await invokeBackend("provision_libretro_core", {
-          coreId: cid,
-          customBytes: null
-        });
-        if (boot) {
-          applyBootstrap(boot);
-        } else {
-          c.installed = true;
-          c.statusLabel = "Descripteur local actif · Ajoutez le binaire natif .dll/.so";
-          renderNetplayAndCores();
-        }
-      });
-      libCard.appendChild(row);
-    }
-
+    // 5. Registre Cryptographique des BIOS
     const biosCard = document.createElement("div");
     biosCard.className = "panel-card";
     biosCard.innerHTML = `
-      <div class="section-title"><span>Registre Cryptographique des BIOS</span></div>
+      <div class="section-title"><span>Registre Cryptographique des BIOS HLE</span></div>
       ${state.biosEntries
         .map(
           (b) => `
@@ -1538,9 +1505,9 @@ function renderNetplayAndCores() {
         .join("")}
     `;
 
+    coresGrid.appendChild(vaultCard);
+    coresGrid.appendChild(nativeCard);
     coresGrid.appendChild(foldersCard);
-    coresGrid.appendChild(extCard);
-    coresGrid.appendChild(libCard);
     coresGrid.appendChild(communityCard);
     coresGrid.appendChild(biosCard);
   }
@@ -1581,21 +1548,13 @@ function applyBootstrap(boot) {
         : state.pgxpSubpixel;
   state.sramHexInspection = boot.sramHexInspection || state.sramHexInspection;
   state.tournamentBracket = boot.tournamentBracket || state.tournamentBracket;
-  state.libretroCores = Array.isArray(boot.libretroCores)
-    ? boot.libretroCores
-    : state.libretroCores;
+  state.nativeCores = Array.isArray(boot.nativeCores) ? boot.nativeCores : state.nativeCores;
   state.biosEntries = Array.isArray(boot.biosEntries) ? boot.biosEntries : state.biosEntries;
   state.linkTelemetry = boot.linkTelemetry || { enabled: false, packetsTransferred: 0 };
-  state.discoveredFolders = Array.isArray(boot.discoveredFolders)
-    ? boot.discoveredFolders
-    : state.discoveredFolders;
   state.romDirectories = Array.isArray(boot.romDirectories)
     ? boot.romDirectories
     : state.romDirectories;
-  state.externalEmulators = Array.isArray(boot.externalEmulators)
-    ? boot.externalEmulators
-    : state.externalEmulators;
-  state.switchKeys = boot.switchKeys || state.switchKeys;
+  state.switchVault = boot.switchVault || state.switchVault;
   state.lastScanReport = boot.lastScanReport || state.lastScanReport;
   state.warning = boot.warning || null;
   if (state.warning && state.warning !== lastSurfacedWarning) {
@@ -1665,19 +1624,30 @@ function paintRgbaFrame(canvasId, frame) {
     canvasId.startsWith("canvas-p") && state.upscalerMode !== "OFF"
       ? upscaleFrameIfEnabled(frame, state.upscalerMode)
       : frame;
-  if (canvas.width !== processed.width || canvas.height !== processed.height) {
-    canvas.width = processed.width;
-    canvas.height = processed.height;
+
+  const w = processed.width;
+  const h = processed.height;
+  if (!w || !h || processed.rgba.length !== w * h * 4) return;
+
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
   }
   const ctx = canvas.getContext("2d");
-  const clamped = new Uint8ClampedArray(processed.rgba);
-  if (clamped.length === processed.width * processed.height * 4) {
-    const imgData = new ImageData(clamped, processed.width, processed.height);
-    ctx.putImageData(imgData, 0, 0);
+  let cached = canvasImageCache.get(canvasId);
+  if (!cached || cached.width !== w || cached.height !== h) {
+    cached = {
+      width: w,
+      height: h,
+      imgData: ctx.createImageData(w, h)
+    };
+    canvasImageCache.set(canvasId, cached);
   }
+  cached.imgData.data.set(processed.rgba);
+  ctx.putImageData(cached.imgData, 0, 0);
 }
 
-function renderAudioOscilloscope(freqHz, frameNumber) {
+function renderAudioOscilloscope(freqHz, frameNumber, pcmSamples = null, consoleKind = "") {
   const osc = document.getElementById("audio-oscilloscope-canvas");
   if (!osc) return;
   const ctx = osc.getContext("2d");
@@ -1692,13 +1662,26 @@ function renderAudioOscilloscope(freqHz, frameNumber) {
   ctx.lineTo(w, h / 2);
   ctx.stroke();
 
-  const samples = synthesizeMultiChannelSamples(freqHz || 220, frameNumber, 48);
-  ctx.strokeStyle = freqHz > 0 ? "#7D9B76" : "#3B6EF5";
+  let plotSamples;
+  const hasRealPcm = pcmSamples && pcmSamples.length >= 2;
+  if (hasRealPcm) {
+    const pairCount = pcmSamples.length >> 1;
+    const step = Math.max(1, Math.floor(pairCount / 48));
+    plotSamples = [];
+    for (let i = 0; i < pairCount && plotSamples.length < 48; i += step) {
+      plotSamples.push((pcmSamples[i * 2] + pcmSamples[i * 2 + 1]) * 0.5);
+    }
+  } else {
+    plotSamples = synthesizeMultiChannelSamples(freqHz || 0, frameNumber, 48);
+  }
+
+  ctx.strokeStyle = freqHz > 0 || hasRealPcm ? "#7D9B76" : "#3B6EF5";
   ctx.lineWidth = 1.5;
   ctx.beginPath();
-  for (let i = 0; i < samples.length; i++) {
-    const x = (i / Math.max(1, samples.length - 1)) * w;
-    const y = h / 2 - samples[i] * (h * 0.42);
+  for (let i = 0; i < plotSamples.length; i++) {
+    const x = (i / Math.max(1, plotSamples.length - 1)) * w;
+    const clamped = Math.max(-1, Math.min(1, plotSamples[i] * 1.4));
+    const y = h / 2 - clamped * (h * 0.42);
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   }
@@ -1706,31 +1689,28 @@ function renderAudioOscilloscope(freqHz, frameNumber) {
 }
 
 function detectConsoleFromExtension(lowerName) {
+  if (lowerName.endsWith(".nx") || lowerName.endsWith(".nup")) {
+    return { console: "SWITCH2", coreId: "fritchii-external" };
+  }
   if (
     lowerName.endsWith(".nsp") ||
     lowerName.endsWith(".xci") ||
     lowerName.endsWith(".nsz") ||
     lowerName.endsWith(".xcz") ||
-    lowerName.endsWith(".nro")
+    lowerName.endsWith(".nro") ||
+    lowerName.endsWith(".nso")
   ) {
-    return { console: "SWITCH", coreId: "yuzu-external" };
+    return { console: "SWITCH", coreId: "torzu-external" };
   }
-  if (lowerName.endsWith(".nes")) return { console: "NES", coreId: "zaimule-rust-nes" };
-  if (lowerName.endsWith(".sfc") || lowerName.endsWith(".smc"))
-    return { console: "SNES", coreId: "zaimule-rust-snes" };
-  if (lowerName.endsWith(".z64") || lowerName.endsWith(".n64") || lowerName.endsWith(".v64"))
-    return { console: "N64", coreId: "zaimule-rust-n64" };
-  if (lowerName.endsWith(".md") || lowerName.endsWith(".gen") || lowerName.endsWith(".smd"))
-    return { console: "MEGADRIVE", coreId: "zaimule-rust-md" };
   if (lowerName.endsWith(".gba")) return { console: "GBA", coreId: "zaimule-rust-gba" };
-  if (lowerName.endsWith(".nds")) return { console: "NDS", coreId: "melonds_libretro" };
-  if (lowerName.endsWith(".cue") || lowerName.endsWith(".bin") || lowerName.endsWith(".psx"))
-    return { console: "PS1", coreId: "zaimule-rust-ps1" };
-  if (lowerName.endsWith(".iso") || lowerName.endsWith(".cso"))
-    return { console: "PSP", coreId: "zaimule-rust-psp" };
-  if (lowerName.endsWith(".ch8")) return { console: "CHIP8", coreId: "zaimule-rust-chip8" };
-  if (lowerName.endsWith(".gb")) return { console: "GB", coreId: "zaimule-rust-gb" };
-  return { console: "GBC", coreId: "zaimule-rust-gb" };
+  if (lowerName.endsWith(".nds") || lowerName.endsWith(".srl")) {
+    return { console: "NDS", coreId: "zaimule-rust-nds" };
+  }
+  if (lowerName.endsWith(".gb") || lowerName.endsWith(".dmg")) {
+    return { console: "GB", coreId: "zaimule-rust-gb" };
+  }
+  if (lowerName.endsWith(".gbc")) return { console: "GBC", coreId: "zaimule-rust-gb" };
+  return null;
 }
 
 const MAX_WEB_ROM_READ_BYTES = 128 * 1024 * 1024;
@@ -1738,6 +1718,16 @@ const MAX_WEB_ROM_READ_BYTES = 128 * 1024 * 1024;
 async function handleImportedFile(file, options = {}) {
   if (!file) return;
   const lower = file.name.toLowerCase();
+
+  if (lower.endsWith(".keys")) {
+    showToast(
+      "Importez prod.keys / title.keys depuis l'onglet « Cœurs & Switch » (ou glissez le fichier dans l'application desktop).",
+      "info",
+      6000
+    );
+    switchTab("view-cores");
+    return;
+  }
 
   if (file.size > MAX_WEB_ROM_READ_BYTES) {
     if (tauriInvoke) {
@@ -1748,24 +1738,34 @@ async function handleImportedFile(file, options = {}) {
       );
     } else {
       const detected = detectConsoleFromExtension(lower);
-      const isSwitch = detected.console === "SWITCH";
+      if (!detected) {
+        showToast(
+          `Format non pris en charge : ${file.name}. Formats : .gb, .gbc, .gba, .nds, .nsp, .xci, .nx, .nup, .zip, .7z.`,
+          "error"
+        );
+        return;
+      }
+      const isSwitch = detected.console === "SWITCH" || detected.console === "SWITCH2";
       const newId = `rom-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
       state.catalog.unshift({
         id: newId,
         title: file.name.replace(/\.[^.]+$/, ""),
         console: detected.console,
         engineKind: isSwitch ? "externalLauncher" : "nativeRust",
+        switchEngine: "auto",
         coreId: detected.coreId,
         region: "Import Local",
         crc32Hex: "00000000",
         sizeBytes: file.size,
         fastFingerprint: true,
         sramSummary: isSwitch
-          ? "Sauvegarde Yuzu / Eden / Ryujinx"
+          ? detected.console === "SWITCH2"
+            ? "Sauvegarde Fritchii (Switch 2)"
+            : "Sauvegarde Torzu (Switch 1)"
           : "32 Ko SRAM Atomique (.tmp → .srm)",
         playtimeSeconds: 0,
         favorite: true,
-        linkCableReady: !isSwitch
+        linkCableReady: !isSwitch && detected.console !== "NDS"
       });
       state.activeGameId = newId;
       updateAllViews();
@@ -1811,25 +1811,35 @@ async function handleImportedFile(file, options = {}) {
   if (boot) {
     applyBootstrap(boot);
   } else if (!tauriInvoke) {
-    const newId = `rom-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
     const detected = detectConsoleFromExtension(lower);
-    const isSwitch = detected.console === "SWITCH";
+    if (!detected) {
+      showToast(
+        `Format non pris en charge : ${file.name}. Formats : .gb, .gbc, .gba, .nds, .nsp, .xci, .nx, .nup, .zip, .7z.`,
+        "error"
+      );
+      return;
+    }
+    const newId = `rom-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const isSwitch = detected.console === "SWITCH" || detected.console === "SWITCH2";
     const crc32Hex = computeCrc32Hex(bytes);
     state.catalog.unshift({
       id: newId,
       title: file.name.replace(/\.[^.]+$/, ""),
       console: detected.console,
       engineKind: isSwitch ? "externalLauncher" : "nativeRust",
+      switchEngine: "auto",
       coreId: detected.coreId,
       region: "Import Local",
       crc32Hex,
       sizeBytes: bytes.length,
       sramSummary: isSwitch
-        ? "Sauvegarde Yuzu / Eden / Ryujinx"
+        ? detected.console === "SWITCH2"
+          ? "Sauvegarde Fritchii (Switch 2)"
+          : "Sauvegarde Torzu (Switch 1)"
         : "32 Ko SRAM Atomique (.tmp → .srm)",
       playtimeSeconds: 0,
       favorite: true,
-      linkCableReady: !isSwitch
+      linkCableReady: !isSwitch && detected.console !== "NDS"
     });
     state.activeGameId = newId;
     updateAllViews();
@@ -1891,122 +1901,116 @@ async function refreshDebuggerDrawer() {
 }
 
 async function tickEmulationLoop() {
-  const buttonsP1 = computeBitmaskFromPressedCodes(pressedKeys) | pollGamepadBitmask();
-  await handleBigPictureNavigation(buttonsP1);
-
-  const activeGame = getSelectedGame();
-  const isExternalGame = Boolean(
-    activeGame &&
-      (String(activeGame.console || "").toUpperCase() === "SWITCH" ||
-        activeGame.engineKind === "externalLauncher")
-  );
-
-  if (!state.isEmulationRunning || !activeGame || isExternalGame) {
-    if (isExternalGame && state.isEmulationRunning) {
-      state.isEmulationRunning = false;
-      hideEmuBanner();
-    }
+  if (stepInFlight) {
     requestAnimationFrame(tickEmulationLoop);
     return;
   }
+  stepInFlight = true;
+  try {
+    const buttonsP1 = computeBitmaskFromPressedCodes(pressedKeys) | pollGamepadBitmask();
+    await handleBigPictureNavigation(buttonsP1);
 
-  if (state.debuggerPaused && !state.stepOnceRequested) {
-    requestAnimationFrame(tickEmulationLoop);
-    return;
-  }
-  state.stepOnceRequested = false;
+    const activeGame = getSelectedGame();
+    const isSwitch = isSwitchGame(activeGame);
 
-  if (state.recordingMacro) {
-    state.recordedFrames.push(buttonsP1);
-  }
-
-  const resp = await invokeBackend(
-    "step_viewport",
-    {
-      buttonsP1,
-      buttonsP2: 0,
-      turboActive: true
-    },
-    { silent: true }
-  );
-
-  if (resp && resp.primary) {
-    state.currentFrame = resp.primary.frameNumber || state.currentFrame + 1;
-    paintRgbaFrame("canvas-p1", resp.primary);
-    if (resp.secondary) {
-      paintRgbaFrame("canvas-p2", resp.secondary);
-    }
-    if (resp.tertiary) {
-      paintRgbaFrame("canvas-p3", resp.tertiary);
-    } else if (state.quadLinkMode) {
-      paintRgbaFrame("canvas-p3", resp.primary);
-    }
-    if (resp.quaternary) {
-      paintRgbaFrame("canvas-p4", resp.quaternary);
-    } else if (state.quadLinkMode) {
-      paintRgbaFrame("canvas-p4", resp.primary);
+    if (!state.isEmulationRunning || !activeGame || isSwitch) {
+      if (isSwitch && state.isEmulationRunning) {
+        state.isEmulationRunning = false;
+        hideEmuBanner();
+      }
+      return;
     }
 
-    renderAudioOscilloscope(resp.primary.audioFreqHz || 0, resp.primary.frameNumber);
+    if (state.debuggerPaused && !state.stepOnceRequested) {
+      return;
+    }
+    state.stepOnceRequested = false;
 
-    if (resp.primary.audioFreqHz) {
-      apuAudio.triggerFrameTone(resp.primary.audioFreqHz);
-      if (resp.primary.audioFreqHz >= 1200) {
-        triggerGamepadRumble(getConnectedGamepad(), 55, 0.35, 0.65);
+    if (state.recordingMacro) {
+      state.recordedFrames.push(buttonsP1);
+    }
+
+    const rawPkt = await invokeBackend(
+      "step_viewport_binary",
+      {
+        buttonsP1,
+        buttonsP2: 0,
+        turboActive: true,
+        speedMult: state.speedMult
+      },
+      { silent: true }
+    );
+
+    if (rawPkt) {
+      const pkt = decodeViewportBinaryPacket(rawPkt);
+      const primary = pkt.views[0];
+      if (primary) {
+        state.currentFrame = pkt.frameNumber || state.currentFrame + 1;
+        paintRgbaFrame("canvas-p1", primary);
+        if (pkt.views[1]) {
+          paintRgbaFrame("canvas-p2", pkt.views[1]);
+        }
+        if (pkt.views[2]) {
+          paintRgbaFrame("canvas-p3", pkt.views[2]);
+        } else if (state.quadLinkMode) {
+          paintRgbaFrame("canvas-p3", primary);
+        }
+        if (pkt.views[3]) {
+          paintRgbaFrame("canvas-p4", pkt.views[3]);
+        } else if (state.quadLinkMode) {
+          paintRgbaFrame("canvas-p4", primary);
+        }
+
+        // Draw waveform BEFORE transferring pkt.pcmSamples buffer ownership to AudioWorklet
+        renderAudioOscilloscope(
+          pkt.audioFreqHz || 0,
+          pkt.frameNumber,
+          pkt.pcmSamples,
+          pkt.meta?.console || activeGame.console
+        );
+        apuAudio.pushPcmSamples(pkt.pcmSamples, pkt.sampleRateHz);
+
+        if (pkt.audioFreqHz >= 1200) {
+          triggerGamepadRumble(getConnectedGamepad(), 55, 0.35, 0.65);
+        }
+
+        const meta = pkt.meta || {};
+        if (meta.newlyUnlockedAchievement) {
+          triggerGamepadRumble(getConnectedGamepad(), 140, 0.6, 0.95);
+          showToast(`Succès débloqué : ${meta.newlyUnlockedAchievement}`, "ok");
+          const boot = await invokeBackend("get_station_bootstrap", {}, { silent: true });
+          if (boot) applyBootstrap(boot);
+          else renderInspector();
+        }
+
+        const cpu = meta.cpu || {};
+        const score = cpu.score ?? 0;
+        document.getElementById("emu-score-pill").textContent = `Score : ${score}`;
+        document.getElementById("p1-reg-readout").textContent = `${cpu.arch || "—"} · PC:${cpu.pcHex || "—"}`;
+        document.getElementById("rewind-readout").textContent = `Frame #${pkt.frameNumber}`;
+        document.getElementById("dbg-pc-sp").textContent = `${cpu.pcHex || "—"} / ${cpu.spHex || "—"}`;
+        document.getElementById("dbg-af-bc").textContent = `${cpu.regAHex || "—"} / ${cpu.regBcHex || "—"}`;
+        document.getElementById("dbg-de-hl").textContent = `${cpu.regDeHex || "—"} / ${cpu.regHlHex || "—"}`;
+        document.getElementById("dbg-sio").textContent = `${cpu.serialSbHex || "0x00"} / ${pkt.audioFreqHz || 0} Hz`;
+        document.getElementById("tel-rewind").textContent = `${pkt.rewindSnapshotsCount} clichés (${Math.round(pkt.rewindMemoryBytes / 1024)} Ko)`;
+
+        const link = meta.linkTelemetry;
+        if (link?.enabled) {
+          const modePrefix = link.quadMode ? "4P Tournoi" : "2P Sync";
+          document.getElementById("tel-link").textContent =
+            `${modePrefix} (${link.packetsTransferred} pkts · ${link.lastP1ToP2Hex})`;
+        }
+        if ((pkt.frameNumber & 15) === 1 || state.debuggerPaused) {
+          await refreshDebuggerDrawer();
+        }
       }
     }
-    if (resp.newlyUnlockedAchievement) {
-      triggerGamepadRumble(getConnectedGamepad(), 140, 0.6, 0.95);
-      showToast(`Succès débloqué : ${resp.newlyUnlockedAchievement}`, "ok");
-      const boot = await invokeBackend("get_station_bootstrap", {}, { silent: true });
-      if (boot) applyBootstrap(boot);
-      else renderInspector();
-    }
-    const cpu = resp.primary.cpu;
-    if (cpu?.flagsStr === "NEED_MELONDS_CABI") {
-      showEmuBanner(
-        `need-melonds-${activeGame.id}`,
-        "Cœur melonDS Libretro C-ABI requis pour ce jeu Nintendo DS",
-        `${activeGame.title} (${cpu.regHlHex || "Nitro"}) attend le noyau natif melonDS pour exécuter la cartouche complète, ou un lancement dans un émulateur externe.`,
-        [
-          {
-            label: "Télécharger melonDS C-ABI (Auto)",
-            primary: true,
-            onClick: (btn) => handleDownloadCore("melonds_libretro", btn)
-          },
-          {
-            label: "Charger .dll / .so...",
-            onClick: () => handlePickCoreFile("melonds_libretro")
-          },
-          {
-            label: "Lancer en externe",
-            onClick: () => launchExternalForActiveGame(null)
-          }
-        ]
-      );
-    } else {
-      hideEmuBanner();
-    }
-    const score = cpu.score ?? 0;
-    document.getElementById("emu-score-pill").textContent = `Score : ${score}`;
-    document.getElementById("p1-reg-readout").textContent = `${cpu.arch} · PC:${cpu.pcHex}`;
-    document.getElementById("rewind-readout").textContent = `Frame #${resp.primary.frameNumber}`;
-    document.getElementById("dbg-pc-sp").textContent = `${cpu.pcHex} / ${cpu.spHex}`;
-    document.getElementById("dbg-af-bc").textContent = `${cpu.regAHex} / ${cpu.regBcHex}`;
-    document.getElementById("dbg-de-hl").textContent = `${cpu.regDeHex} / ${cpu.regHlHex}`;
-    document.getElementById("dbg-sio").textContent = `${cpu.serialSbHex} / ${resp.primary.audioFreqHz || 0} Hz`;
-    document.getElementById("tel-rewind").textContent = `${resp.rewindSnapshotsCount} clichés (${Math.round(resp.rewindMemoryBytes / 1024)} Ko)`;
-    if (resp.linkTelemetry?.enabled) {
-      const modePrefix = resp.linkTelemetry.quadMode ? "4P Tournoi" : "2P Sync";
-      document.getElementById("tel-link").textContent =
-        `${modePrefix} (${resp.linkTelemetry.packetsTransferred} pkts · ${resp.linkTelemetry.lastP1ToP2Hex})`;
-    }
-    if ((resp.primary.frameNumber & 15) === 1 || state.debuggerPaused) {
-      await refreshDebuggerDrawer();
-    }
+  } catch (err) {
+    console.warn("[zaimule] Erreur boucle viewport:", err);
+  } finally {
+    stepInFlight = false;
+    requestAnimationFrame(tickEmulationLoop);
   }
-
-  requestAnimationFrame(tickEmulationLoop);
 }
 
 async function setupDragAndDrop() {
@@ -2207,6 +2211,26 @@ function bindEvents() {
     await handleStylusEvent(e, false);
   });
 
+  document.getElementById("insp-switch-engine")?.addEventListener("change", async (e) => {
+    const g = getSelectedGame();
+    if (!g || !isSwitchGame(g)) return;
+    const mode = e.target.value;
+    const boot = await invokeBackend("set_game_switch_engine", {
+      gameId: g.id,
+      mode
+    });
+    if (boot) {
+      applyBootstrap(boot);
+      showToast(
+        `Moteur Switch pour ${g.title} : ${formatSwitchEngineLabel(mode, g.console)}`,
+        "ok"
+      );
+    } else if (!tauriInvoke) {
+      g.switchEngine = mode;
+      updateAllViews();
+    }
+  });
+
   document.getElementById("btn-send-chat")?.addEventListener("click", async () => {
     const inp = document.getElementById("netplay-chat-input");
     const text = inp?.value?.trim();
@@ -2272,8 +2296,6 @@ function bindEvents() {
 
   document.getElementById("btn-import-rom")?.addEventListener("click", () => handleImportRomsTrigger());
   document.getElementById("btn-scan-folder")?.addEventListener("click", () => handleScanFolderTrigger());
-  document.getElementById("btn-scan-known")?.addEventListener("click", () => handleScanKnownTrigger());
-  document.getElementById("btn-insp-external")?.addEventListener("click", () => launchExternalForActiveGame(null));
   document.getElementById("btn-import-ips")?.addEventListener("click", () => ipsInput?.click());
   document.getElementById("btn-insp-ips")?.addEventListener("click", () => ipsInput?.click());
   document.getElementById("btn-import-pack")?.addEventListener("click", () => packInput?.click());
@@ -2348,7 +2370,7 @@ function bindEvents() {
         new TextEncoder().encode(
           JSON.stringify({
             magic: "ZAIMULE_PACK_V1",
-            version: "1.2.0",
+            version: "1.3.0",
             activeGameId: state.activeGameId,
             cheatCodes: state.cheatCodes,
             macros: state.macros
@@ -2505,6 +2527,9 @@ function bindEvents() {
 
   document.getElementById("btn-audio-toggle")?.addEventListener("click", (e) => {
     const on = apuAudio.toggleEnabled();
+    if (on && state.isEmulationRunning) {
+      apuAudio.ensureContext();
+    }
     e.currentTarget.textContent = `Audio APU : ${on ? "ON" : "MUET"}`;
   });
 
@@ -2582,7 +2607,7 @@ function bindEvents() {
       document.getElementById("macro-status").textContent = "ENREGISTREMENT...";
     } else {
       state.recordingMacro = false;
-      e.currentTarget.textContent = "Enregistrer Macro Live";
+      e.currentTarget.textContent = "Enregistrer Séquence Live";
       const frames = state.recordedFrames.length > 0 ? state.recordedFrames : [BTN_A];
       const name = `Combo Live (${frames.length}f)`;
       const boot = await invokeBackend("save_recorded_macro", { name, frames });
@@ -2650,10 +2675,12 @@ function bindEvents() {
   });
 
   document.getElementById("btn-speed-cycle")?.addEventListener("click", (e) => {
-    state.speedMult = state.speedMult === 1 ? 2 : state.speedMult === 2 ? 4 : 1;
-    e.currentTarget.textContent = `Vitesse : ${state.speedMult}.0x`;
+    state.speedMult =
+      state.speedMult === 1 ? 2 : state.speedMult === 2 ? 4 : state.speedMult === 4 ? 8 : 1;
+    e.currentTarget.textContent = `Vitesse : ${state.speedMult}x`;
     if (state.isEmulationRunning) {
-      document.getElementById("tel-fps").textContent = `${(60 * state.speedMult).toFixed(1)} FPS`;
+      document.getElementById("tel-fps").textContent = `${(60 * state.speedMult).toFixed(0)} FPS`;
+      document.getElementById("tel-ft").textContent = `${(16.6 / state.speedMult).toFixed(1)} ms`;
     }
   });
 
@@ -2686,6 +2713,9 @@ function bindEvents() {
     }
     if (e.ctrlKey || e.metaKey || e.altKey) {
       return;
+    }
+    if (state.isEmulationRunning && apuAudio.enabled) {
+      apuAudio.ensureContext();
     }
     pressedKeys.add(e.code);
 
@@ -2756,6 +2786,29 @@ function bindEvents() {
 async function init() {
   bindEvents();
   await setupDragAndDrop();
+
+  if (window.__TAURI__?.event?.listen) {
+    try {
+      await window.__TAURI__.event.listen("switch-session-ended", async (event) => {
+        const p = event?.payload;
+        const boot = await invokeBackend("get_station_bootstrap", {}, { silent: true });
+        if (boot) applyBootstrap(boot);
+        if (p?.elapsedSeconds !== undefined) {
+          const engineLabel = p.target === "fritchii" ? "Fritchii" : "Torzu";
+          const durText =
+            p.elapsedSeconds < 60 ? `${p.elapsedSeconds} s` : formatPlaytime(p.elapsedSeconds);
+          showToast(
+            `Session ${engineLabel} terminée · Temps enregistré : ${durText}.`,
+            "ok",
+            6000
+          );
+        }
+      });
+    } catch (err) {
+      console.warn("[zaimule] Écouteur switch-session-ended indisponible :", err);
+    }
+  }
+
   renderStandbyCanvas();
   updateAllViews();
   const boot = await invokeBackend("get_station_bootstrap");

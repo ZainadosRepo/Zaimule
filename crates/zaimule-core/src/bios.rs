@@ -47,7 +47,7 @@ pub fn verify_bios_bytes(
     }
 }
 
-/// Default BIOS registry with built-in open-source HLE/FreeBIOS fallbacks so every console boots out of the box.
+/// Built-in open-source HLE/FreeBIOS metadata for supported native Rust consoles (`GB/GBC`, `GBA`, `NDS`).
 pub fn default_bios_registry() -> Vec<BiosEntry> {
     vec![
         BiosEntry {
@@ -57,8 +57,7 @@ pub fn default_bios_registry() -> Vec<BiosEntry> {
             expected_crc32_hex: "59C8598E".into(),
             required_for_boot: false,
             status: BiosStatus::FreeBiosBuiltIn,
-            notes: "Boot ROM Rust HLE intégrée (registres AF=0x01B0, PC=0x0100 pré-initialisés)."
-                .into(),
+            notes: "Séquence de démarrage DMG/CGB Rust intégrée (termboy-gb 0.5.0).".into(),
         },
         BiosEntry {
             file_name: "gba_bios.bin".into(),
@@ -67,18 +66,7 @@ pub fn default_bios_registry() -> Vec<BiosEntry> {
             expected_crc32_hex: "81977335".into(),
             required_for_boot: false,
             status: BiosStatus::FreeBiosBuiltIn,
-            notes:
-                "Normmatt Open-Source GBA BIOS actif par défaut ; remplaçable par dump officiel."
-                    .into(),
-        },
-        BiosEntry {
-            file_name: "scph5502.bin".into(),
-            console: ConsoleKind::Ps1,
-            expected_bytes: 524_288,
-            expected_crc32_hex: "D786F0B9".into(),
-            required_for_boot: true,
-            status: BiosStatus::VerifiedOfficial,
-            notes: "BIOS PlayStation 1 Europe (PAL/Multi) vérifié.".into(),
+            notes: "BIOS GBA HLE Rust intégré (termboy-gba 0.5.0, SWI + DMA complets).".into(),
         },
         BiosEntry {
             file_name: "bios7.bin / bios9.bin".into(),
@@ -87,7 +75,9 @@ pub fn default_bios_registry() -> Vec<BiosEntry> {
             expected_crc32_hex: "DF692A80".into(),
             required_for_boot: false,
             status: BiosStatus::FreeBiosBuiltIn,
-            notes: "melonDS FreeBIOS actif pour lancement direct des ROMs NDS.".into(),
+            notes:
+                "BIOS HLE ARM9/ARM7 + key1.bin + firmware synthétique Zaimule (SPU 16 canaux 48 kHz + 3D 4×4/Toon/Decal + PPU affine/étendu)."
+                    .into(),
         },
     ]
 }
