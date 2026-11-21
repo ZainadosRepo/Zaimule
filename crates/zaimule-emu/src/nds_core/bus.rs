@@ -161,6 +161,16 @@ pub trait Bus {
     fn irq_pending(&mut self) -> bool;
     fn ime(&mut self) -> bool;
     fn set_ime(&mut self, on: bool);
+    /// Fast combined check: returns true iff IME is enabled and an enabled IRQ is pending.
+    #[inline(always)]
+    fn irq_takeable(&mut self) -> bool {
+        self.irq_pending() && self.ime()
+    }
+    /// Returns true if watch/I/O-log debug instrumentation is active.
+    #[inline(always)]
+    fn has_debug_hooks(&self) -> bool {
+        true
+    }
     /// Address of the BIOS interrupt-flag mirror word games' IRQ handlers
     /// update (top of DTCM on the ARM9, top of ARM7 WRAM on the ARM7).
     fn bios_flag_addr(&mut self) -> u32;
@@ -177,6 +187,11 @@ static WATCH_ADDR: std::sync::LazyLock<Option<(u32, u32)>> = std::sync::LazyLock
     let len = u32::from_str_radix(len.trim().trim_start_matches("0x"), 16).ok()?;
     Some((a, len))
 });
+
+#[inline]
+pub fn watch_active() -> bool {
+    WATCH_ADDR.is_some()
+}
 
 pub const LCDC_BASE: [u32; 9] = [
     0x0680_0000, // A
@@ -307,20 +322,32 @@ pub struct Machine {
     /// Debug-only I/O access counters (NDS_IOLOG); never part of a savestate.
     #[serde(skip)]
     pub io_log: Option<std::collections::HashMap<(usize, u32, bool), u64>>,
+    /// Cached `WATCH_ADDR.is_some() || io_log.is_some()` so hot bus paths avoid LazyLock atomic checks.
+    #[serde(skip)]
+    pub debug_hooks: bool,
+    #[serde(with = "super::state::raw_bytes")]
     pub main_ram: Vec<u8>, // 4MB at 0x02000000
-    pub wram7: Vec<u8>,    // 64KB ARM7 at 0x03800000
-    pub swram: Vec<u8>,    // 32KB shared at 0x03000000 per WRAMCNT
+    #[serde(with = "super::state::raw_bytes")]
+    pub wram7: Vec<u8>, // 64KB ARM7 at 0x03800000
+    #[serde(with = "super::state::raw_bytes")]
+    pub swram: Vec<u8>, // 32KB shared at 0x03000000 per WRAMCNT
     pub wramcnt: u8,
+    #[serde(with = "super::state::raw_bytes")]
     pub dtcm: Vec<u8>, // 16KB, ARM9, base from CP15
     pub dtcm_base: u32,
+    #[serde(with = "super::state::raw_bytes")]
     pub itcm: Vec<u8>, // 32KB, ARM9, at 0
+    #[serde(with = "super::state::raw_bytes_array")]
     pub vram: [Vec<u8>; 9],
     pub vramcnt: [u8; 9],
+    #[serde(with = "super::state::raw_bytes")]
     pub pal: Vec<u8>, // 2KB: A-BG, A-OBJ, B-BG, B-OBJ
+    #[serde(with = "super::state::raw_bytes")]
     pub oam: Vec<u8>, // 2KB: engine A then B
     /// 2D register blocks: engine A at 0x04000000, B at 0x04001000. Held as
     /// Vecs rather than [[u8; 0x70]; 2] because serde only derives array
     /// support up to 32 elements.
+    #[serde(with = "super::state::raw_bytes_array")]
     pub io2d: [Vec<u8>; 2],
     pub vcount: u16,
     pub keyinput: u16, // 10 bits, active low
@@ -351,6 +378,7 @@ pub struct Machine {
     // SPI bus (ARM7): firmware flash, touchscreen, power management.
     pub spicnt: u16,
     pub spi_out: u8,
+    #[serde(with = "super::state::raw_bytes")]
     pub firmware: Vec<u8>,
     spi_phase: u8, // 0 = command, 1 = address, 2 = data
     spi_cmd: u8,
@@ -385,6 +413,7 @@ pub struct Machine {
     pub cart_left: usize,
     cart_kind: u8, // 0 = rom data, 1 = chip id, 2 = ones
     // AUXSPI backup chip (serial flash FSM, 512KB space).
+    #[serde(with = "super::state::raw_bytes")]
     pub save: Vec<u8>,
     pub auxspi_out: u8,
     aux_phase: u8, // 0 cmd, 1 addr, 2 data
@@ -431,11 +460,14 @@ pub struct Machine {
     pub gx_cmds: u64,
     /// WiFi register block 0x04800000-0x0480FFFF (ARM7): RAM-backed so init
     /// handshakes read back what they wrote; a few IDs/status special-cased.
+    #[serde(with = "super::state::raw_bytes")]
     pub wifi: Vec<u8>,
     /// HLE BIOS IRQ dispatch stubs (0x40 bytes each, Vec for the same serde
     /// reason as io2d). The ARM9 one is patched in place whenever CP15 moves
     /// DTCM, so a savestate must carry the patched bytes, not rebuild them.
+    #[serde(with = "super::state::raw_bytes")]
     pub stub9: Vec<u8>,
+    #[serde(with = "super::state::raw_bytes")]
     pub stub7: Vec<u8>,
     pub last_pc: [u32; 2],
     /// Scanline counter since boot, for event timestamps in debug logs.
@@ -635,9 +667,12 @@ fn build_stub(handler_ptr_plus4: u32) -> Vec<u8> {
 
 impl Machine {
     pub fn new() -> Self {
+        let io_log = std::env::var("NDS_IOLOG").ok().map(|_| Default::default());
+        let debug_hooks = WATCH_ADDR.is_some() || io_log.is_some();
         Self {
             rom: Vec::new(),
-            io_log: std::env::var("NDS_IOLOG").ok().map(|_| Default::default()),
+            io_log,
+            debug_hooks,
             main_ram: vec![0; 0x40_0000],
             wram7: vec![0; 0x1_0000],
             swram: vec![0; 0x8000],
@@ -1718,26 +1753,88 @@ impl View {
                 (m.cart_left as u32 / 4).max(1)
             };
         }
-        for _ in 0..len {
-            if kind == DMA_CART {
-                let v = { self.m.borrow_mut().cart_read_word(cpu) };
-                self.write32(dst, v);
-            } else if word {
-                let v = self.read32(src);
-                self.write32(dst, v);
+        let mut fast_done = false;
+        if kind == DMA_CART && (dst_ctl == 0 || dst_ctl == 3) && (dst >> 24) == 0x02 {
+            let mut m = self.m.borrow_mut();
+            let byte_len = (len as usize).saturating_mul(4);
+            let dst_aligned = dst & !3;
+            let dst_off = (dst_aligned & 0x3F_FFFF) as usize;
+            let dtcm_hit = cpu == 0
+                && dst_aligned < m.dtcm_base.wrapping_add(0x4000)
+                && dst_aligned.wrapping_add(byte_len as u32) > m.dtcm_base;
+            if !m.debug_hooks
+                && !dtcm_hit
+                && m.cart_kind == 0
+                && m.cart_left == byte_len
+                && byte_len > 0
+                && (m.cart_addr & 0xFFF) + byte_len <= 0x1000
+                && m.cart_addr + byte_len <= m.rom.len()
+                && dst_off + byte_len <= m.main_ram.len()
+            {
+                let ca = m.cart_addr;
+                let Machine { rom, main_ram, .. } = &mut *m;
+                main_ram[dst_off..dst_off + byte_len].copy_from_slice(&rom[ca..ca + byte_len]);
+                m.cart_addr = (ca & !0xFFF) | ((ca + byte_len) & 0xFFF);
+                m.cart_left = 0;
+                m.romctrl &= !0x8080_0000;
+                if m.auxspicnt & 0x4000 != 0 {
+                    m.request_irq(cpu, 1 << 19);
+                }
+                dst = dst.wrapping_add(len.wrapping_mul(4));
+                fast_done = true;
+            }
+        } else if kind != DMA_CART
+            && len >= 4
+            && (src_ctl == 0 || src_ctl == 2)
+            && (dst_ctl == 0 || dst_ctl == 3)
+        {
+            let byte_len = (len as usize).saturating_mul(step as usize);
+            let mask = !(step - 1);
+            let src_a = src & mask;
+            let dst_a = dst & mask;
+            if src_ctl == 0 {
+                let mut m = self.m.borrow_mut();
+                if Self::try_fast_dma_copy(&mut m, cpu, src_a, dst_a, byte_len) {
+                    src = src.wrapping_add(len.wrapping_mul(step));
+                    dst = dst.wrapping_add(len.wrapping_mul(step));
+                    fast_done = true;
+                }
             } else {
-                let v = self.read16(src);
-                self.write16(dst, v);
+                // Fixed-source fill (e.g. VRAM/RAM clear).
+                let fill_val = if word {
+                    self.read32(src_a)
+                } else {
+                    self.read16(src_a) as u32
+                };
+                let mut m = self.m.borrow_mut();
+                if Self::try_fast_dma_fill(&mut m, cpu, dst_a, byte_len, word, fill_val) {
+                    dst = dst.wrapping_add(len.wrapping_mul(step));
+                    fast_done = true;
+                }
             }
-            match src_ctl {
-                0 => src = src.wrapping_add(step),
-                1 => src = src.wrapping_sub(step),
-                _ => {}
-            }
-            match dst_ctl {
-                0 | 3 => dst = dst.wrapping_add(step),
-                1 => dst = dst.wrapping_sub(step),
-                _ => {}
+        }
+        if !fast_done {
+            for _ in 0..len {
+                if kind == DMA_CART {
+                    let v = { self.m.borrow_mut().cart_read_word(cpu) };
+                    self.write32(dst, v);
+                } else if word {
+                    let v = self.read32(src);
+                    self.write32(dst, v);
+                } else {
+                    let v = self.read16(src);
+                    self.write16(dst, v);
+                }
+                match src_ctl {
+                    0 => src = src.wrapping_add(step),
+                    1 => src = src.wrapping_sub(step),
+                    _ => {}
+                }
+                match dst_ctl {
+                    0 | 3 => dst = dst.wrapping_add(step),
+                    1 => dst = dst.wrapping_sub(step),
+                    _ => {}
+                }
             }
         }
         let mut m = self.m.borrow_mut();
@@ -1754,6 +1851,143 @@ impl View {
         if !repeat {
             m.dma_cnt[cpu][ch] &= !0x8000_0000;
         }
+    }
+
+    fn try_fast_dma_copy(m: &mut Machine, cpu: usize, src: u32, dst: u32, byte_len: usize) -> bool {
+        if m.debug_hooks || byte_len == 0 || byte_len > 0x40_0000 {
+            return false;
+        }
+        let overlaps_dtcm = |a: u32| -> bool {
+            cpu == 0
+                && a < m.dtcm_base.wrapping_add(0x4000)
+                && a.wrapping_add(byte_len as u32) > m.dtcm_base
+        };
+        if overlaps_dtcm(src) || overlaps_dtcm(dst) {
+            return false;
+        }
+        let src_hi = src >> 24;
+        let dst_hi = dst >> 24;
+        if src_hi == 0x02 {
+            let so = (src & 0x3F_FFFF) as usize;
+            if so + byte_len > m.main_ram.len() {
+                return false;
+            }
+            match dst_hi {
+                0x02 => {
+                    let doff = (dst & 0x3F_FFFF) as usize;
+                    if doff + byte_len > m.main_ram.len() {
+                        return false;
+                    }
+                    if doff <= so || doff >= so + byte_len {
+                        m.main_ram.copy_within(so..so + byte_len, doff);
+                        return true;
+                    }
+                }
+                0x05 if cpu == 0 => {
+                    let doff = (dst & 0x7FF) as usize;
+                    if doff + byte_len <= m.pal.len() {
+                        m.pal[doff..doff + byte_len]
+                            .copy_from_slice(&m.main_ram[so..so + byte_len]);
+                        return true;
+                    }
+                }
+                0x07 if cpu == 0 => {
+                    let doff = (dst & 0x7FF) as usize;
+                    if doff + byte_len <= m.oam.len() {
+                        m.oam[doff..doff + byte_len]
+                            .copy_from_slice(&m.main_ram[so..so + byte_len]);
+                        return true;
+                    }
+                }
+                0x06 => {
+                    let slot = if cpu == 0 {
+                        m.vram_slot(dst)
+                    } else {
+                        m.vram_arm7_slot(dst)
+                    };
+                    if let Some((b, doff)) = slot {
+                        if doff + byte_len <= m.vram[b].len() {
+                            let Machine { main_ram, vram, .. } = &mut *m;
+                            vram[b][doff..doff + byte_len]
+                                .copy_from_slice(&main_ram[so..so + byte_len]);
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn try_fast_dma_fill(
+        m: &mut Machine,
+        cpu: usize,
+        dst: u32,
+        byte_len: usize,
+        word: bool,
+        fill_val: u32,
+    ) -> bool {
+        if m.debug_hooks || byte_len == 0 || byte_len > 0x40_0000 {
+            return false;
+        }
+        if cpu == 0
+            && dst < m.dtcm_base.wrapping_add(0x4000)
+            && dst.wrapping_add(byte_len as u32) > m.dtcm_base
+        {
+            return false;
+        }
+        let target: &mut [u8] = match dst >> 24 {
+            0x02 => {
+                let doff = (dst & 0x3F_FFFF) as usize;
+                if doff + byte_len > m.main_ram.len() {
+                    return false;
+                }
+                &mut m.main_ram[doff..doff + byte_len]
+            }
+            0x05 if cpu == 0 => {
+                let doff = (dst & 0x7FF) as usize;
+                if doff + byte_len > m.pal.len() {
+                    return false;
+                }
+                &mut m.pal[doff..doff + byte_len]
+            }
+            0x07 if cpu == 0 => {
+                let doff = (dst & 0x7FF) as usize;
+                if doff + byte_len > m.oam.len() {
+                    return false;
+                }
+                &mut m.oam[doff..doff + byte_len]
+            }
+            0x06 => {
+                let slot = if cpu == 0 {
+                    m.vram_slot(dst)
+                } else {
+                    m.vram_arm7_slot(dst)
+                };
+                match slot {
+                    Some((b, doff)) if doff + byte_len <= m.vram[b].len() => {
+                        &mut m.vram[b][doff..doff + byte_len]
+                    }
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        };
+        if fill_val == 0 {
+            target.fill(0);
+        } else if word {
+            let pat = fill_val.to_le_bytes();
+            for chunk in target.chunks_exact_mut(4) {
+                chunk.copy_from_slice(&pat);
+            }
+        } else {
+            let pat = (fill_val as u16).to_le_bytes();
+            for chunk in target.chunks_exact_mut(2) {
+                chunk.copy_from_slice(&pat);
+            }
+        }
+        true
     }
 }
 
@@ -2308,34 +2542,23 @@ impl View {
     /// every access.
     #[inline(always)]
     fn fast_read<const BYTES: usize>(&self, a: u32) -> Option<u32> {
-        if WATCH_ADDR.is_some() {
-            return None;
-        }
         let m = self.m.borrow();
-        // NDS_IOLOG counts a RAM watch range through the byte path; stay out
-        // of the fast path so those counts stay accurate.
-        if m.io_log.is_some() {
+        if m.debug_hooks {
             return None;
         }
         let cpu = self.cpu;
         let get = |buf: &[u8], off: usize| -> Option<u32> {
-            if off + BYTES > buf.len() {
-                return None;
-            }
-            if BYTES == 4 {
-                Some(u32::from_le_bytes([
-                    buf[off],
-                    buf[off + 1],
-                    buf[off + 2],
-                    buf[off + 3],
-                ]))
-            } else {
-                Some(u16::from_le_bytes([buf[off], buf[off + 1]]) as u32)
-            }
+            let slice = buf.get(off..off + BYTES)?;
+            Some(match BYTES {
+                4 => u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]),
+                2 => u16::from_le_bytes([slice[0], slice[1]]) as u32,
+                _ => slice[0] as u32,
+            })
         };
         if cpu == 0 {
-            if a >= m.dtcm_base && a < m.dtcm_base + 0x4000 {
-                return get(&m.dtcm, (a - m.dtcm_base) as usize);
+            let dtcm_off = a.wrapping_sub(m.dtcm_base);
+            if dtcm_off < 0x4000 {
+                return get(&m.dtcm, dtcm_off as usize);
             }
             if a < 0x0200_0000 {
                 return get(&m.itcm, (a & 0x7FFF) as usize);
@@ -2350,10 +2573,23 @@ impl View {
                     match m.swram_off(cpu, a) {
                         Some(off) => get(&m.swram, off),
                         None if cpu == 1 => get(&m.wram7, (a & 0xFFFF) as usize),
-                        None => None,
+                        None => Some(0),
                     }
                 }
             }
+            0x05 if cpu == 0 => get(&m.pal, (a & 0x7FF) as usize),
+            0x06 => {
+                let slot = if cpu == 0 {
+                    m.vram_slot(a)
+                } else {
+                    m.vram_arm7_slot(a)
+                };
+                match slot {
+                    Some((b, off)) => get(&m.vram[b], off),
+                    None => Some(0),
+                }
+            }
+            0x07 if cpu == 0 => get(&m.oam, (a & 0x7FF) as usize),
             _ => None,
         }
     }
@@ -2361,33 +2597,29 @@ impl View {
     /// Write counterpart of `fast_read`.
     #[inline(always)]
     fn fast_write<const BYTES: usize>(&mut self, a: u32, v: u32) -> bool {
-        if WATCH_ADDR.is_some() {
-            return false;
-        }
         let mut m = self.m.borrow_mut();
-        if m.io_log.is_some() {
+        if m.debug_hooks {
             return false;
         }
         let cpu = self.cpu;
         let put = |buf: &mut [u8], off: usize| -> bool {
-            if off + BYTES > buf.len() {
+            let Some(slice) = buf.get_mut(off..off + BYTES) else {
                 return false;
-            }
-            if BYTES == 4 {
-                buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
-            } else {
-                buf[off..off + 2].copy_from_slice(&(v as u16).to_le_bytes());
+            };
+            match BYTES {
+                4 => slice.copy_from_slice(&v.to_le_bytes()),
+                2 => slice.copy_from_slice(&(v as u16).to_le_bytes()),
+                _ => slice[0] = v as u8,
             }
             true
         };
         if cpu == 0 {
-            if a >= m.dtcm_base && a < m.dtcm_base + 0x4000 {
-                let off = (a - m.dtcm_base) as usize;
-                return put(&mut m.dtcm, off);
+            let dtcm_off = a.wrapping_sub(m.dtcm_base);
+            if dtcm_off < 0x4000 {
+                return put(&mut m.dtcm, dtcm_off as usize);
             }
             if a < 0x0200_0000 {
-                let off = (a & 0x7FFF) as usize;
-                return put(&mut m.itcm, off);
+                return put(&mut m.itcm, (a & 0x7FFF) as usize);
             }
         }
         match a >> 24 {
@@ -2406,11 +2638,143 @@ impl View {
                             let off = (a & 0xFFFF) as usize;
                             put(&mut m.wram7, off)
                         }
-                        None => false,
+                        None => true,
                     }
                 }
             }
+            0x05 if cpu == 0 => {
+                let off = (a & 0x7FF) as usize;
+                put(&mut m.pal, off)
+            }
+            0x06 => {
+                let slot = if cpu == 0 {
+                    m.vram_slot(a)
+                } else {
+                    m.vram_arm7_slot(a)
+                };
+                match slot {
+                    Some((b, off)) => put(&mut m.vram[b], off),
+                    None => true,
+                }
+            }
+            0x07 if cpu == 0 => {
+                let off = (a & 0x7FF) as usize;
+                put(&mut m.oam, off)
+            }
             _ => false,
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read8_slow(&mut self, a: u32) -> u8 {
+        if self.is_wifi(a) {
+            let v = self.wifi_read16(a & !1);
+            return (v >> ((a & 1) * 8)) as u8;
+        }
+        if self.is_io(a) {
+            let v = self.io_read16(a & !1);
+            (v >> ((a & 1) * 8)) as u8
+        } else {
+            self.mem_read8(a)
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read16_slow(&mut self, a: u32) -> u16 {
+        if self.is_wifi(a) {
+            self.wifi_read16(a)
+        } else if self.is_io(a) {
+            self.io_read16(a)
+        } else {
+            u16::from_le_bytes([self.mem_read8(a), self.mem_read8(a + 1)])
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read32_slow(&mut self, a: u32) -> u32 {
+        if self.is_wifi(a) {
+            return self.wifi_read16(a) as u32 | (self.wifi_read16(a + 2) as u32) << 16;
+        }
+        if self.is_io(a) {
+            self.io_read32(a)
+        } else {
+            u32::from_le_bytes([
+                self.mem_read8(a),
+                self.mem_read8(a + 1),
+                self.mem_read8(a + 2),
+                self.mem_read8(a + 3),
+            ])
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn write8_slow(&mut self, a: u32, v: u8) {
+        if self.is_wifi(a) {
+            let cur = self.wifi_read16(a & !1);
+            let nv = if a & 1 == 0 {
+                (cur & 0xFF00) | v as u16
+            } else {
+                (cur & 0xFF) | (v as u16) << 8
+            };
+            self.wifi_write16(a & !1, nv);
+            return;
+        }
+        if self.is_io(a) {
+            // Byte I/O writes: read-modify-write the 16-bit register.
+            let cur = self.io_read16(a & !1);
+            let nv = if a & 1 == 0 {
+                (cur & 0xFF00) | v as u16
+            } else {
+                (cur & 0x00FF) | (v as u16) << 8
+            };
+            self.io_write16(a & !1, nv);
+        } else {
+            self.mem_write8(a, v);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn write16_slow(&mut self, a: u32, v: u16) {
+        if self.is_wifi(a) {
+            self.wifi_write16(a, v);
+        } else if self.is_io(a) {
+            self.io_write16(a, v);
+            let off = a & 0xFFFF;
+            if (0x00B0..=0x00DF).contains(&off) || (0x01A4..=0x01A7).contains(&off) {
+                self.dma_service(DMA_IMM);
+                self.dma_service(DMA_CART);
+            }
+        } else {
+            self.mem_write8(a, v as u8);
+            self.mem_write8(a + 1, (v >> 8) as u8);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn write32_slow(&mut self, a: u32, v: u32) {
+        if self.is_wifi(a) {
+            self.wifi_write16(a, v as u16);
+            self.wifi_write16(a + 2, (v >> 16) as u16);
+            return;
+        }
+        if self.is_io(a) {
+            self.io_write32(a, v);
+            let off = a & 0xFFFF;
+            if (0x00B0..=0x00DF).contains(&off) || (0x01A4..=0x01A7).contains(&off) {
+                self.dma_service(DMA_IMM);
+                self.dma_service(DMA_CART);
+            }
+        } else {
+            self.mem_write8(a, v as u8);
+            self.mem_write8(a + 1, (v >> 8) as u8);
+            self.mem_write8(a + 2, (v >> 16) as u8);
+            self.mem_write8(a + 3, (v >> 24) as u8);
         }
     }
 
@@ -2606,17 +2970,12 @@ impl View {
 }
 
 impl Bus for View {
+    #[inline(always)]
     fn read8(&mut self, a: u32) -> u8 {
-        if self.is_wifi(a) {
-            let v = self.wifi_read16(a & !1);
-            return (v >> ((a & 1) * 8)) as u8;
+        if let Some(v) = self.fast_read::<1>(a) {
+            return v as u8;
         }
-        if self.is_io(a) {
-            let v = self.io_read16(a & !1);
-            (v >> ((a & 1) * 8)) as u8
-        } else {
-            self.mem_read8(a)
-        }
+        self.read8_slow(a)
     }
 
     #[inline(always)]
@@ -2625,13 +2984,7 @@ impl Bus for View {
         if let Some(v) = self.fast_read::<2>(a) {
             return v as u16;
         }
-        if self.is_wifi(a) {
-            self.wifi_read16(a)
-        } else if self.is_io(a) {
-            self.io_read16(a)
-        } else {
-            u16::from_le_bytes([self.mem_read8(a), self.mem_read8(a + 1)])
-        }
+        self.read16_slow(a)
     }
 
     #[inline(always)]
@@ -2640,44 +2993,15 @@ impl Bus for View {
         if let Some(v) = self.fast_read::<4>(a) {
             return v;
         }
-        if self.is_wifi(a) {
-            return self.wifi_read16(a) as u32 | (self.wifi_read16(a + 2) as u32) << 16;
-        }
-        if self.is_io(a) {
-            self.io_read32(a)
-        } else {
-            u32::from_le_bytes([
-                self.mem_read8(a),
-                self.mem_read8(a + 1),
-                self.mem_read8(a + 2),
-                self.mem_read8(a + 3),
-            ])
-        }
+        self.read32_slow(a)
     }
 
+    #[inline(always)]
     fn write8(&mut self, a: u32, v: u8) {
-        if self.is_wifi(a) {
-            let cur = self.wifi_read16(a & !1);
-            let nv = if a & 1 == 0 {
-                (cur & 0xFF00) | v as u16
-            } else {
-                (cur & 0xFF) | (v as u16) << 8
-            };
-            self.wifi_write16(a & !1, nv);
+        if self.fast_write::<1>(a, v as u32) {
             return;
         }
-        if self.is_io(a) {
-            // Byte I/O writes: read-modify-write the 16-bit register.
-            let cur = self.io_read16(a & !1);
-            let nv = if a & 1 == 0 {
-                (cur & 0xFF00) | v as u16
-            } else {
-                (cur & 0x00FF) | (v as u16) << 8
-            };
-            self.io_write16(a & !1, nv);
-        } else {
-            self.mem_write8(a, v);
-        }
+        self.write8_slow(a, v);
     }
 
     #[inline(always)]
@@ -2686,16 +3010,7 @@ impl Bus for View {
         if self.fast_write::<2>(a, v as u32) {
             return;
         }
-        if self.is_wifi(a) {
-            self.wifi_write16(a, v);
-        } else if self.is_io(a) {
-            self.io_write16(a, v);
-            self.dma_service(DMA_IMM);
-            self.dma_service(DMA_CART);
-        } else {
-            self.mem_write8(a, v as u8);
-            self.mem_write8(a + 1, (v >> 8) as u8);
-        }
+        self.write16_slow(a, v);
     }
 
     #[inline(always)]
@@ -2704,21 +3019,7 @@ impl Bus for View {
         if self.fast_write::<4>(a, v) {
             return;
         }
-        if self.is_wifi(a) {
-            self.wifi_write16(a, v as u16);
-            self.wifi_write16(a + 2, (v >> 16) as u16);
-            return;
-        }
-        if self.is_io(a) {
-            self.io_write32(a, v);
-            self.dma_service(DMA_IMM);
-            self.dma_service(DMA_CART);
-        } else {
-            self.mem_write8(a, v as u8);
-            self.mem_write8(a + 1, (v >> 8) as u8);
-            self.mem_write8(a + 2, (v >> 16) as u8);
-            self.mem_write8(a + 3, (v >> 24) as u8);
-        }
+        self.write32_slow(a, v);
     }
 
     #[inline(always)]
@@ -2739,8 +3040,19 @@ impl Bus for View {
     }
 
     #[inline(always)]
+    fn irq_takeable(&mut self) -> bool {
+        let m = self.m.borrow();
+        m.ime[self.cpu] && (m.ie[self.cpu] & m.if_[self.cpu]) != 0
+    }
+
+    #[inline(always)]
+    fn has_debug_hooks(&self) -> bool {
+        self.m.borrow().debug_hooks
+    }
+
+    #[inline(always)]
     fn note_pc(&mut self, pc: u32) {
-        if WATCH_ADDR.is_none() && self.m.borrow().io_log.is_none() {
+        if !self.m.borrow().debug_hooks {
             return;
         }
         let cpu = self.cpu;

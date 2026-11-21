@@ -32,11 +32,11 @@ impl ShaderPreset {
 }
 
 fn default_upscaler_mode() -> String {
-    "OFF".into()
+    "XBRZ".into()
 }
 
 fn default_shader_css() -> String {
-    "mode-crt".into()
+    "mode-clean".into()
 }
 
 fn default_nds_layout() -> String {

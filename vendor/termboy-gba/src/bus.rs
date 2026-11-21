@@ -34,8 +34,14 @@ pub struct Bus {
     nonseq: bool,
     /// Number of timing events processed (2 per line: start, hblank).
     events_done: u64,
+    /// Cached cycle timestamp of the next PPU scanline/HBlank event.
+    next_event_at: u64,
     pub(crate) dma: [crate::dma::Dma; 4],
     pub(crate) timers: [crate::timers::Timer; 4],
+    /// Bitmask of enabled timers (`bit t` set iff timer `t` control bit 7 is set).
+    pub(crate) timers_active_mask: u8,
+    /// True when DMA channel 1 or 2 is enabled in Direct Sound FIFO special-timing mode.
+    fifo_dma_active: bool,
     /// Cycle count the timers were last advanced to.
     pub(crate) timers_synced: u64,
     pub(crate) apu: crate::apu::Apu,
@@ -63,8 +69,11 @@ impl Bus {
             seq_next: 0,
             nonseq: true,
             events_done: 0,
+            next_event_at: 0,
             dma: [crate::dma::Dma::default(); 4],
             timers: [crate::timers::Timer::default(); 4],
+            timers_active_mask: 0,
+            fifo_dma_active: false,
             timers_synced: 0,
             apu: crate::apu::Apu::new(),
             apu_synced: 0,
@@ -72,12 +81,69 @@ impl Bus {
         }
     }
 
-    /// Advance the APU by the elapsed cycle delta (called from catch_up).
+    #[inline(always)]
+    fn event_cycle(k: u64) -> u64 {
+        (k / 2) * CYCLES_PER_LINE + (k % 2) * HBLANK_AT
+    }
+
+    fn rebuild_caches(&mut self) {
+        self.next_event_at = Self::event_cycle(self.events_done);
+        let mut tmask = 0u8;
+        for t in 0..4 {
+            if self.io[0x102 + t * 4] & 0x80 != 0 {
+                tmask |= 1 << t;
+            }
+        }
+        self.timers_active_mask = tmask;
+        self.refresh_fifo_dma_active();
+    }
+
+    fn refresh_fifo_dma_active(&mut self) {
+        let mut active = false;
+        for ch in 1..=2 {
+            let ctrl = self.io16(0x0BA + ch * 0xC);
+            if ctrl & 0x8000 != 0 && (ctrl >> 12) & 3 == 3 {
+                active = true;
+            }
+        }
+        self.fifo_dma_active = active;
+    }
+
+    /// Advance the APU by the elapsed cycle delta.
+    #[inline]
     pub(crate) fn apu_catch_up(&mut self) {
         let elapsed = (self.cycles - self.apu_synced) as u32;
         self.apu_synced = self.cycles;
         if elapsed > 0 {
             self.apu.tick(elapsed);
+        }
+    }
+
+    /// Jump directly to the next scanline/HBlank or timer overflow event while halted,
+    /// eliminating ~280k idle 1-cycle polls per frame.
+    #[inline]
+    pub(crate) fn skip_halt_until(&mut self, limit: u64) {
+        self.timers_catch_up();
+        let next_timer = self.next_timer_overflow_cycle();
+        let target = self.next_event_at.min(next_timer).min(limit);
+        self.cycles = target.max(self.cycles + 1);
+    }
+
+    /// Fast per-step catch-up: skips disabled timers/FIFO DMA and batches APU work
+    /// at scanline/timer/I/O boundaries instead of ticking on every single instruction.
+    #[inline(always)]
+    pub(crate) fn catch_up_fast(&mut self) {
+        if self.timers_active_mask != 0 {
+            self.timers_catch_up();
+        } else {
+            self.timers_synced = self.cycles;
+        }
+        if self.cycles >= self.next_event_at {
+            self.catch_up_events();
+            self.apu_catch_up();
+        }
+        if self.fifo_dma_active {
+            self.service_fifo_dma();
         }
     }
 
@@ -87,13 +153,19 @@ impl Bus {
     pub fn catch_up(&mut self) {
         self.timers_catch_up();
         self.apu_catch_up();
-        loop {
+        if self.cycles >= self.next_event_at {
+            self.catch_up_events();
+        }
+        if self.fifo_dma_active {
+            self.service_fifo_dma();
+        }
+    }
+
+    fn catch_up_events(&mut self) {
+        while self.next_event_at <= self.cycles {
             let k = self.events_done;
-            let at = (k / 2) * CYCLES_PER_LINE + (k % 2) * HBLANK_AT;
-            if at > self.cycles {
-                break;
-            }
-            self.events_done += 1;
+            self.events_done = k + 1;
+            self.next_event_at = Self::event_cycle(k + 1);
             let line = (k / 2) % LINES;
             let dispstat = self.io16(0x004);
             if k % 2 == 0 {
@@ -119,7 +191,6 @@ impl Bus {
                 }
             }
         }
-        self.service_fifo_dma();
     }
 
     /// A near-empty Direct Sound FIFO requests its refill DMA (the enabled
@@ -225,11 +296,24 @@ impl Bus {
         self.write8_raw(addr, value);
     }
 
+    #[inline(always)]
+    fn sync_io_read(&mut self, addr: u32) {
+        if addr >> 24 == 0x04 {
+            let reg = (addr as usize) & 0x3FF;
+            if (0x060..=0x09F).contains(&reg) {
+                self.apu_catch_up();
+            }
+        }
+    }
+
+    #[inline(always)]
     pub fn read8(&mut self, addr: u32) -> u8 {
         self.tick_access(addr, Width::Bits8);
+        self.sync_io_read(addr);
         self.read8_raw(addr)
     }
 
+    #[inline]
     fn read8_raw(&self, addr: u32) -> u8 {
         match addr >> 24 {
             // BIOS region: SWIs are HLE'd, so nothing executes from here.
@@ -255,38 +339,141 @@ impl Bus {
         }
     }
 
+    #[inline(always)]
     pub fn read16(&mut self, addr: u32) -> u16 {
         self.tick_access(addr, Width::Bits16);
-        if addr >> 24 == 0x0D {
+        let region = addr >> 24;
+        if region == 0x0D {
             if let Some(e) = self.save.eeprom() {
                 return e.read_bit();
             }
         }
-        // The 0x0E/0x0F save region is an 8-bit bus: a wider read returns the
-        // one addressed byte duplicated into every lane.
-        if matches!(addr >> 24, 0x0E | 0x0F) {
-            let b = self.save.read(addr) as u16;
-            return b | (b << 8);
+        let a = addr & !1;
+        match region {
+            0x02 => {
+                let i = (a as usize) & 0x3_FFFF;
+                u16::from_le_bytes([self.ewram[i], self.ewram[i + 1]])
+            }
+            0x03 => {
+                let i = (a as usize) & 0x7FFF;
+                u16::from_le_bytes([self.iwram[i], self.iwram[i + 1]])
+            }
+            0x05 => {
+                let i = (a as usize) & 0x3FF;
+                u16::from_le_bytes([self.palette[i], self.palette[i + 1]])
+            }
+            0x06 => {
+                let i = Self::vram_index(a);
+                u16::from_le_bytes([self.vram[i], self.vram[i + 1]])
+            }
+            0x07 => {
+                let i = (a as usize) & 0x3FF;
+                u16::from_le_bytes([self.oam[i], self.oam[i + 1]])
+            }
+            0x08..=0x0D => {
+                let i = (a as usize) & 0x1FF_FFFF;
+                if let Some(s) = self.rom.get(i..i + 2) {
+                    u16::from_le_bytes([s[0], s[1]])
+                } else {
+                    u16::from_le_bytes([self.read8_raw(a), self.read8_raw(a + 1)])
+                }
+            }
+            // The 0x0E/0x0F save region is an 8-bit bus: a wider read returns the
+            // one addressed byte duplicated into every lane.
+            0x0E | 0x0F => {
+                let b = self.save.read(addr) as u16;
+                b | (b << 8)
+            }
+            0x04 => {
+                self.sync_io_read(a);
+                u16::from_le_bytes([self.read_io(a), self.read_io(a + 1)])
+            }
+            _ => 0,
         }
-        let addr = addr & !1;
-        u16::from_le_bytes([self.read8_raw(addr), self.read8_raw(addr + 1)])
     }
 
+    #[inline(always)]
     pub fn read32(&mut self, addr: u32) -> u32 {
         self.tick_access(addr, Width::Bits32);
-        if matches!(addr >> 24, 0x0E | 0x0F) {
-            let b = self.save.read(addr) as u32;
-            return b | (b << 8) | (b << 16) | (b << 24);
+        let region = addr >> 24;
+        let a = addr & !3;
+        match region {
+            0x02 => {
+                let i = (a as usize) & 0x3_FFFF;
+                u32::from_le_bytes([
+                    self.ewram[i],
+                    self.ewram[i + 1],
+                    self.ewram[i + 2],
+                    self.ewram[i + 3],
+                ])
+            }
+            0x03 => {
+                let i = (a as usize) & 0x7FFF;
+                u32::from_le_bytes([
+                    self.iwram[i],
+                    self.iwram[i + 1],
+                    self.iwram[i + 2],
+                    self.iwram[i + 3],
+                ])
+            }
+            0x05 => {
+                let i = (a as usize) & 0x3FF;
+                u32::from_le_bytes([
+                    self.palette[i],
+                    self.palette[i + 1],
+                    self.palette[i + 2],
+                    self.palette[i + 3],
+                ])
+            }
+            0x06 => {
+                let i = Self::vram_index(a);
+                u32::from_le_bytes([
+                    self.vram[i],
+                    self.vram[i + 1],
+                    self.vram[i + 2],
+                    self.vram[i + 3],
+                ])
+            }
+            0x07 => {
+                let i = (a as usize) & 0x3FF;
+                u32::from_le_bytes([
+                    self.oam[i],
+                    self.oam[i + 1],
+                    self.oam[i + 2],
+                    self.oam[i + 3],
+                ])
+            }
+            0x08..=0x0D => {
+                let i = (a as usize) & 0x1FF_FFFF;
+                if let Some(s) = self.rom.get(i..i + 4) {
+                    u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+                } else {
+                    u32::from_le_bytes([
+                        self.read8_raw(a),
+                        self.read8_raw(a + 1),
+                        self.read8_raw(a + 2),
+                        self.read8_raw(a + 3),
+                    ])
+                }
+            }
+            0x0E | 0x0F => {
+                let b = self.save.read(addr) as u32;
+                b | (b << 8) | (b << 16) | (b << 24)
+            }
+            0x04 => {
+                self.sync_io_read(a);
+                u32::from_le_bytes([
+                    self.read_io(a),
+                    self.read_io(a + 1),
+                    self.read_io(a + 2),
+                    self.read_io(a + 3),
+                ])
+            }
+            _ => 0,
         }
-        let addr = addr & !3;
-        u32::from_le_bytes([
-            self.read8_raw(addr),
-            self.read8_raw(addr + 1),
-            self.read8_raw(addr + 2),
-            self.read8_raw(addr + 3),
-        ])
     }
 
+    #[inline(always)]
     pub fn write8(&mut self, addr: u32, value: u8) {
         self.tick_access(addr, Width::Bits8);
         match addr >> 24 {
@@ -314,40 +501,88 @@ impl Bus {
         }
     }
 
+    #[inline(always)]
     pub fn write16(&mut self, addr: u32, value: u16) {
         self.tick_access(addr, Width::Bits16);
-        if addr >> 24 == 0x0D {
+        let region = addr >> 24;
+        if region == 0x0D {
             if let Some(e) = self.save.eeprom() {
                 e.write_bit(value);
                 return;
             }
         }
-        // 8-bit save bus: a 16-bit store writes a single byte, selected by the
-        // low address bit, to the (unaligned) target address.
-        if matches!(addr >> 24, 0x0E | 0x0F) {
-            self.save.write(addr, (value >> (8 * (addr & 1))) as u8);
-            return;
+        let a = addr & !1;
+        let bytes = value.to_le_bytes();
+        match region {
+            0x02 => {
+                let i = (a as usize) & 0x3_FFFF;
+                self.ewram[i..i + 2].copy_from_slice(&bytes);
+            }
+            0x03 => {
+                let i = (a as usize) & 0x7FFF;
+                self.iwram[i..i + 2].copy_from_slice(&bytes);
+            }
+            0x05 => {
+                let i = (a as usize) & 0x3FF;
+                self.palette[i..i + 2].copy_from_slice(&bytes);
+            }
+            0x06 => {
+                let i = Self::vram_index(a);
+                self.vram[i..i + 2].copy_from_slice(&bytes);
+            }
+            0x07 => {
+                let i = (a as usize) & 0x3FF;
+                self.oam[i..i + 2].copy_from_slice(&bytes);
+            }
+            // 8-bit save bus: a 16-bit store writes a single byte, selected by the
+            // low address bit, to the (unaligned) target address.
+            0x0E | 0x0F => self.save.write(addr, (value >> (8 * (addr & 1))) as u8),
+            0x04 => {
+                self.write_io(a, bytes[0]);
+                self.write_io(a + 1, bytes[1]);
+            }
+            _ => {}
         }
-        let addr = addr & !1;
-        let [a, b] = value.to_le_bytes();
-        self.write8_raw(addr, a);
-        self.write8_raw(addr + 1, b);
     }
 
+    #[inline(always)]
     pub fn write32(&mut self, addr: u32, value: u32) {
         self.tick_access(addr, Width::Bits32);
-        // 8-bit save bus: a 32-bit store likewise writes one byte, selected by
-        // the low two address bits.
-        if matches!(addr >> 24, 0x0E | 0x0F) {
-            self.save.write(addr, (value >> (8 * (addr & 3))) as u8);
-            return;
+        let region = addr >> 24;
+        let a = addr & !3;
+        let bytes = value.to_le_bytes();
+        match region {
+            0x02 => {
+                let i = (a as usize) & 0x3_FFFF;
+                self.ewram[i..i + 4].copy_from_slice(&bytes);
+            }
+            0x03 => {
+                let i = (a as usize) & 0x7FFF;
+                self.iwram[i..i + 4].copy_from_slice(&bytes);
+            }
+            0x05 => {
+                let i = (a as usize) & 0x3FF;
+                self.palette[i..i + 4].copy_from_slice(&bytes);
+            }
+            0x06 => {
+                let i = Self::vram_index(a);
+                self.vram[i..i + 4].copy_from_slice(&bytes);
+            }
+            0x07 => {
+                let i = (a as usize) & 0x3FF;
+                self.oam[i..i + 4].copy_from_slice(&bytes);
+            }
+            // 8-bit save bus: a 32-bit store likewise writes one byte, selected by
+            // the low two address bits.
+            0x0E | 0x0F => self.save.write(addr, (value >> (8 * (addr & 3))) as u8),
+            0x04 => {
+                self.write_io(a, bytes[0]);
+                self.write_io(a + 1, bytes[1]);
+                self.write_io(a + 2, bytes[2]);
+                self.write_io(a + 3, bytes[3]);
+            }
+            _ => {}
         }
-        let addr = addr & !3;
-        let [a, b, c, d] = value.to_le_bytes();
-        self.write8_raw(addr, a);
-        self.write8_raw(addr + 1, b);
-        self.write8_raw(addr + 2, c);
-        self.write8_raw(addr + 3, d);
     }
 
     pub(crate) fn io16(&self, reg: usize) -> u16 {
@@ -440,6 +675,11 @@ impl Bus {
                 let was = self.io[reg] & 0x80 != 0;
                 self.timers_catch_up();
                 self.io[reg] = value;
+                if value & 0x80 != 0 {
+                    self.timers_active_mask |= 1 << t;
+                } else {
+                    self.timers_active_mask &= !(1 << t);
+                }
                 if !was && value & 0x80 != 0 {
                     self.timers[t].counter = self.io16(0x100 + t * 4);
                     self.timers[t].rem = 0;
@@ -451,13 +691,17 @@ impl Bus {
                 let was = self.io[0x0BB + ch * 0xC] & 0x80 != 0;
                 self.io[reg] = value;
                 self.dma_ctrl_write(ch, was);
+                self.refresh_fifo_dma_active();
             }
             // Sound: settle the APU to now, then apply the register change.
             0x060..=0x085 | 0x090..=0x09F => {
                 self.apu_catch_up();
                 self.apu.write(reg, value);
             }
-            0x0A0..=0x0A7 => self.apu.fifo_push((reg - 0x0A0) / 4, value),
+            0x0A0..=0x0A7 => {
+                self.apu_catch_up();
+                self.apu.fifo_push((reg - 0x0A0) / 4, value);
+            }
             // HALTCNT: any write halts (bit 7 = Stop, same thing at coarse timing)
             0x301 => {
                 self.io[reg] = value;
@@ -527,6 +771,7 @@ impl Bus {
         self.apu.deserialize(r)?;
         self.apu_synced = r.get_u64()?;
         self.halted = r.get_bool()?;
+        self.rebuild_caches();
         Ok(())
     }
 }

@@ -18,6 +18,74 @@ const V: u32 = 1 << 28;
 const Q: u32 = 1 << 27;
 const T: u32 = 1 << 5; // Thumb state
 
+const OP_DP: u8 = 0;
+const OP_SINGLE: u8 = 1;
+const OP_BLOCK: u8 = 2;
+const OP_BRANCH: u8 = 3;
+const OP_HALFWORD: u8 = 4;
+const OP_MUL: u8 = 5;
+const OP_MULL: u8 = 6;
+const OP_SMLAXY: u8 = 7;
+const OP_COPROC: u8 = 8;
+const OP_LDC_STC: u8 = 9;
+const OP_SWI: u8 = 10;
+const OP_MISC: u8 = 11;
+const OP_UNDEF: u8 = 12;
+
+/// Compile-time 4096-entry ARM instruction class lookup table indexed by
+/// `(((op >> 16) & 0xFF0) | ((op >> 4) & 0x00F))`. Replaces ~16 sequential
+/// mask/compare branches per instruction with a single indexed jump.
+const ARM_LUT: [u8; 4096] = {
+    let mut lut = [OP_UNDEF; 4096];
+    let mut idx = 0usize;
+    while idx < 4096 {
+        let hi = (idx >> 4) as u8; // bits 27..20
+        let lo = (idx & 0xF) as u8; // bits 7..4
+        lut[idx] = if (hi == 0x12 && (lo == 0x1 || lo == 0x3))
+            || (hi == 0x16 && lo == 0x1)
+            || ((hi & 0xF9) == 0x10 && lo == 0x5)
+        {
+            OP_MISC
+        } else if (hi & 0xF9) == 0x10 && (lo & 0x9) == 0x8 {
+            if hi == 0x10 || hi == 0x14 {
+                OP_SMLAXY
+            } else {
+                OP_MISC
+            }
+        } else if (hi & 0xE0) == 0xA0 {
+            OP_BRANCH
+        } else if (hi & 0xF0) == 0xE0 && (lo & 1) == 1 {
+            OP_COPROC
+        } else if (hi & 0xE0) == 0xC0 {
+            OP_LDC_STC
+        } else if (hi & 0xFC) == 0x00 && lo == 0x9 {
+            OP_MUL
+        } else if (hi & 0xF8) == 0x08 && lo == 0x9 {
+            OP_MULL
+        } else if (hi & 0xFB) == 0x10 && lo == 0x9 {
+            OP_MISC
+        } else if (hi & 0xE0) == 0x00 && (lo & 0x9) == 0x9 && (lo & 0x6) != 0 {
+            OP_HALFWORD
+        } else if (hi & 0xFB) == 0x10 && lo == 0x0 {
+            OP_MISC
+        } else if (hi & 0xDB) == 0x12 {
+            OP_MISC
+        } else if (hi & 0xC0) == 0x00 {
+            OP_DP
+        } else if (hi & 0xC0) == 0x40 {
+            OP_SINGLE
+        } else if (hi & 0xE0) == 0x80 {
+            OP_BLOCK
+        } else if (hi & 0xF0) == 0xF0 {
+            OP_SWI
+        } else {
+            OP_UNDEF
+        };
+        idx += 1;
+    }
+    lut
+};
+
 /// One ARM core, generic over its bus view. With `arm9` set it executes the
 /// ARMv5TE extensions (BLX, CLZ, saturating ops, halfword multiplies,
 /// LDRD/STRD, CP15) on top of the ARMv4T base; the NDS ARM7 uses the base
@@ -110,14 +178,17 @@ impl<B: Bus> Cpu<B> {
         self.st = st;
     }
 
+    #[inline(always)]
     fn thumb(&self) -> bool {
         self.st.cpsr & T != 0
     }
 
+    #[inline(always)]
     fn flag(&self, f: u32) -> bool {
         self.st.cpsr & f != 0
     }
 
+    #[inline(always)]
     fn set_flag(&mut self, f: u32, on: bool) {
         if on {
             self.st.cpsr |= f
@@ -126,11 +197,17 @@ impl<B: Bus> Cpu<B> {
         }
     }
 
+    #[inline(always)]
     fn set_nz(&mut self, v: u32) {
-        self.set_flag(N, v & 0x8000_0000 != 0);
-        self.set_flag(Z, v == 0);
+        let mut cpsr = self.st.cpsr & !(N | Z);
+        cpsr |= v & N;
+        if v == 0 {
+            cpsr |= Z;
+        }
+        self.st.cpsr = cpsr;
     }
 
+    #[inline(always)]
     fn r(&self, i: u32) -> u32 {
         if i == 15 {
             self.st.regs[15].wrapping_add(if self.thumb() { 4 } else { 8 })
@@ -139,6 +216,7 @@ impl<B: Bus> Cpu<B> {
         }
     }
 
+    #[inline(always)]
     fn set_r(&mut self, i: u32, v: u32) {
         if i == 15 {
             self.st.regs[15] = v & if self.thumb() { !1 } else { !3 };
@@ -147,6 +225,7 @@ impl<B: Bus> Cpu<B> {
         }
     }
 
+    #[inline(always)]
     fn mode(&self) -> u32 {
         self.st.cpsr & 0x1F
     }
@@ -209,6 +288,7 @@ impl<B: Bus> Cpu<B> {
         }
     }
 
+    #[inline(always)]
     fn cond(&self, c: u32) -> bool {
         match c {
             0x0 => self.flag(Z),
@@ -229,6 +309,7 @@ impl<B: Bus> Cpu<B> {
         }
     }
 
+    #[inline(always)]
     fn shift(&self, ty: u32, val: u32, amount: u32, imm: bool) -> (u32, bool) {
         let c_in = self.flag(C);
         match ty {
@@ -286,19 +367,64 @@ impl<B: Bus> Cpu<B> {
         }
     }
 
+    #[inline(always)]
     fn add_with_flags(&mut self, a: u32, b: u32, carry: u32, set: bool) -> u32 {
         let r64 = a as u64 + b as u64 + carry as u64;
         let r = r64 as u32;
         if set {
-            self.set_nz(r);
-            self.set_flag(C, r64 > 0xFFFF_FFFF);
-            self.set_flag(V, (!(a ^ b) & (a ^ r)) >> 31 != 0);
+            let mut cpsr = self.st.cpsr & !(N | Z | C | V);
+            cpsr |= r & N;
+            if r == 0 {
+                cpsr |= Z;
+            }
+            if r64 > 0xFFFF_FFFF {
+                cpsr |= C;
+            }
+            if (!(a ^ b) & (a ^ r)) >> 31 != 0 {
+                cpsr |= V;
+            }
+            self.st.cpsr = cpsr;
         }
         r
     }
 
+    #[inline(always)]
     fn sub_with_flags(&mut self, a: u32, b: u32, carry: u32, set: bool) -> u32 {
         self.add_with_flags(a, !b, carry, set)
+    }
+
+    /// Returns true if this core is halted (not spinning) and has no pending IRQ.
+    #[inline(always)]
+    pub fn is_halted_idle(&mut self) -> bool {
+        self.st.spin == 0 && self.st.halted && !self.bus.irq_pending()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn enter_irq(&mut self) {
+        let old_cpsr = self.st.cpsr;
+        let old_mode = self.mode();
+        let ret = self.st.regs[15].wrapping_add(4);
+        self.st.cpsr = (self.st.cpsr & !0x3F) | 0x12 | 0x80; // IRQ mode, ARM, I set
+        self.switch_mode(old_mode);
+        *self.spsr_for_mode() = old_cpsr;
+        self.st.regs[14] = ret;
+        self.st.regs[15] = self.st.vec_base + 0x18;
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn check_intr_wait(&mut self, mask: u32) {
+        if self.mode() != 0x12 {
+            let flag_addr = self.bus.bios_flag_addr();
+            let flags = self.bus.read32(flag_addr);
+            if flags & mask != 0 {
+                self.bus.write32(flag_addr, flags & !mask);
+                self.st.intr_wait = None;
+            } else {
+                self.st.halted = true;
+            }
+        }
     }
 
     /// Execute up to `n` instructions, collapsing idle time.
@@ -323,6 +449,10 @@ impl<B: Bus> Cpu<B> {
             // handler, which cannot run while nothing is pending.
             return;
         }
+        if self.brk.is_none() && !self.bus.has_debug_hooks() {
+            self.run_slice_fast(n);
+            return;
+        }
         let mut remaining = n;
         while remaining > 0 {
             self.step();
@@ -341,35 +471,77 @@ impl<B: Bus> Cpu<B> {
         }
     }
 
+    /// Tight instruction execution loop used when no breakpoint/watch/I/O-log hooks are active.
+    fn run_slice_fast(&mut self, mut remaining: u32) {
+        while remaining > 0 {
+            if let Some(mask) = self.st.intr_wait {
+                self.check_intr_wait(mask);
+            }
+            if self.st.halted {
+                if !self.bus.irq_pending() {
+                    return;
+                }
+                self.st.halted = false;
+                if self.st.cpsr & 0x80 == 0 && self.bus.ime() {
+                    self.enter_irq();
+                    remaining -= 1;
+                    continue;
+                }
+            } else if self.st.cpsr & 0x80 == 0 && self.bus.irq_takeable() {
+                self.enter_irq();
+                remaining -= 1;
+                continue;
+            }
+
+            let pc = self.st.regs[15];
+            if self.thumb() {
+                let op = self.bus.read16(pc);
+                self.exec_thumb(op);
+                if self.st.regs[15] == pc {
+                    self.st.regs[15] = pc.wrapping_add(2);
+                }
+            } else {
+                let op = self.bus.read32(pc);
+                let c = op >> 28;
+                if c == 0xE {
+                    self.exec_arm(op);
+                } else if c == 0xF {
+                    if self.st.arm9 {
+                        self.exec_arm_uncond(op);
+                    }
+                } else if self.cond(c) {
+                    self.exec_arm(op);
+                }
+                if self.st.regs[15] == pc {
+                    self.st.regs[15] = pc.wrapping_add(4);
+                }
+            }
+
+            remaining -= 1;
+            if self.st.spin > 0 {
+                if self.st.spin >= remaining {
+                    self.st.spin -= remaining;
+                    return;
+                }
+                remaining -= self.st.spin;
+                self.st.spin = 0;
+            }
+        }
+    }
+
     pub fn step(&mut self) {
         if self.st.spin > 0 {
             self.st.spin -= 1;
             return;
         }
         if let Some(mask) = self.st.intr_wait {
-            if self.mode() != 0x12 {
-                let flag_addr = self.bus.bios_flag_addr();
-                let flags = self.bus.read32(flag_addr);
-                if flags & mask != 0 {
-                    self.bus.write32(flag_addr, flags & !mask);
-                    self.st.intr_wait = None;
-                } else {
-                    self.st.halted = true;
-                }
-            }
+            self.check_intr_wait(mask);
         }
         let pending = self.bus.irq_pending();
         if pending {
             self.st.halted = false;
             if self.bus.ime() && self.st.cpsr & 0x80 == 0 {
-                let old_cpsr = self.st.cpsr;
-                let old_mode = self.mode();
-                let ret = self.st.regs[15].wrapping_add(4);
-                self.st.cpsr = (self.st.cpsr & !0x3F) | 0x12 | 0x80; // IRQ mode, ARM, I set
-                self.switch_mode(old_mode);
-                *self.spsr_for_mode() = old_cpsr;
-                self.st.regs[14] = ret;
-                self.st.regs[15] = self.st.vec_base + 0x18;
+                self.enter_irq();
                 return;
             }
         }
@@ -409,7 +581,9 @@ impl<B: Bus> Cpu<B> {
             let op = self.bus.read32(self.st.regs[15]);
             let pc_before = self.st.regs[15];
             let c = op >> 28;
-            if c == 0xF {
+            if c == 0xE {
+                self.exec_arm(op);
+            } else if c == 0xF {
                 if self.st.arm9 {
                     self.exec_arm_uncond(op);
                 }
@@ -441,7 +615,140 @@ impl<B: Bus> Cpu<B> {
         // PLD and other hints: no-op.
     }
 
+    #[inline(always)]
     fn exec_arm(&mut self, op: u32) {
+        let lut_idx = (((op >> 16) & 0xFF0) | ((op >> 4) & 0x00F)) as usize;
+        match ARM_LUT[lut_idx] {
+            OP_DP => self.arm_data_processing(op),
+            OP_SINGLE => self.arm_single_transfer(op),
+            OP_BLOCK => self.arm_block_transfer(op),
+            OP_BRANCH => {
+                // B/BL
+                let off = ((op << 8) as i32 >> 6) as u32;
+                if op & 0x0100_0000 != 0 {
+                    self.st.regs[14] = self.st.regs[15].wrapping_add(4);
+                }
+                self.st.regs[15] = self.st.regs[15].wrapping_add(8).wrapping_add(off);
+            }
+            OP_HALFWORD => self.arm_halfword(op),
+            OP_MUL => {
+                // MUL/MLA
+                let rd = op >> 16 & 0xF;
+                let rn = op >> 12 & 0xF;
+                let rs = op >> 8 & 0xF;
+                let rm = op & 0xF;
+                let mut r = self.r(rm).wrapping_mul(self.r(rs));
+                if op & 0x0020_0000 != 0 {
+                    r = r.wrapping_add(self.r(rn));
+                }
+                self.set_r(rd, r);
+                if op & 0x0010_0000 != 0 {
+                    self.set_nz(r);
+                }
+            }
+            OP_MULL => {
+                // UMULL/UMLAL/SMULL/SMLAL
+                let rdhi = op >> 16 & 0xF;
+                let rdlo = op >> 12 & 0xF;
+                let rs = op >> 8 & 0xF;
+                let rm = op & 0xF;
+                let signed = op & 0x0040_0000 != 0;
+                let acc = op & 0x0020_0000 != 0;
+                let mut r: u64 = if signed {
+                    (self.r(rm) as i32 as i64).wrapping_mul(self.r(rs) as i32 as i64) as u64
+                } else {
+                    (self.r(rm) as u64).wrapping_mul(self.r(rs) as u64)
+                };
+                if acc {
+                    r = r.wrapping_add((self.r(rdhi) as u64) << 32 | self.r(rdlo) as u64);
+                }
+                self.set_r(rdlo, r as u32);
+                self.set_r(rdhi, (r >> 32) as u32);
+                if op & 0x0010_0000 != 0 {
+                    self.set_flag(N, r >> 63 != 0);
+                    self.set_flag(Z, r == 0);
+                }
+            }
+            OP_SMLAXY => {
+                if self.st.arm9 {
+                    self.exec_arm_smlaxy(op);
+                } else {
+                    self.arm_data_processing(op);
+                }
+            }
+            OP_COPROC => self.coprocessor(op),
+            OP_LDC_STC => {}
+            OP_SWI => self.hle_swi(op >> 16 & 0xFF),
+            OP_MISC => self.exec_arm_misc(op),
+            _ => {
+                if *STRICT {
+                    panic!(
+                        "unimplemented ARM op {op:#010X} at {:#010X}",
+                        self.st.regs[15]
+                    );
+                }
+            }
+        }
+    }
+
+    fn exec_arm_smlaxy(&mut self, op: u32) {
+        // SMLAxy / SMLAWy / SMULWy / SMLALxy / SMULxy
+        let opc = op >> 21 & 3;
+        let x = op & 0x20 != 0;
+        let y = op & 0x40 != 0;
+        let rm = self.r(op & 0xF);
+        let rs = self.r(op >> 8 & 0xF);
+        let half = |v: u32, top: bool| {
+            if top {
+                (v >> 16) as i16 as i32
+            } else {
+                v as i16 as i32
+            }
+        };
+        match opc {
+            0 => {
+                // SMLAxy
+                let p = half(rm, x).wrapping_mul(half(rs, y));
+                let acc = self.r(op >> 12 & 0xF) as i32;
+                let (r, ov) = p.overflowing_add(acc);
+                if ov {
+                    self.st.cpsr |= Q;
+                }
+                self.set_r(op >> 16 & 0xF, r as u32);
+            }
+            1 => {
+                // SMULWy / SMLAWy
+                let p = ((rm as i32 as i64 * half(rs, y) as i64) >> 16) as i32;
+                if x {
+                    self.set_r(op >> 16 & 0xF, p as u32); // SMULWy
+                } else {
+                    let acc = self.r(op >> 12 & 0xF) as i32;
+                    let (r, ov) = p.overflowing_add(acc);
+                    if ov {
+                        self.st.cpsr |= Q;
+                    }
+                    self.set_r(op >> 16 & 0xF, r as u32);
+                }
+            }
+            2 => {
+                // SMLALxy
+                let p = half(rm, x).wrapping_mul(half(rs, y)) as i64;
+                let rdhi = op >> 16 & 0xF;
+                let rdlo = op >> 12 & 0xF;
+                let acc = ((self.r(rdhi) as u64) << 32 | self.r(rdlo) as u64) as i64;
+                let r = acc.wrapping_add(p) as u64;
+                self.set_r(rdlo, r as u32);
+                self.set_r(rdhi, (r >> 32) as u32);
+            }
+            _ => {
+                // SMULxy
+                let p = half(rm, x).wrapping_mul(half(rs, y));
+                self.set_r(op >> 16 & 0xF, p as u32);
+            }
+        }
+    }
+
+    fn exec_arm_misc(&mut self, op: u32) {
         if op & 0x0FFF_FFF0 == 0x012F_FF10 {
             // BX
             let v = self.r(op & 0xF);
@@ -493,117 +800,7 @@ impl<B: Bus> Cpu<B> {
             return;
         }
         if self.st.arm9 && op & 0x0F90_0090 == 0x0100_0080 {
-            // SMLAxy / SMLAWy / SMULWy / SMLALxy / SMULxy
-            let opc = op >> 21 & 3;
-            let x = op & 0x20 != 0;
-            let y = op & 0x40 != 0;
-            let rm = self.r(op & 0xF);
-            let rs = self.r(op >> 8 & 0xF);
-            let half = |v: u32, top: bool| {
-                if top {
-                    (v >> 16) as i16 as i32
-                } else {
-                    v as i16 as i32
-                }
-            };
-            match opc {
-                0 => {
-                    // SMLAxy
-                    let p = half(rm, x).wrapping_mul(half(rs, y));
-                    let acc = self.r(op >> 12 & 0xF) as i32;
-                    let (r, ov) = p.overflowing_add(acc);
-                    if ov {
-                        self.st.cpsr |= Q;
-                    }
-                    self.set_r(op >> 16 & 0xF, r as u32);
-                }
-                1 => {
-                    // SMULWy / SMLAWy
-                    let p = ((rm as i32 as i64 * half(rs, y) as i64) >> 16) as i32;
-                    if x {
-                        self.set_r(op >> 16 & 0xF, p as u32); // SMULWy
-                    } else {
-                        let acc = self.r(op >> 12 & 0xF) as i32;
-                        let (r, ov) = p.overflowing_add(acc);
-                        if ov {
-                            self.st.cpsr |= Q;
-                        }
-                        self.set_r(op >> 16 & 0xF, r as u32);
-                    }
-                }
-                2 => {
-                    // SMLALxy
-                    let p = half(rm, x).wrapping_mul(half(rs, y)) as i64;
-                    let rdhi = op >> 16 & 0xF;
-                    let rdlo = op >> 12 & 0xF;
-                    let acc = ((self.r(rdhi) as u64) << 32 | self.r(rdlo) as u64) as i64;
-                    let r = acc.wrapping_add(p) as u64;
-                    self.set_r(rdlo, r as u32);
-                    self.set_r(rdhi, (r >> 32) as u32);
-                }
-                _ => {
-                    // SMULxy
-                    let p = half(rm, x).wrapping_mul(half(rs, y));
-                    self.set_r(op >> 16 & 0xF, p as u32);
-                }
-            }
-            return;
-        }
-        if op & 0x0E00_0000 == 0x0A00_0000 {
-            // B/BL
-            let off = ((op << 8) as i32 >> 6) as u32;
-            if op & 0x0100_0000 != 0 {
-                self.st.regs[14] = self.st.regs[15].wrapping_add(4);
-            }
-            self.st.regs[15] = self.st.regs[15].wrapping_add(8).wrapping_add(off);
-            return;
-        }
-        if op & 0x0F00_0010 == 0x0E00_0010 {
-            // MRC/MCR
-            self.coprocessor(op);
-            return;
-        }
-        if op & 0x0F00_0000 == 0x0C00_0000 || op & 0x0F00_0000 == 0x0D00_0000 {
-            return; // LDC/STC: no coprocessor data transfers we care about
-        }
-        if op & 0x0FC0_00F0 == 0x0000_0090 {
-            // MUL/MLA
-            let rd = op >> 16 & 0xF;
-            let rn = op >> 12 & 0xF;
-            let rs = op >> 8 & 0xF;
-            let rm = op & 0xF;
-            let mut r = self.r(rm).wrapping_mul(self.r(rs));
-            if op & 0x0020_0000 != 0 {
-                r = r.wrapping_add(self.r(rn));
-            }
-            self.set_r(rd, r);
-            if op & 0x0010_0000 != 0 {
-                self.set_nz(r);
-            }
-            return;
-        }
-        if op & 0x0F80_00F0 == 0x0080_0090 {
-            // UMULL/UMLAL/SMULL/SMLAL
-            let rdhi = op >> 16 & 0xF;
-            let rdlo = op >> 12 & 0xF;
-            let rs = op >> 8 & 0xF;
-            let rm = op & 0xF;
-            let signed = op & 0x0040_0000 != 0;
-            let acc = op & 0x0020_0000 != 0;
-            let mut r: u64 = if signed {
-                (self.r(rm) as i32 as i64).wrapping_mul(self.r(rs) as i32 as i64) as u64
-            } else {
-                (self.r(rm) as u64).wrapping_mul(self.r(rs) as u64)
-            };
-            if acc {
-                r = r.wrapping_add((self.r(rdhi) as u64) << 32 | self.r(rdlo) as u64);
-            }
-            self.set_r(rdlo, r as u32);
-            self.set_r(rdhi, (r >> 32) as u32);
-            if op & 0x0010_0000 != 0 {
-                self.set_flag(N, r >> 63 != 0);
-                self.set_flag(Z, r == 0);
-            }
+            self.exec_arm_smlaxy(op);
             return;
         }
         if op & 0x0FB0_0FF0 == 0x0100_0090 {
@@ -620,10 +817,6 @@ impl<B: Bus> Cpu<B> {
                 self.bus.write32(addr, rm);
                 self.set_r(rd, old);
             }
-            return;
-        }
-        if op & 0x0E00_0090 == 0x0000_0090 && op & 0x60 != 0 {
-            self.arm_halfword(op);
             return;
         }
         if op & 0x0FBF_0FFF == 0x010F_0000 {
@@ -664,28 +857,7 @@ impl<B: Bus> Cpu<B> {
             }
             return;
         }
-        if op & 0x0C00_0000 == 0x0000_0000 {
-            self.arm_data_processing(op);
-            return;
-        }
-        if op & 0x0C00_0000 == 0x0400_0000 {
-            self.arm_single_transfer(op);
-            return;
-        }
-        if op & 0x0E00_0000 == 0x0800_0000 {
-            self.arm_block_transfer(op);
-            return;
-        }
-        if op & 0x0F00_0000 == 0x0F00_0000 {
-            self.hle_swi(op >> 16 & 0xFF);
-            return;
-        }
-        if *STRICT {
-            panic!(
-                "unimplemented ARM op {op:#010X} at {:#010X}",
-                self.st.regs[15]
-            );
-        }
+        self.arm_data_processing(op);
     }
 
     /// CP15 (system control) on the ARM9; everything else ignored.
@@ -727,6 +899,7 @@ impl<B: Bus> Cpu<B> {
         }
     }
 
+    #[inline(always)]
     fn dp_operand2(&mut self, op: u32) -> (u32, bool) {
         if op & 0x0200_0000 != 0 {
             let imm = op & 0xFF;
@@ -739,6 +912,10 @@ impl<B: Bus> Cpu<B> {
             }
         } else {
             let rm = op & 0xF;
+            if op & 0xFF0 == 0 {
+                // Plain unshifted register (LSL #0): most frequent register operand.
+                return (self.r(rm), self.flag(C));
+            }
             let ty = op >> 5 & 3;
             if op & 0x10 != 0 {
                 let amount = self.r(op >> 8 & 0xF) & 0xFF;
@@ -755,18 +932,18 @@ impl<B: Bus> Cpu<B> {
         }
     }
 
+    #[inline(always)]
     fn arm_data_processing(&mut self, op: u32) {
         let opcode = op >> 21 & 0xF;
         let set = op & 0x0010_0000 != 0;
         let rn = op >> 16 & 0xF;
         let rd = op >> 12 & 0xF;
-        if (0x8..=0xB).contains(&opcode) && rd == 15 && !set {
-            return;
-        }
-        if (0x8..=0xB).contains(&opcode) && rd == 15 {
-            let old = self.mode();
-            self.st.cpsr = *self.spsr_for_mode();
-            self.switch_mode(old);
+        if rd == 15 && (0x8..=0xB).contains(&opcode) {
+            if set {
+                let old = self.mode();
+                self.st.cpsr = *self.spsr_for_mode();
+                self.switch_mode(old);
+            }
             return;
         }
         let (op2, sh_carry) = self.dp_operand2(op);
@@ -776,8 +953,15 @@ impl<B: Bus> Cpu<B> {
             self.r(rn)
         };
         let logical_flags = |cpu: &mut Self, r: u32| {
-            cpu.set_nz(r);
-            cpu.set_flag(C, sh_carry);
+            let mut cpsr = cpu.st.cpsr & !(N | Z | C);
+            cpsr |= r & N;
+            if r == 0 {
+                cpsr |= Z;
+            }
+            if sh_carry {
+                cpsr |= C;
+            }
+            cpu.st.cpsr = cpsr;
         };
         let c = self.flag(C) as u32;
         let result = match opcode {
@@ -857,11 +1041,12 @@ impl<B: Bus> Cpu<B> {
                 }
                 self.st.regs[15] = r & if self.thumb() { !1 } else { !3 };
             } else {
-                self.set_r(rd, r);
+                self.st.regs[rd as usize] = r;
             }
         }
     }
 
+    #[inline(always)]
     fn arm_single_transfer(&mut self, op: u32) {
         let rn = op >> 16 & 0xF;
         let rd = op >> 12 & 0xF;
@@ -886,11 +1071,13 @@ impl<B: Bus> Cpu<B> {
         if load {
             let v = if byte {
                 self.bus.read8(addr) as u32
-            } else if self.st.arm9 {
-                // ARM9 forces alignment (no rotate; the v5 way with U=0).
-                self.bus.read32(addr & !3).rotate_right((addr & 3) * 8)
             } else {
-                self.bus.read32(addr).rotate_right((addr & 3) * 8)
+                let raw = self.bus.read32(addr);
+                if addr & 3 == 0 {
+                    raw
+                } else {
+                    raw.rotate_right((addr & 3) * 8)
+                }
             };
             if !pre || wb {
                 self.set_r(rn, off_base);
@@ -906,7 +1093,7 @@ impl<B: Bus> Cpu<B> {
             let v = if rd == 15 {
                 self.r(15).wrapping_add(4)
             } else {
-                self.r(rd)
+                self.st.regs[rd as usize]
             };
             if byte {
                 self.bus.write8(addr, v as u8);
@@ -919,6 +1106,7 @@ impl<B: Bus> Cpu<B> {
         }
     }
 
+    #[inline(always)]
     fn arm_halfword(&mut self, op: u32) {
         let rn = op >> 16 & 0xF;
         let rd = op >> 12 & 0xF;
@@ -993,6 +1181,7 @@ impl<B: Bus> Cpu<B> {
         }
     }
 
+    #[inline(always)]
     fn arm_block_transfer(&mut self, op: u32) {
         let rn = op >> 16 & 0xF;
         let list = op & 0xFFFF;
@@ -1059,53 +1248,55 @@ impl<B: Bus> Cpu<B> {
             // v5 (ARM9): writeback beats the loaded value unless Rn is the
             // last (and not only) register in the list. Applied after loads.
             let v5_wb_wins = self.st.arm9 && wb && in_list && (n == 1 || rn != last_reg);
-            for i in 0..16 {
-                if list & (1 << i) != 0 {
-                    let v = self.bus.read32(addr);
-                    if user_bank && i < 15 {
-                        self.set_user_reg(i, v);
-                        addr = addr.wrapping_add(4);
-                        continue;
-                    }
-                    if i == 15 {
-                        if s_bit {
-                            let old = self.mode();
-                            self.st.cpsr = *self.spsr_for_mode();
-                            self.switch_mode(old);
-                        }
-                        if self.st.arm9 && !s_bit {
-                            self.set_flag(T, v & 1 != 0);
-                        }
-                        self.st.regs[15] = v & if self.thumb() { !1 } else { !3 };
-                    } else {
-                        self.st.regs[i as usize] = v;
-                    }
+            let mut rem = list;
+            while rem != 0 {
+                let i = rem.trailing_zeros();
+                rem &= rem - 1;
+                let v = self.bus.read32(addr);
+                if user_bank && i < 15 {
+                    self.set_user_reg(i, v);
                     addr = addr.wrapping_add(4);
+                    continue;
                 }
+                if i == 15 {
+                    if s_bit {
+                        let old = self.mode();
+                        self.st.cpsr = *self.spsr_for_mode();
+                        self.switch_mode(old);
+                    }
+                    if self.st.arm9 && !s_bit {
+                        self.set_flag(T, v & 1 != 0);
+                    }
+                    self.st.regs[15] = v & if self.thumb() { !1 } else { !3 };
+                } else {
+                    self.st.regs[i as usize] = v;
+                }
+                addr = addr.wrapping_add(4);
             }
             if v5_wb_wins {
                 self.set_r(rn, new_base);
             }
         } else {
-            for i in 0..16 {
-                if list & (1 << i) != 0 {
-                    let v = if i == 15 {
-                        self.r(15).wrapping_add(4)
-                    } else if i == rn && i != first_reg && wb {
-                        // v4 stores the written-back base; v5 the old one.
-                        if self.st.arm9 {
-                            base
-                        } else {
-                            new_base
-                        }
-                    } else if user_bank {
-                        self.user_reg(i)
+            let mut rem = list;
+            while rem != 0 {
+                let i = rem.trailing_zeros();
+                rem &= rem - 1;
+                let v = if i == 15 {
+                    self.r(15).wrapping_add(4)
+                } else if i == rn && i != first_reg && wb {
+                    // v4 stores the written-back base; v5 the old one.
+                    if self.st.arm9 {
+                        base
                     } else {
-                        self.st.regs[i as usize]
-                    };
-                    self.bus.write32(addr, v);
-                    addr = addr.wrapping_add(4);
-                }
+                        new_base
+                    }
+                } else if user_bank {
+                    self.user_reg(i)
+                } else {
+                    self.st.regs[i as usize]
+                };
+                self.bus.write32(addr, v);
+                addr = addr.wrapping_add(4);
             }
             if wb {
                 self.set_r(rn, new_base);
@@ -1301,6 +1492,7 @@ impl<B: Bus> Cpu<B> {
 
     // ===================== Thumb =====================
 
+    #[inline(always)]
     fn exec_thumb(&mut self, op: u16) {
         let op = op as u32;
         match op >> 13 {
@@ -1422,11 +1614,12 @@ impl<B: Bus> Cpu<B> {
                     let n = list.count_ones() + r_bit as u32;
                     if load {
                         let mut addr = self.r(13);
-                        for i in 0..8 {
-                            if list & (1 << i) != 0 {
-                                self.st.regs[i as usize] = self.bus.read32(addr);
-                                addr = addr.wrapping_add(4);
-                            }
+                        let mut rem = list;
+                        while rem != 0 {
+                            let i = rem.trailing_zeros();
+                            rem &= rem - 1;
+                            self.st.regs[i as usize] = self.bus.read32(addr);
+                            addr = addr.wrapping_add(4);
                         }
                         if r_bit {
                             let v = self.bus.read32(addr);
@@ -1441,12 +1634,13 @@ impl<B: Bus> Cpu<B> {
                     } else {
                         let base = self.r(13).wrapping_sub(n * 4);
                         let mut addr = base;
-                        for i in 0..8 {
-                            if list & (1 << i) != 0 {
-                                let v = self.st.regs[i as usize];
-                                self.bus.write32(addr, v);
-                                addr = addr.wrapping_add(4);
-                            }
+                        let mut rem = list;
+                        while rem != 0 {
+                            let i = rem.trailing_zeros();
+                            rem &= rem - 1;
+                            let v = self.st.regs[i as usize];
+                            self.bus.write32(addr, v);
+                            addr = addr.wrapping_add(4);
                         }
                         if r_bit {
                             self.bus.write32(addr, self.st.regs[14]);
@@ -1477,20 +1671,21 @@ impl<B: Bus> Cpu<B> {
                     }
                     let first = list.trailing_zeros();
                     let new_base = addr.wrapping_add(list.count_ones() * 4);
-                    for i in 0..8 {
-                        if list & (1 << i) != 0 {
-                            if load {
-                                self.st.regs[i as usize] = self.bus.read32(addr);
+                    let mut rem = list;
+                    while rem != 0 {
+                        let i = rem.trailing_zeros();
+                        rem &= rem - 1;
+                        if load {
+                            self.st.regs[i as usize] = self.bus.read32(addr);
+                        } else {
+                            let v = if i == rb && i != first {
+                                new_base
                             } else {
-                                let v = if i == rb && i != first {
-                                    new_base
-                                } else {
-                                    self.st.regs[i as usize]
-                                };
-                                self.bus.write32(addr, v);
-                            }
-                            addr = addr.wrapping_add(4);
+                                self.st.regs[i as usize]
+                            };
+                            self.bus.write32(addr, v);
                         }
+                        addr = addr.wrapping_add(4);
                     }
                     if !(load && list & (1 << rb) != 0) {
                         self.set_r(rb, addr);
@@ -1537,6 +1732,7 @@ impl<B: Bus> Cpu<B> {
         }
     }
 
+    #[inline(always)]
     fn thumb_group_010(&mut self, op: u32) {
         if op & 0x1C00 == 0x0000 {
             let rd = op & 7;

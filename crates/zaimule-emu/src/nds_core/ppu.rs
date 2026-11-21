@@ -3,6 +3,7 @@ use super::bus::{Machine, BANK_SIZE};
 pub const WIDTH: usize = 256;
 pub const HEIGHT: usize = 192;
 
+#[inline(always)]
 fn rgb555(c: u16) -> u32 {
     let r = (c & 0x1F) as u32;
     let g = (c >> 5 & 0x1F) as u32;
@@ -10,12 +11,23 @@ fn rgb555(c: u16) -> u32 {
     (r << 19 | r >> 2 << 16) | (g << 11 | g >> 2 << 8) | (b << 3 | b >> 2)
 }
 
-/// Fast 16 KiB VRAM page lookup helper built once per engine per frame.
+/// Fast 16 KiB VRAM page lookup helper built once per engine per frame using direct slice pointers.
 #[inline(always)]
-fn vram_page_read8(m: &Machine, pages: &[Option<(usize, usize)>], off: u32) -> u8 {
+fn vram_page_read8(pages: &[Option<&[u8]>], off: u32) -> u8 {
     let page = (off >> 14) as usize;
-    if let Some(Some((bank, bank_off))) = pages.get(page) {
-        m.vram[*bank][*bank_off + (off & 0x3FFF) as usize]
+    if let Some(Some(slice)) = pages.get(page) {
+        slice[(off & 0x3FFF) as usize]
+    } else {
+        0
+    }
+}
+
+#[inline(always)]
+fn vram_page_read16(pages: &[Option<&[u8]>], off: u32) -> u16 {
+    let page = (off >> 14) as usize;
+    if let Some(Some(slice)) = pages.get(page) {
+        let o = (off & 0x3FFE) as usize;
+        u16::from_le_bytes([slice[o], slice[o + 1]])
     } else {
         0
     }
@@ -37,6 +49,8 @@ pub struct Ppu {
     obj_semi: Vec<bool>,
     #[serde(skip)]
     obj_bmp_alpha: Vec<u8>,
+    #[serde(skip)]
+    render3d: super::render3d::Render3dScratch,
 }
 
 impl Ppu {
@@ -49,6 +63,7 @@ impl Ppu {
             obj_win: vec![false; WIDTH * HEIGHT],
             obj_semi: vec![false; WIDTH * HEIGHT],
             obj_bmp_alpha: vec![0; WIDTH * HEIGHT],
+            render3d: super::render3d::Render3dScratch::new(),
         }
     }
 
@@ -78,14 +93,16 @@ impl Ppu {
                 2 => {
                     // LCDC: show the selected 128KB VRAM bank directly.
                     let bank = (dispcnt >> 18 & 3) as usize;
-                    for i in 0..WIDTH * HEIGHT {
+                    let src = &m.vram[bank];
+                    let limit = BANK_SIZE[bank].min(src.len());
+                    for (i, dst) in fb.iter_mut().enumerate() {
                         let off = i * 2;
-                        let c = if off + 1 < BANK_SIZE[bank] {
-                            u16::from_le_bytes([m.vram[bank][off], m.vram[bank][off + 1]])
+                        let c = if off + 1 < limit {
+                            u16::from_le_bytes([src[off], src[off + 1]])
                         } else {
                             0
                         };
-                        fb[i] = rgb555(c);
+                        *dst = rgb555(c);
                     }
                 }
                 _ => Self::render_graphics(
@@ -98,6 +115,7 @@ impl Ppu {
                     &mut self.obj_win,
                     &mut self.obj_semi,
                     &mut self.obj_bmp_alpha,
+                    &mut self.render3d,
                 ),
             }
         }
@@ -220,6 +238,7 @@ impl Ppu {
         obj_win: &mut [bool],
         obj_semi: &mut [bool],
         obj_bmp_alpha: &mut [u8],
+        render3d: &mut super::render3d::Render3dScratch,
     ) {
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum BgKind {
@@ -238,14 +257,25 @@ impl Ppu {
             (((raw as i32) << 4) >> 4) as i64
         };
         let pal_base = eng * 0x400;
-        let backdrop = u16::from_le_bytes([m.pal[pal_base], m.pal[pal_base + 1]]);
-        // BG VRAM window for this engine (512 KiB = 32 × 16 KiB pages).
-        let bg_vram_base: u32 = if eng == 0 { 0x0600_0000 } else { 0x0620_0000 };
-        let mut bg_pages = [None; 32];
-        for (p, slot) in bg_pages.iter_mut().enumerate() {
-            *slot = m.vram_slot(bg_vram_base + ((p as u32) << 14));
+        let mut bg_pal_rgb = [0u32; 256];
+        for (idx, dst) in bg_pal_rgb.iter_mut().enumerate() {
+            let p = pal_base + idx * 2;
+            *dst = rgb555(u16::from_le_bytes([m.pal[p], m.pal[p + 1]]));
         }
-        let vram8 = |off: u32| vram_page_read8(m, &bg_pages, off);
+        let backdrop_rgb = bg_pal_rgb[0];
+
+        // BG VRAM window for this engine (512 KiB = 32 × 16 KiB direct slices).
+        let bg_vram_base: u32 = if eng == 0 { 0x0600_0000 } else { 0x0620_0000 };
+        let mut bg_pages: [Option<&[u8]>; 32] = [None; 32];
+        for (p, slot) in bg_pages.iter_mut().enumerate() {
+            if let Some((bank, bank_off)) = m.vram_slot(bg_vram_base + ((p as u32) << 14)) {
+                if bank_off + 0x4000 <= m.vram[bank].len() {
+                    *slot = Some(&m.vram[bank][bank_off..bank_off + 0x4000]);
+                }
+            }
+        }
+        let vram8 = |off: u32| vram_page_read8(&bg_pages, off);
+        let vram16 = |off: u32| vram_page_read16(&bg_pages, off);
         let char_bank_off = if eng == 0 {
             (dispcnt >> 24 & 7) * 0x10000
         } else {
@@ -258,15 +288,14 @@ impl Ppu {
         };
 
         // 3D layer: engine A's BG0 shows the rasterized 3D frame when
-        // DISPCNT bit 3 is set. Rendered lazily, once per frame.
-        let bg0_3d = if eng == 0 && dispcnt & 8 != 0 && dispcnt & 0x100 != 0 {
-            Some(super::render3d::render(m))
-        } else {
-            None
-        };
+        // DISPCNT bit 3 is set. Rendered once per frame into reusable scratch.
+        let has_3d = eng == 0 && dispcnt & 8 != 0 && dispcnt & 0x100 != 0;
+        if has_3d {
+            super::render3d::render_into(m, render3d);
+        }
 
         let objs_enabled = dispcnt & (1 << 12) != 0;
-        if objs_enabled {
+        let (any_obj_drawn, any_semi_obj) = if objs_enabled {
             obj_prio.fill(0xFF);
             obj_win.fill(false);
             Self::render_objs(
@@ -278,8 +307,10 @@ impl Ppu {
                 obj_win,
                 obj_semi,
                 obj_bmp_alpha,
-            );
-        }
+            )
+        } else {
+            (false, false)
+        };
 
         // Color special effects (BLDCNT/BLDALPHA/BLDY). Layer ids: BG0-3 =
         // 0-3, OBJ = 4, backdrop = 5.
@@ -288,11 +319,9 @@ impl Ppu {
         let eva = (r16(0x52) & 0x1F).min(16);
         let evb = (r16(0x52) >> 8 & 0x1F).min(16);
         let evy = (r16(0x54) & 0x1F).min(16);
+        let need_color_fx = bld_mode != 0 || any_semi_obj;
 
-        // Windows clip layers to a rectangle: WININ says which layers draw
-        // inside WIN0 (low 6 bits) and WIN1 (next 8), WINOUT says which draw
-        // outside both (low byte) or inside the OBJ window (high byte).
-        // WIN0 takes precedence over WIN1, which beats the OBJ window.
+        // Windows clip layers to a rectangle.
         let bg_extpal_on = dispcnt & 1 << 30 != 0;
         let win0_on = dispcnt & 1 << 13 != 0;
         let win1_on = dispcnt & 1 << 14 != 0;
@@ -314,17 +343,17 @@ impl Ppu {
         let mut order = [0u32, 1, 2, 3];
         order.sort_by_key(|&bg| std::cmp::Reverse((r16(0x8 + bg as usize * 2) & 3, bg)));
         let mode = dispcnt & 7;
-        let backdrop_rgb = rgb555(backdrop);
 
         for y in 0..HEIGHT as u32 {
             let w0_row = win0_on && y >= w0y1 && y < w0y2;
             let w1_row = win1_on && y >= w1y1 && y < w1y2;
+            let row_off = y as usize * WIDTH;
             let layers_at = |x: u32| -> u32 {
                 if w0_row && x >= w0x1 && x < w0x2 {
                     winin
                 } else if w1_row && x >= w1x1 && x < w1x2 {
                     winin >> 8
-                } else if objwin_on && obj_win[y as usize * WIDTH + x as usize] {
+                } else if objwin_on && obj_win[row_off + x as usize] {
                     winout >> 8
                 } else {
                     winout
@@ -340,23 +369,35 @@ impl Ppu {
                 if dispcnt & (1 << (8 + bg)) == 0 {
                     continue;
                 }
-                // BG0 with 3D enabled: composite the rasterized 3D frame at
-                // BG0's priority; undrawn 3D pixels stay transparent.
+                // BG0 with 3D enabled: composite the rasterized 3D frame at BG0's priority.
                 if eng == 0 && bg == 0 && dispcnt & 8 != 0 {
-                    if let Some(buf) = &bg0_3d {
+                    if has_3d {
+                        let buf = &render3d.fb[row_off..row_off + WIDTH];
                         let prio = (r16(0x8) & 3) as u8;
-                        for x in 0..WIDTH as u32 {
-                            if windows_on && layers_at(x) & 1 == 0 {
-                                continue;
+                        if !windows_on {
+                            for x in 0..WIDTH {
+                                let px = buf[x];
+                                if px != super::render3d::TRANSPARENT {
+                                    sec_col[x] = top_col[x];
+                                    sec_layer[x] = top_layer[x];
+                                    top_col[x] = px;
+                                    top_layer[x] = 0;
+                                    top_prio[x] = prio;
+                                }
                             }
-                            let i = y as usize * WIDTH + x as usize;
-                            if buf[i] != super::render3d::TRANSPARENT {
-                                let x = x as usize;
-                                sec_col[x] = top_col[x];
-                                sec_layer[x] = top_layer[x];
-                                top_col[x] = buf[i];
-                                top_layer[x] = 0;
-                                top_prio[x] = prio;
+                        } else {
+                            for x in 0..WIDTH {
+                                if layers_at(x as u32) & 1 == 0 {
+                                    continue;
+                                }
+                                let px = buf[x];
+                                if px != super::render3d::TRANSPARENT {
+                                    sec_col[x] = top_col[x];
+                                    sec_layer[x] = top_layer[x];
+                                    top_col[x] = px;
+                                    top_layer[x] = 0;
+                                    top_prio[x] = prio;
+                                }
                             }
                         }
                     }
@@ -393,71 +434,96 @@ impl Ppu {
                     let size = bgcnt >> 14 & 3;
                     let hofs = r16(0x10 + bg as usize * 4) & 0x1FF;
                     let vofs = r16(0x12 + bg as usize * 4) & 0x1FF;
-                    let (w_tiles, h_tiles) = match size {
-                        0 => (32u32, 32u32),
-                        1 => (64, 32),
-                        2 => (32, 64),
-                        _ => (64, 64),
+                    let w_mask = if size & 1 != 0 { 511u32 } else { 255u32 };
+                    let h_mask = if size & 2 != 0 { 511u32 } else { 255u32 };
+                    let py = (y + vofs) & h_mask;
+                    let ty = (py >> 3) & 31;
+                    let fy_raw = py & 7;
+                    let sbb_y = match size {
+                        2 => (py >> 8) * 0x800,
+                        3 => (py >> 8) * 0x1000,
+                        _ => 0,
                     };
-                    let py = (y + vofs) % (h_tiles * 8);
-                    for x in 0..WIDTH as u32 {
-                        if windows_on && layers_at(x) & 1 << bg == 0 {
-                            continue;
-                        }
-                        let px = (x + hofs) % (w_tiles * 8);
-                        let sbb = match size {
-                            0 => 0,
-                            1 => px / 256,
-                            2 => py / 256,
-                            _ => (px / 256) + (py / 256) * 2,
-                        };
-                        let tx = (px / 8) % 32;
-                        let ty = (py / 8) % 32;
-                        let entry_off = screen_base + sbb * 0x800 + (ty * 32 + tx) * 2;
-                        let entry =
-                            u16::from_le_bytes([vram8(entry_off), vram8(entry_off + 1)]) as u32;
+                    let row_screen_base = screen_base + sbb_y + ty * 64;
+                    let extpal_slot = if bg < 2 && bgcnt & 0x2000 != 0 {
+                        bg as usize + 2
+                    } else {
+                        bg as usize
+                    };
+                    let bg_bit = 1u32 << bg;
+                    let bg_u8 = bg as u8;
+
+                    // Tile-at-a-time rendering: read each 16-bit screen entry once per 8-pixel tile.
+                    let mut x = 0u32;
+                    while x < WIDTH as u32 {
+                        let px = (x + hofs) & w_mask;
+                        let fx_start = px & 7;
+                        let run = (8 - fx_start).min(WIDTH as u32 - x);
+                        let sbb_x = if size & 1 != 0 { (px >> 8) * 0x800 } else { 0 };
+                        let tx = (px >> 3) & 31;
+                        let entry = vram16(row_screen_base + sbb_x + tx * 2) as u32;
                         let tile = entry & 0x3FF;
-                        let mut fx = px % 8;
-                        let mut fy = py % 8;
-                        if entry & 0x400 != 0 {
-                            fx = 7 - fx;
-                        }
-                        if entry & 0x800 != 0 {
-                            fy = 7 - fy;
-                        }
-                        let color = if eight_bpp {
-                            vram8(char_base + tile * 64 + fy * 8 + fx) as u32
+                        let hflip = entry & 0x400 != 0;
+                        let fy = if entry & 0x800 != 0 {
+                            7 - fy_raw
                         } else {
-                            let b = vram8(char_base + tile * 32 + fy * 4 + fx / 2) as u32;
-                            if fx & 1 == 0 {
-                                b & 0xF
-                            } else {
-                                b >> 4
-                            }
+                            fy_raw
                         };
-                        if color != 0 {
-                            let c = if eight_bpp && bg_extpal_on {
-                                let slot = if bg < 2 && bgcnt & 0x2000 != 0 {
-                                    bg as usize + 2
+                        let pal_hi = entry >> 12;
+
+                        if eight_bpp {
+                            let tile_row = char_base + tile * 64 + fy * 8;
+                            for step in 0..run {
+                                let cx = x + step;
+                                if windows_on && layers_at(cx) & bg_bit == 0 {
+                                    continue;
+                                }
+                                let fx = if hflip {
+                                    7 - (fx_start + step)
                                 } else {
-                                    bg as usize
+                                    fx_start + step
                                 };
-                                m.bg_extpal(eng, slot, entry >> 12, color)
-                            } else {
-                                let poff = if eight_bpp {
-                                    pal_base + color as usize * 2
+                                let color = vram8(tile_row + fx) as u32;
+                                if color != 0 {
+                                    let rgb = if bg_extpal_on {
+                                        rgb555(m.bg_extpal(eng, extpal_slot, pal_hi, color))
+                                    } else {
+                                        bg_pal_rgb[color as usize]
+                                    };
+                                    let xi = cx as usize;
+                                    sec_col[xi] = top_col[xi];
+                                    sec_layer[xi] = top_layer[xi];
+                                    top_col[xi] = rgb;
+                                    top_layer[xi] = bg_u8;
+                                    top_prio[xi] = prio;
+                                }
+                            }
+                        } else {
+                            let tile_row = char_base + tile * 32 + fy * 4;
+                            let pal_off = (pal_hi as usize) * 16;
+                            for step in 0..run {
+                                let cx = x + step;
+                                if windows_on && layers_at(cx) & bg_bit == 0 {
+                                    continue;
+                                }
+                                let fx = if hflip {
+                                    7 - (fx_start + step)
                                 } else {
-                                    pal_base + ((entry >> 12) * 32 + color * 2) as usize
+                                    fx_start + step
                                 };
-                                u16::from_le_bytes([m.pal[poff], m.pal[poff + 1]])
-                            };
-                            let x = x as usize;
-                            sec_col[x] = top_col[x];
-                            sec_layer[x] = top_layer[x];
-                            top_col[x] = rgb555(c);
-                            top_layer[x] = bg as u8;
-                            top_prio[x] = prio;
+                                let b = vram8(tile_row + (fx >> 1)) as u32;
+                                let color = if fx & 1 == 0 { b & 0xF } else { b >> 4 };
+                                if color != 0 {
+                                    let xi = cx as usize;
+                                    sec_col[xi] = top_col[xi];
+                                    sec_layer[xi] = top_layer[xi];
+                                    top_col[xi] = bg_pal_rgb[pal_off + color as usize];
+                                    top_layer[xi] = bg_u8;
+                                    top_prio[xi] = prio;
+                                }
+                            }
                         }
+                        x += run;
                     }
                     continue;
                 }
@@ -501,6 +567,8 @@ impl Ppu {
                 if map_w == 0 || map_h == 0 {
                     continue;
                 }
+                let mask_w = map_w - 1;
+                let mask_h = map_h - 1;
 
                 let char_base = (char_bank_off + (bgcnt >> 2 & 0xF) * 0x4000) as u32;
                 let screen_base_tile = (screen_bank_off + (bgcnt >> 8 & 0x1F) * 0x800) as u32;
@@ -509,7 +577,7 @@ impl Ppu {
                 } else {
                     ((bgcnt >> 8) & 0x1F) * 0x4000
                 };
-                let tiles_w = (map_w / 8) as u32;
+                let tiles_w = (map_w >> 3) as u32;
 
                 #[derive(Clone, Copy)]
                 enum AffMode {
@@ -528,8 +596,8 @@ impl Ppu {
                 };
 
                 for x in 0..WIDTH as u32 {
-                    let cur_x = (sx >> 8) as i64;
-                    let cur_y = (sy >> 8) as i64;
+                    let cur_x = sx >> 8;
+                    let cur_y = sy >> 8;
                     sx += pa;
                     sy += pc;
 
@@ -538,10 +606,7 @@ impl Ppu {
                     }
                     let (px, py) = if cur_x < 0 || cur_x >= map_w || cur_y < 0 || cur_y >= map_h {
                         if overflow_wrap {
-                            (
-                                cur_x.rem_euclid(map_w) as u32,
-                                cur_y.rem_euclid(map_h) as u32,
-                            )
+                            ((cur_x & mask_w) as u32, (cur_y & mask_h) as u32)
                         } else {
                             continue;
                         }
@@ -549,25 +614,24 @@ impl Ppu {
                         (cur_x as u32, cur_y as u32)
                     };
 
-                    let rgb15: Option<u16> = match aff_mode {
+                    let rgb_opt: Option<u32> = match aff_mode {
                         AffMode::Affine8bpp => {
                             let tx = px >> 3;
                             let ty = py >> 3;
                             let tile = vram8(screen_base_tile + ty * tiles_w + tx) as u32;
                             let color =
-                                vram8(char_base + tile * 64 + (py & 7) * 8 + (px & 7)) as u32;
+                                vram8(char_base + tile * 64 + (py & 7) * 8 + (px & 7)) as usize;
                             if color == 0 {
                                 None
                             } else {
-                                let poff = pal_base + color as usize * 2;
-                                Some(u16::from_le_bytes([m.pal[poff], m.pal[poff + 1]]))
+                                Some(bg_pal_rgb[color])
                             }
                         }
                         AffMode::ExtTile16 => {
                             let tx = px >> 3;
                             let ty = py >> 3;
                             let eoff = screen_base_tile + (ty * tiles_w + tx) * 2;
-                            let entry = u16::from_le_bytes([vram8(eoff), vram8(eoff + 1)]) as u32;
+                            let entry = vram16(eoff) as u32;
                             let tile = entry & 0x3FF;
                             let mut fx = px & 7;
                             let mut fy = py & 7;
@@ -581,39 +645,37 @@ impl Ppu {
                             if color == 0 {
                                 None
                             } else if bg_extpal_on {
-                                Some(m.bg_extpal(eng, bg as usize, entry >> 12, color))
+                                Some(rgb555(m.bg_extpal(eng, bg as usize, entry >> 12, color)))
                             } else {
-                                let poff = pal_base + color as usize * 2;
-                                Some(u16::from_le_bytes([m.pal[poff], m.pal[poff + 1]]))
+                                Some(bg_pal_rgb[color as usize])
                             }
                         }
                         AffMode::Bitmap8bpp => {
-                            let color = vram8(bmp_base + py * (map_w as u32) + px) as u32;
+                            let color = vram8(bmp_base + py * (map_w as u32) + px) as usize;
                             if color == 0 {
                                 None
                             } else {
-                                let poff = pal_base + color as usize * 2;
-                                Some(u16::from_le_bytes([m.pal[poff], m.pal[poff + 1]]))
+                                Some(bg_pal_rgb[color])
                             }
                         }
                         AffMode::BitmapDirect16 => {
                             let off = bmp_base + (py * (map_w as u32) + px) * 2;
-                            let c = u16::from_le_bytes([vram8(off), vram8(off + 1)]);
+                            let c = vram16(off);
                             if c & 0x8000 == 0 {
                                 None
                             } else {
-                                Some(c & 0x7FFF)
+                                Some(rgb555(c & 0x7FFF))
                             }
                         }
                     };
 
-                    if let Some(c) = rgb15 {
-                        let x = x as usize;
-                        sec_col[x] = top_col[x];
-                        sec_layer[x] = top_layer[x];
-                        top_col[x] = rgb555(c);
-                        top_layer[x] = bg as u8;
-                        top_prio[x] = prio;
+                    if let Some(rgb) = rgb_opt {
+                        let xi = x as usize;
+                        sec_col[xi] = top_col[xi];
+                        sec_layer[xi] = top_layer[xi];
+                        top_col[xi] = rgb;
+                        top_layer[xi] = bg as u8;
+                        top_prio[xi] = prio;
                     }
                 }
             }
@@ -622,44 +684,57 @@ impl Ppu {
             // same or lower priority (higher or equal value).
             let mut semi_top = [false; WIDTH];
             let mut bmp_alpha_top = [0u8; WIDTH];
-            if objs_enabled {
-                for x in 0..WIDTH as u32 {
-                    let i = y as usize * WIDTH + x as usize;
+            let mut row_has_semi = false;
+            if any_obj_drawn {
+                for x in 0..WIDTH {
+                    let i = row_off + x;
                     if obj_prio[i] == 0xFF {
                         continue;
                     }
-                    if windows_on && layers_at(x) & 0x10 == 0 {
+                    if windows_on && layers_at(x as u32) & 0x10 == 0 {
                         continue;
                     }
-                    if obj_prio[i] <= top_prio[x as usize] {
-                        let x = x as usize;
+                    if obj_prio[i] <= top_prio[x] {
                         sec_col[x] = top_col[x];
                         sec_layer[x] = top_layer[x];
                         top_col[x] = rgb555(obj_col[i]);
                         top_layer[x] = 4;
-                        semi_top[x] = obj_semi[i];
-                        bmp_alpha_top[x] = obj_bmp_alpha[i];
+                        if any_semi_obj {
+                            let s = obj_semi[i];
+                            let ba = obj_bmp_alpha[i];
+                            semi_top[x] = s;
+                            bmp_alpha_top[x] = ba;
+                            if s || ba > 0 {
+                                row_has_semi = true;
+                            }
+                        }
                     }
                 }
             }
 
+            // Fast path: when no blend mode and no semi-transparent sprite pixel touched this row,
+            // commit `top_col` directly with a single memcpy.
+            if bld_mode == 0 && !row_has_semi {
+                fb[row_off..row_off + WIDTH].copy_from_slice(&top_col);
+                continue;
+            }
+
             // Color special effects, then commit the row.
+            let _ = need_color_fx;
             for x in 0..WIDTH {
                 let (top, sec) = (top_col[x], sec_col[x]);
                 let first_ok = bldcnt >> top_layer[x] & 1 != 0;
                 let second_ok = bldcnt >> (8 + sec_layer[x]) & 1 != 0;
                 let alpha = |eva_c: u32, evb_c: u32| {
                     let bl = |sh: u32| {
-                        (((top >> sh & 0xFF) * eva_c + (sec >> sh & 0xFF) * evb_c) / 16).min(255)
+                        (((top >> sh & 0xFF) * eva_c + (sec >> sh & 0xFF) * evb_c) >> 4).min(255)
                     };
                     bl(16) << 16 | bl(8) << 8 | bl(0)
                 };
-                let out = if bmp_alpha_top[x] > 0 && second_ok {
-                    // Semi-transparent Bitmap OBJ uses per-OBJ attr2 alpha (+1) / 16.
+                let out = if row_has_semi && bmp_alpha_top[x] > 0 && second_ok {
                     let ba = bmp_alpha_top[x] as u32;
                     alpha(ba, 16 - ba)
-                } else if semi_top[x] && second_ok {
-                    // Semi-transparent tile sprite pixels always alpha-blend with BLDALPHA.
+                } else if row_has_semi && semi_top[x] && second_ok {
                     alpha(eva, evb)
                 } else {
                     match bld_mode {
@@ -667,27 +742,28 @@ impl Ppu {
                         2 if first_ok => {
                             let bl = |sh: u32| {
                                 let c = top >> sh & 0xFF;
-                                c + (255 - c) * evy / 16
+                                c + (((255 - c) * evy) >> 4)
                             };
                             bl(16) << 16 | bl(8) << 8 | bl(0)
                         }
                         3 if first_ok => {
                             let bl = |sh: u32| {
                                 let c = top >> sh & 0xFF;
-                                c - c * evy / 16
+                                c - ((c * evy) >> 4)
                             };
                             bl(16) << 16 | bl(8) << 8 | bl(0)
                         }
                         _ => top,
                     }
                 };
-                fb[y as usize * WIDTH + x] = out;
+                fb[row_off + x] = out;
             }
         }
     }
 
     /// Render all OAM sprites for one engine into per-pixel color/priority
     /// buffers (lower OAM index wins), bitmap per-OBJ alpha, and the OBJ-window mask.
+    /// Returns `(any_obj_drawn, any_semi_or_bmp_alpha)`.
     #[allow(clippy::too_many_arguments)]
     fn render_objs(
         m: &Machine,
@@ -698,27 +774,32 @@ impl Ppu {
         obj_win: &mut [bool],
         obj_semi: &mut [bool],
         obj_bmp_alpha: &mut [u8],
-    ) {
+    ) -> (bool, bool) {
         let oam_base = eng * 0x400;
         let obj_vram_base: u32 = if eng == 0 { 0x0640_0000 } else { 0x0660_0000 };
-        let mut obj_pages = [None; 16];
+        let mut obj_pages: [Option<&[u8]>; 16] = [None; 16];
         for (p, slot) in obj_pages.iter_mut().enumerate() {
-            *slot = m.vram_slot(obj_vram_base + ((p as u32) << 14));
+            if let Some((bank, bank_off)) = m.vram_slot(obj_vram_base + ((p as u32) << 14)) {
+                if bank_off + 0x4000 <= m.vram[bank].len() {
+                    *slot = Some(&m.vram[bank][bank_off..bank_off + 0x4000]);
+                }
+            }
         }
-        let obj_vram8 =
-            |addr: u32| vram_page_read8(m, &obj_pages, addr.wrapping_sub(obj_vram_base));
+        let obj_vram8 = |addr: u32| vram_page_read8(&obj_pages, addr.wrapping_sub(obj_vram_base));
         let pal_base = eng * 0x400 + 0x200;
         let one_d = dispcnt & 0x10 != 0;
         let bmp_one_d = dispcnt & 0x40 != 0;
         let bmp_2d_w: u32 = if dispcnt & 0x20 != 0 { 256 } else { 128 };
         let obj_extpal_on = dispcnt & 1 << 31 != 0;
-        // In 1D mapping the tile index steps in units of 32<<boundary bytes (tile) or 128<<bit22 (bitmap).
         let boundary = 32u32 << (dispcnt >> 20 & 3);
         let bmp_boundary = if eng == 0 {
             128u32 << ((dispcnt >> 22) & 1)
         } else {
             128u32
         };
+        let mut any_drawn = false;
+        let mut any_semi = false;
+
         // Painted highest index first so lower OAM indices overwrite (win).
         for idx in (0..128).rev() {
             let at = |o: usize| {
@@ -763,6 +844,13 @@ impl Ppu {
             if left >= 256 {
                 left -= 512; // X is 9-bit signed
             }
+            let sy_start = (-top).max(0);
+            let sy_end = (HEIGHT as i32 - top).min(bh);
+            let sx_start = (-left).max(0);
+            let sx_end = (WIDTH as i32 - left).min(bw);
+            if sy_start >= sy_end || sx_start >= sx_end {
+                continue;
+            }
             let (pa, pb, pc, pd) = if rot {
                 let grp = oam_base + (a1 >> 9 & 0x1F) as usize * 32;
                 let p = |o: usize| i16::from_le_bytes([m.oam[grp + o], m.oam[grp + o + 1]]) as i32;
@@ -774,23 +862,21 @@ impl Ppu {
             let prio = (a2 >> 10 & 3) as u8;
             let tsz: u32 = if eight_bpp { 64 } else { 32 };
             let w_tiles = (w / 8) as u32;
-            for sy in 0..bh {
-                let y = top + sy;
-                if y < 0 || y >= HEIGHT as i32 {
-                    continue;
-                }
-                for sx in 0..bw {
-                    let x = left + sx;
-                    if x < 0 || x >= WIDTH as i32 {
-                        continue;
-                    }
+            if mode == 1 || (mode == 3 && palnum < 15) {
+                any_semi = true;
+            }
+            for sy in sy_start..sy_end {
+                let y = (top + sy) as usize;
+                let row_y = y * WIDTH;
+                for sx in sx_start..sx_end {
+                    let x = (left + sx) as usize;
                     // Texture coordinates within the w*h sprite.
                     let (tx, ty) = if rot {
                         let dx = sx - bw / 2;
                         let dy = sy - bh / 2;
                         (
-                            (w / 2 << 8) + pa * dx + pb * dy >> 8,
-                            (h / 2 << 8) + pc * dx + pd * dy >> 8,
+                            ((w / 2 << 8) + pa * dx + pb * dy) >> 8,
+                            ((h / 2 << 8) + pc * dx + pd * dy) >> 8,
                         )
                     } else {
                         let mut tx = sx;
@@ -806,6 +892,7 @@ impl Ppu {
                     if tx < 0 || tx >= w || ty < 0 || ty >= h {
                         continue;
                     }
+                    let i = row_y + x;
                     if mode == 3 {
                         let addr = if bmp_one_d {
                             obj_vram_base
@@ -824,19 +911,18 @@ impl Ppu {
                         if raw & 0x8000 == 0 {
                             continue;
                         }
-                        let i = y as usize * WIDTH + x as usize;
                         obj_col[i] = raw & 0x7FFF;
                         obj_prio[i] = prio;
                         obj_semi[i] = false;
                         obj_bmp_alpha[i] = if palnum < 15 { (palnum + 1) as u8 } else { 0 };
+                        any_drawn = true;
                         continue;
                     }
-                    let (ctx, cty) = ((tx / 8) as u32, (ty / 8) as u32);
-                    let (fx, fy) = ((tx % 8) as u32, (ty % 8) as u32);
+                    let (ctx, cty) = ((tx >> 3) as u32, (ty >> 3) as u32);
+                    let (fx, fy) = ((tx & 7) as u32, (ty & 7) as u32);
                     let tile_addr = if one_d {
                         obj_vram_base + tile * boundary + (cty * w_tiles + ctx) * tsz
                     } else if eight_bpp {
-                        // 2D map: 32 tile-index units (32 bytes each) per row.
                         obj_vram_base + (tile & !1) * 32 + cty * 1024 + ctx * 64
                     } else {
                         obj_vram_base + (tile + cty * 32 + ctx) * 32
@@ -844,7 +930,7 @@ impl Ppu {
                     let color = if eight_bpp {
                         obj_vram8(tile_addr + fy * 8 + fx) as u32
                     } else {
-                        let b = obj_vram8(tile_addr + fy * 4 + fx / 2) as u32;
+                        let b = obj_vram8(tile_addr + fy * 4 + (fx >> 1)) as u32;
                         if fx & 1 == 0 {
                             b & 0xF
                         } else {
@@ -854,7 +940,6 @@ impl Ppu {
                     if color == 0 {
                         continue;
                     }
-                    let i = y as usize * WIDTH + x as usize;
                     if mode == 2 {
                         obj_win[i] = true;
                         continue;
@@ -872,9 +957,11 @@ impl Ppu {
                         u16::from_le_bytes([m.pal[poff], m.pal[poff + 1]])
                     };
                     obj_prio[i] = prio;
+                    any_drawn = true;
                 }
             }
         }
+        (any_drawn, any_semi)
     }
 }
 

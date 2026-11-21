@@ -107,15 +107,26 @@ impl Core for GbaCore {
         // the PPU somehow never signals (e.g. a ROM that stops the clock).
         let cap = self.cpu.bus.cycles + CYCLES_PER_FRAME;
         while !self.cpu.bus.ppu.frame_ready && self.cpu.bus.cycles < cap {
-            self.cpu.step_system();
+            self.cpu.step_system_until(cap);
         }
+        self.cpu.bus.apu_catch_up();
         if let Some(lut) = self.correction.as_deref() {
-            for (i, &c) in self.cpu.bus.ppu.frame.iter().enumerate() {
-                self.frame.pixels[i] = lut[(c & 0x7FFF) as usize];
+            for (dst, &c) in self
+                .frame
+                .pixels
+                .iter_mut()
+                .zip(self.cpu.bus.ppu.frame.iter())
+            {
+                *dst = lut[(c & 0x7FFF) as usize];
             }
         } else {
-            for (i, &c) in self.cpu.bus.ppu.frame.iter().enumerate() {
-                self.frame.pixels[i] = ppu::bgr555_to_rgb(c);
+            for (dst, &c) in self
+                .frame
+                .pixels
+                .iter_mut()
+                .zip(self.cpu.bus.ppu.frame.iter())
+            {
+                *dst = ppu::bgr555_to_rgb(c);
             }
         }
         &self.frame

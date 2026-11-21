@@ -106,29 +106,45 @@ impl Bus {
         }
 
         // Stage 1: layer producers
-        self.ppu.bg_line = [[TRANSPARENT; WIDTH]; 4];
-        self.ppu.obj_line = [NO_OBJ; WIDTH];
-        self.ppu.obj_window = [false; WIDTH];
         let mode = dispcnt & 7;
         let bg_on = |i: usize| dispcnt & (1 << (8 + i)) != 0;
+        let mut active_bg_mask = 0u8;
         match mode {
             0 => {
                 for i in 0..4 {
                     if bg_on(i) {
+                        self.ppu.bg_line[i].fill(TRANSPARENT);
                         self.render_text_bg(i, line);
+                        active_bg_mask |= 1 << i;
                     }
                 }
             }
             1 => {
                 if bg_on(0) {
+                    self.ppu.bg_line[0].fill(TRANSPARENT);
                     self.render_text_bg(0, line);
+                    active_bg_mask |= 1 << 0;
                 }
                 if bg_on(1) {
+                    self.ppu.bg_line[1].fill(TRANSPARENT);
                     self.render_text_bg(1, line);
+                    active_bg_mask |= 1 << 1;
+                }
+                if bg_on(2) {
+                    self.ppu.bg_line[2].fill(TRANSPARENT);
+                    active_bg_mask |= 1 << 2;
                 }
                 self.render_affine_bg(2, line, bg_on(2));
             }
             2 => {
+                if bg_on(2) {
+                    self.ppu.bg_line[2].fill(TRANSPARENT);
+                    active_bg_mask |= 1 << 2;
+                }
+                if bg_on(3) {
+                    self.ppu.bg_line[3].fill(TRANSPARENT);
+                    active_bg_mask |= 1 << 3;
+                }
                 self.render_affine_bg(2, line, bg_on(2));
                 self.render_affine_bg(3, line, bg_on(3));
             }
@@ -139,10 +155,12 @@ impl Bus {
                         self.ppu.bg_line[2][x] =
                             u16::from_le_bytes([self.vram[i], self.vram[i + 1]]);
                     }
+                    active_bg_mask |= 1 << 2;
                 }
             }
             4 => {
                 if bg_on(2) {
+                    self.ppu.bg_line[2].fill(TRANSPARENT);
                     let page = if dispcnt & (1 << 4) != 0 { 0xA000 } else { 0 };
                     for x in 0..WIDTH {
                         let idx = self.vram[page + line * WIDTH + x] as usize;
@@ -150,28 +168,38 @@ impl Bus {
                             self.ppu.bg_line[2][x] = self.palette16(idx);
                         }
                     }
+                    active_bg_mask |= 1 << 2;
                 }
             }
             _ => {
-                if bg_on(2) && line < 128 {
-                    let page = if dispcnt & (1 << 4) != 0 { 0xA000 } else { 0 };
-                    for x in 0..160 {
-                        let i = page + (line * 160 + x) * 2;
-                        self.ppu.bg_line[2][x] =
-                            u16::from_le_bytes([self.vram[i], self.vram[i + 1]]);
+                if bg_on(2) {
+                    self.ppu.bg_line[2].fill(TRANSPARENT);
+                    if line < 128 {
+                        let page = if dispcnt & (1 << 4) != 0 { 0xA000 } else { 0 };
+                        for x in 0..160 {
+                            let i = page + (line * 160 + x) * 2;
+                            self.ppu.bg_line[2][x] =
+                                u16::from_le_bytes([self.vram[i], self.vram[i + 1]]);
+                        }
                     }
+                    active_bg_mask |= 1 << 2;
                 }
             }
         }
-        if dispcnt & (1 << 12) != 0 {
+        let obj_enabled = dispcnt & (1 << 12) != 0;
+        if obj_enabled {
+            self.ppu.obj_line.fill(NO_OBJ);
+            if dispcnt & (1 << 15) != 0 {
+                self.ppu.obj_window.fill(false);
+            }
             self.render_objects(line, dispcnt);
         }
 
         // Stages 2+3
-        self.compose(line, dispcnt);
+        self.compose(line, dispcnt, active_bg_mask, obj_enabled);
     }
 
-    fn compose(&mut self, line: usize, dispcnt: u16) {
+    fn compose(&mut self, line: usize, dispcnt: u16, active_bg_mask: u8, obj_enabled: bool) {
         let backdrop = self.palette16(0);
         let bg_prio = [
             (self.io16(0x008) & 3) as u8,
@@ -179,67 +207,107 @@ impl Bus {
             (self.io16(0x00C) & 3) as u8,
             (self.io16(0x00E) & 3) as u8,
         ];
+        // Pre-sort active BGs in exact (priority, bg_index) order once per scanline.
+        let mut sorted_bgs = [(0usize, 0u8); 4];
+        let mut n_bgs = 0usize;
+        for p in 0..4u8 {
+            for (bg, &prio) in bg_prio.iter().enumerate() {
+                if (active_bg_mask & (1 << bg)) != 0 && prio == p {
+                    sorted_bgs[n_bgs] = (bg, p);
+                    n_bgs += 1;
+                }
+            }
+        }
+
         let bldcnt = self.io16(0x050);
+        let bld_mode = (bldcnt >> 6) & 3;
         let bldalpha = self.io16(0x052);
         let bldy = (self.io16(0x054) & 0x1F).min(16) as u32;
         let eva = (bldalpha & 0x1F).min(16) as u32;
         let evb = ((bldalpha >> 8) & 0x1F).min(16) as u32;
+        let win_enabled = dispcnt & 0xE000 != 0;
+        let row_off = line * WIDTH;
 
         for x in 0..WIDTH {
-            let win = self.window_mask(x, line, dispcnt);
+            let win = if win_enabled {
+                self.window_mask(x, line, dispcnt)
+            } else {
+                0x3F
+            };
             // top two visible layers; layer ids: 0-3 BG, 4 OBJ, 5 backdrop
             let mut top = (backdrop, 5u8);
             let mut second = (backdrop, 5u8);
             let mut found = 0u8;
-            let op = self.ppu.obj_line[x];
-            'scan: for p in 0..4u8 {
-                if win & 0x10 != 0 && op.color != TRANSPARENT && op.prio == p {
+            let op = if obj_enabled && (win & 0x10 != 0) {
+                self.ppu.obj_line[x]
+            } else {
+                NO_OBJ
+            };
+            let has_obj = op.color != TRANSPARENT;
+            let mut obj_used = !has_obj;
+            let need_second = bld_mode == 1 || (has_obj && op.semi);
+
+            for &(bg, p) in &sorted_bgs[..n_bgs] {
+                if !obj_used && op.prio <= p {
+                    obj_used = true;
                     if found == 0 {
                         top = (op.color, 4);
                         found = 1;
+                        if !need_second {
+                            break;
+                        }
                     } else {
                         second = (op.color, 4);
-                        break 'scan;
+                        found = 2;
+                        break;
                     }
                 }
-                for bg in 0..4usize {
-                    if bg_prio[bg] != p || win & (1 << bg) == 0 {
-                        continue;
+                if win & (1 << bg) == 0 {
+                    continue;
+                }
+                let c = self.ppu.bg_line[bg][x];
+                if c == TRANSPARENT {
+                    continue;
+                }
+                if found == 0 {
+                    top = (c, bg as u8);
+                    found = 1;
+                    if !need_second {
+                        break;
                     }
-                    let c = self.ppu.bg_line[bg][x];
-                    if c == TRANSPARENT {
-                        continue;
-                    }
-                    if found == 0 {
-                        top = (c, bg as u8);
-                        found = 1;
-                    } else {
-                        second = (c, bg as u8);
-                        break 'scan;
-                    }
+                } else {
+                    second = (c, bg as u8);
+                    found = 2;
+                    break;
+                }
+            }
+            if !obj_used && found < 2 {
+                if found == 0 {
+                    top = (op.color, 4);
+                } else {
+                    second = (op.color, 4);
                 }
             }
 
             // Stage 3: color special effects
-            let first_target = bldcnt & (1 << top.1) != 0;
-            let second_target = bldcnt & (1 << (8 + second.1)) != 0;
-            let special_ok = win & 0x20 != 0;
             let mut color = top.0;
-            // Semi-transparent objects always alpha-blend with a 2nd-target
-            // pixel below — independent of BLDCNT's effect mode AND of the
-            // window color-effects bit (only BG/brightness effects are
-            // window-gated). Pokémon FRLG fog relies on this.
-            if top.1 == 4 && op.semi && second_target {
+            if top.1 == 4 && op.semi && (bldcnt & (1 << (8 + second.1)) != 0) {
+                // Semi-transparent objects always alpha-blend with a 2nd-target
+                // pixel below — independent of BLDCNT's effect mode AND of the
+                // window color-effects bit (only BG/brightness effects are
+                // window-gated). Pokémon FRLG fog relies on this.
                 color = alpha_blend(top.0, second.0, eva, evb);
-            } else if special_ok && first_target {
-                match (bldcnt >> 6) & 3 {
-                    1 if second_target => color = alpha_blend(top.0, second.0, eva, evb),
+            } else if bld_mode != 0 && (win & 0x20 != 0) && (bldcnt & (1 << top.1) != 0) {
+                match bld_mode {
+                    1 if bldcnt & (1 << (8 + second.1)) != 0 => {
+                        color = alpha_blend(top.0, second.0, eva, evb);
+                    }
                     2 => color = brighten(top.0, bldy),
                     3 => color = darken(top.0, bldy),
                     _ => {}
                 }
             }
-            self.ppu.frame[line * WIDTH + x] = color;
+            self.ppu.frame[row_off + x] = color;
         }
     }
 

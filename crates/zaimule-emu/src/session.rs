@@ -225,6 +225,16 @@ fn sanitize_cache_filename(raw: &str) -> String {
 
 /// Encodes a [`ViewportStepResponse`] into the zero-JSON-array `"ZMFR"` v1 binary wire format.
 pub fn encode_viewport_binary_packet(resp: &ViewportStepResponse, sram_dirty: bool) -> Vec<u8> {
+    encode_viewport_binary_packet_with_meta(resp, sram_dirty, true)
+}
+
+/// Encodes a [`ViewportStepResponse`] into `"ZMFR"` v1 binary bytes, optionally omitting
+/// the JSON debug metadata trailer when no telemetry/achievement/link update is needed.
+pub fn encode_viewport_binary_packet_with_meta(
+    resp: &ViewportStepResponse,
+    sram_dirty: bool,
+    include_debug_meta: bool,
+) -> Vec<u8> {
     let mut views: Vec<&FrameStepResult> = Vec::with_capacity(4);
     views.push(&resp.primary);
     if let Some(ref s) = resp.secondary {
@@ -237,14 +247,23 @@ pub fn encode_viewport_binary_packet(resp: &ViewportStepResponse, sram_dirty: bo
         views.push(q);
     }
 
-    let meta_json = serde_json::to_vec(&ViewportPacketMetadata {
-        console: resp.primary.console,
-        cpu: &resp.primary.cpu,
-        link_telemetry: &resp.link_telemetry,
-        active_macro_id: resp.active_macro_id.as_deref(),
-        newly_unlocked_achievement: resp.newly_unlocked_achievement.as_deref(),
-    })
-    .unwrap_or_else(|_| b"{}".to_vec());
+    let emit_meta = include_debug_meta
+        || resp.newly_unlocked_achievement.is_some()
+        || resp.link_telemetry.enabled
+        || resp.active_macro_id.is_some();
+
+    let meta_json = if emit_meta {
+        serde_json::to_vec(&ViewportPacketMetadata {
+            console: resp.primary.console,
+            cpu: &resp.primary.cpu,
+            link_telemetry: &resp.link_telemetry,
+            active_macro_id: resp.active_macro_id.as_deref(),
+            newly_unlocked_achievement: resp.newly_unlocked_achievement.as_deref(),
+        })
+        .unwrap_or_else(|_| b"{}".to_vec())
+    } else {
+        Vec::new()
+    };
 
     let rgba_total: usize = views.iter().map(|v| 8 + v.rgba.len()).sum();
     let pcm_bytes_len = resp.primary.audio_samples.len() * 4;
@@ -461,10 +480,10 @@ impl EmulatorSession {
     /// Restores persisted `GlobalSettings` into live session state while preserving sensible defaults.
     pub fn apply_loaded_settings(&mut self, mut settings: GlobalSettings) {
         if settings.active_shader_css.trim().is_empty() {
-            settings.active_shader_css = "mode-crt".into();
+            settings.active_shader_css = "mode-clean".into();
         }
         if settings.upscaler_mode.trim().is_empty() {
-            settings.upscaler_mode = "OFF".into();
+            settings.upscaler_mode = "XBRZ".into();
         }
         settings.nds_layout = normalize_nds_layout(&settings.nds_layout);
         settings.speed_multiplier = settings.speed_multiplier.clamp(1, 8);
@@ -1543,9 +1562,28 @@ impl EmulatorSession {
         turbo_active: bool,
         speed_mult: u8,
     ) -> Vec<u8> {
+        self.step_viewport_binary_bytes_ex(
+            raw_buttons_p1,
+            raw_buttons_p2,
+            turbo_active,
+            speed_mult,
+            true,
+        )
+    }
+
+    /// Executes `step_viewport_with_speed` and serializes to `"ZMFR"` v1 binary bytes,
+    /// optionally skipping the JSON debug metadata trailer on non-telemetry frames.
+    pub fn step_viewport_binary_bytes_ex(
+        &mut self,
+        raw_buttons_p1: u16,
+        raw_buttons_p2: u16,
+        turbo_active: bool,
+        speed_mult: u8,
+        include_debug_meta: bool,
+    ) -> Vec<u8> {
         let resp =
             self.step_viewport_with_speed(raw_buttons_p1, raw_buttons_p2, turbo_active, speed_mult);
-        encode_viewport_binary_packet(&resp, self.sram_dirty)
+        encode_viewport_binary_packet_with_meta(&resp, self.sram_dirty, include_debug_meta)
     }
 
     fn step_single_viewport_tick(
@@ -1677,7 +1715,7 @@ impl EmulatorSession {
         if self.core_loaded && primary.frame_number.is_multiple_of(rewind_stride) {
             if let Ok(raw_state) = self.core_p1.save_state() {
                 self.rewind_buffer
-                    .push_snapshot(primary.frame_number, &raw_state);
+                    .push_snapshot_owned(primary.frame_number, raw_state);
             }
         }
         self.last_score = primary.cpu.score;
@@ -1685,7 +1723,10 @@ impl EmulatorSession {
             self.recent_inputs_trace.remove(0);
         }
         self.recent_inputs_trace.push((mask_p1 & 0xFF) as u8);
-        if self.core_loaded && self.frame_counter.is_multiple_of(rewind_stride) {
+        if self.core_loaded
+            && self.frame_counter.is_multiple_of(rewind_stride)
+            && self.core_p1.sram_maybe_dirty()
+        {
             self.refresh_sram_dirty_flag();
         }
 

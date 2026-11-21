@@ -28,7 +28,12 @@ impl Timer {
 }
 
 impl Bus {
+    #[inline]
     pub(crate) fn timers_catch_up(&mut self) {
+        if self.timers_active_mask == 0 {
+            self.timers_synced = self.cycles;
+            return;
+        }
         let elapsed = self.cycles - self.timers_synced;
         self.timers_synced = self.cycles;
         if elapsed == 0 {
@@ -53,9 +58,32 @@ impl Bus {
             overflows = self.timer_advance(t, ticks);
             // Timers 0/1 clock the Direct Sound FIFOs.
             if t < 2 && overflows > 0 {
+                self.apu_catch_up();
                 self.apu.on_timer_overflow(t, overflows as u32);
             }
         }
+    }
+
+    /// Earliest cycle at which any enabled non-cascade timer will overflow, or `u64::MAX`.
+    pub(crate) fn next_timer_overflow_cycle(&self) -> u64 {
+        if self.timers_active_mask == 0 {
+            return u64::MAX;
+        }
+        let mut earliest = u64::MAX;
+        for t in 0..4 {
+            if (self.timers_active_mask & (1 << t)) == 0 {
+                continue;
+            }
+            let ctrl = self.io16(0x102 + t * 4);
+            if t > 0 && ctrl & 4 != 0 {
+                continue; // cascade timers only overflow when timer t-1 overflows
+            }
+            let p = PRESCALE[(ctrl & 3) as usize];
+            let ticks_to_ovf = 0x1_0000u64 - self.timers[t].counter as u64;
+            let cycles_to_ovf = (ticks_to_ovf * p).saturating_sub(self.timers[t].rem).max(1);
+            earliest = earliest.min(self.cycles.saturating_add(cycles_to_ovf));
+        }
+        earliest
     }
 
     /// Add `ticks` to timer `t`; returns how many times it overflowed.

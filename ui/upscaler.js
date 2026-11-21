@@ -3,13 +3,50 @@
 
 export const UPSCALER_MODES = ["OFF", "SCALE2X", "XBRZ", "BLOOM"];
 
-function samePixel(rgba, idxA, idxB) {
-  return (
-    rgba[idxA] === rgba[idxB] &&
-    rgba[idxA + 1] === rgba[idxB + 1] &&
-    rgba[idxA + 2] === rgba[idxB + 2] &&
-    rgba[idxA + 3] === rgba[idxB + 3]
-  );
+const IS_LITTLE_ENDIAN = (() => {
+  const buf = new ArrayBuffer(2);
+  new DataView(buf).setUint16(0, 0x0102, true);
+  return new Uint8Array(buf)[0] === 0x02;
+})();
+
+let alignedScratchBuf = null;
+let alignedScratchU8 = null;
+let alignedScratchU32 = null;
+
+function ensureAlignedScratch(byteLen) {
+  if (!alignedScratchBuf || alignedScratchBuf.byteLength < byteLen) {
+    const cap = Math.max(byteLen, 512 * 1024);
+    alignedScratchBuf = new ArrayBuffer(cap);
+    alignedScratchU8 = new Uint8Array(alignedScratchBuf);
+    alignedScratchU32 = new Uint32Array(alignedScratchBuf);
+  }
+}
+
+function toAlignedUint32Pixels(rgba, pixelCount) {
+  const byteLen = pixelCount * 4;
+  if (
+    (rgba instanceof Uint8ClampedArray || rgba instanceof Uint8Array) &&
+    rgba.byteLength >= byteLen
+  ) {
+    if ((rgba.byteOffset & 3) === 0) {
+      return new Uint32Array(rgba.buffer, rgba.byteOffset, pixelCount);
+    }
+    ensureAlignedScratch(byteLen);
+    alignedScratchU8.set(
+      rgba.byteLength === byteLen ? rgba : rgba.subarray(0, byteLen),
+      0
+    );
+    return alignedScratchU32;
+  }
+  ensureAlignedScratch(byteLen);
+  const copyLen = Math.min(rgba.length, byteLen);
+  for (let i = 0; i < copyLen; i += 1) {
+    alignedScratchU8[i] = rgba[i];
+  }
+  if (copyLen < byteLen) {
+    alignedScratchU8.fill(0, copyLen, byteLen);
+  }
+  return alignedScratchU32;
 }
 
 function yuvDistance(rgba, idxA, idxB) {
@@ -44,44 +81,65 @@ export function applyScale2xRgba(rgba, width, height) {
   const outW = w * 2;
   const outH = h * 2;
   const out = new Uint8ClampedArray(outW * outH * 4);
+  const out32 = new Uint32Array(out.buffer);
+  const src32 = toAlignedUint32Pixels(rgba, w * h);
+  const lastX = w - 1;
 
   for (let y = 0; y < h; y += 1) {
-    const yUp = y > 0 ? y - 1 : y;
-    const yDown = y + 1 < h ? y + 1 : y;
+    const rowCur = y * w;
+    const rowUp = y > 0 ? rowCur - w : rowCur;
+    const rowDown = y + 1 < h ? rowCur + w : rowCur;
+    let dstTop = y * 2 * outW;
+    let dstBot = dstTop + outW;
+
+    let P = src32[rowCur];
+    let D = P;
+    let F = w > 1 ? src32[rowCur + 1] : P;
 
     for (let x = 0; x < w; x += 1) {
-      const xLeft = x > 0 ? x - 1 : x;
-      const xRight = x + 1 < w ? x + 1 : x;
+      const B = src32[rowUp + x];
+      const H = src32[rowDown + x];
 
-      const p = (y * w + x) * 4;
-      const b = (yUp * w + x) * 4; // Top (B)
-      const hIdx = (yDown * w + x) * 4; // Bottom (H)
-      const d = (y * w + xLeft) * 4; // Left (D)
-      const f = (y * w + xRight) * 4; // Right (F)
-
-      let e0 = p;
-      let e1 = p;
-      let e2 = p;
-      let e3 = p;
-
-      if (!samePixel(rgba, b, hIdx) && !samePixel(rgba, d, f)) {
-        if (samePixel(rgba, d, b)) e0 = d;
-        if (samePixel(rgba, b, f)) e1 = f;
-        if (samePixel(rgba, d, hIdx)) e2 = d;
-        if (samePixel(rgba, hIdx, f)) e3 = f;
+      if (B === H || D === F) {
+        out32[dstTop] = P;
+        out32[dstTop + 1] = P;
+        out32[dstBot] = P;
+        out32[dstBot + 1] = P;
+      } else {
+        out32[dstTop] = D === B ? D : P;
+        out32[dstTop + 1] = B === F ? F : P;
+        out32[dstBot] = D === H ? D : P;
+        out32[dstBot + 1] = H === F ? F : P;
       }
 
-      const dstTopRow = y * 2 * outW + x * 2;
-      const dstBotRow = (y * 2 + 1) * outW + x * 2;
-
-      copyPixel(rgba, e0, out, dstTopRow * 4);
-      copyPixel(rgba, e1, out, (dstTopRow + 1) * 4);
-      copyPixel(rgba, e2, out, dstBotRow * 4);
-      copyPixel(rgba, e3, out, (dstBotRow + 1) * 4);
+      dstTop += 2;
+      dstBot += 2;
+      D = P;
+      P = F;
+      if (x + 2 <= lastX) {
+        F = src32[rowCur + x + 2];
+      }
     }
   }
 
   return { width: outW, height: outH, rgba: out };
+}
+
+function yuvDistance32LE(a, b) {
+  let dr = (a & 0xff) - (b & 0xff);
+  if (dr < 0) dr = -dr;
+  let dg = ((a >>> 8) & 0xff) - ((b >>> 8) & 0xff);
+  if (dg < 0) dg = -dg;
+  let db = ((a >>> 16) & 0xff) - ((b >>> 16) & 0xff);
+  if (db < 0) db = -db;
+  return (dr * 77 + dg * 150 + db * 29) >> 8;
+}
+
+function blend192LE(p, q) {
+  const r = ((p & 0xff) + (q & 0xff) * 3) >> 2;
+  const g = (((p >>> 8) & 0xff) + ((q >>> 8) & 0xff) * 3) >> 2;
+  const b = (((p >>> 16) & 0xff) + ((q >>> 16) & 0xff) * 3) >> 2;
+  return r | (g << 8) | (b << 16) | (p & 0xff000000);
 }
 
 /**
@@ -94,6 +152,70 @@ export function applyXbrz2xRgba(rgba, width, height) {
   const outW = w * 2;
   const outH = h * 2;
   const out = new Uint8ClampedArray(outW * outH * 4);
+
+  if (IS_LITTLE_ENDIAN) {
+    const out32 = new Uint32Array(out.buffer);
+    const src32 = toAlignedUint32Pixels(rgba, w * h);
+    const lastX = w - 1;
+
+    for (let y = 0; y < h; y += 1) {
+      const rowCur = y * w;
+      const rowUp = y > 0 ? rowCur - w : rowCur;
+      const rowDown = y + 1 < h ? rowCur + w : rowCur;
+      let dstTop = y * 2 * outW;
+      let dstBot = dstTop + outW;
+
+      let P = src32[rowCur];
+      let D = P;
+      let F = w > 1 ? src32[rowCur + 1] : P;
+
+      for (let x = 0; x < w; x += 1) {
+        const B = src32[rowUp + x];
+        const H = src32[rowDown + x];
+
+        let e0 = P;
+        let e1 = P;
+        let e2 = P;
+        let e3 = P;
+
+        if (B !== H && D !== F && yuvDistance32LE(B, H) > 16 && yuvDistance32LE(D, F) > 16) {
+          if (P !== D && yuvDistance32LE(P, D) > 20) {
+            const blendD = blend192LE(P, D);
+            if (D === B || yuvDistance32LE(D, B) < 32) {
+              e0 = blendD;
+            }
+            if (D === H || yuvDistance32LE(D, H) < 32) {
+              e2 = blendD;
+            }
+          }
+          if (P !== F && yuvDistance32LE(P, F) > 20) {
+            const blendF = blend192LE(P, F);
+            if (B === F || yuvDistance32LE(B, F) < 32) {
+              e1 = blendF;
+            }
+            if (H === F || yuvDistance32LE(H, F) < 32) {
+              e3 = blendF;
+            }
+          }
+        }
+
+        out32[dstTop] = e0;
+        out32[dstTop + 1] = e1;
+        out32[dstBot] = e2;
+        out32[dstBot + 1] = e3;
+
+        dstTop += 2;
+        dstBot += 2;
+        D = P;
+        P = F;
+        if (x + 2 <= lastX) {
+          F = src32[rowCur + x + 2];
+        }
+      }
+    }
+
+    return { width: outW, height: outH, rgba: out };
+  }
 
   for (let y = 0; y < h; y += 1) {
     const yUp = y > 0 ? y - 1 : y;
@@ -117,21 +239,22 @@ export function applyXbrz2xRgba(rgba, width, height) {
       copyPixel(rgba, p, out, dstBotRow * 4);
       copyPixel(rgba, p, out, (dstBotRow + 1) * 4);
 
-      const vertDiff = yuvDistance(rgba, b, hIdx) > 16;
-      const horizDiff = yuvDistance(rgba, d, f) > 16;
-
-      if (vertDiff && horizDiff) {
-        if (yuvDistance(rgba, d, b) < 32 && yuvDistance(rgba, p, d) > 20) {
-          blendPixel(rgba, p, d, 192, out, dstTopRow * 4);
+      if (yuvDistance(rgba, b, hIdx) > 16 && yuvDistance(rgba, d, f) > 16) {
+        if (yuvDistance(rgba, p, d) > 20) {
+          if (yuvDistance(rgba, d, b) < 32) {
+            blendPixel(rgba, p, d, 192, out, dstTopRow * 4);
+          }
+          if (yuvDistance(rgba, d, hIdx) < 32) {
+            blendPixel(rgba, p, d, 192, out, dstBotRow * 4);
+          }
         }
-        if (yuvDistance(rgba, b, f) < 32 && yuvDistance(rgba, p, f) > 20) {
-          blendPixel(rgba, p, f, 192, out, (dstTopRow + 1) * 4);
-        }
-        if (yuvDistance(rgba, d, hIdx) < 32 && yuvDistance(rgba, p, d) > 20) {
-          blendPixel(rgba, p, d, 192, out, dstBotRow * 4);
-        }
-        if (yuvDistance(rgba, hIdx, f) < 32 && yuvDistance(rgba, p, f) > 20) {
-          blendPixel(rgba, p, f, 192, out, (dstBotRow + 1) * 4);
+        if (yuvDistance(rgba, p, f) > 20) {
+          if (yuvDistance(rgba, b, f) < 32) {
+            blendPixel(rgba, p, f, 192, out, (dstTopRow + 1) * 4);
+          }
+          if (yuvDistance(rgba, hIdx, f) < 32) {
+            blendPixel(rgba, p, f, 192, out, (dstBotRow + 1) * 4);
+          }
         }
       }
     }
@@ -147,28 +270,94 @@ export function applyCrtPhosphorBloomRgba(rgba, width, height) {
   const w = Math.max(1, Number(width) || 1);
   const h = Math.max(1, Number(height) || 1);
   const out = new Uint8ClampedArray(rgba.length);
+  const lastX = w - 1;
+
+  if (IS_LITTLE_ENDIAN && out.byteLength >= w * h * 4) {
+    const out32 = new Uint32Array(out.buffer, out.byteOffset, w * h);
+    const src32 = toAlignedUint32Pixels(rgba, w * h);
+
+    for (let y = 0; y < h; y += 1) {
+      const rowOff = y * w;
+      let cur = src32[rowOff];
+      let lr = cur & 0xff;
+      let lg = (cur >>> 8) & 0xff;
+      let lb = (cur >>> 16) & 0xff;
+
+      let r = lr;
+      let g = lg;
+      let b = lb;
+
+      let next = w > 1 ? src32[rowOff + 1] : cur;
+      let rr = next & 0xff;
+      let rg = (next >>> 8) & 0xff;
+      let rb = (next >>> 16) & 0xff;
+
+      for (let x = 0; x < w; x += 1) {
+        const luma = (r * 77 + g * 150 + b * 29) >> 8;
+        const boost = luma > 140 ? (luma - 140) >> 2 : 0;
+
+        let outR = r + ((lr + rr) >> 3) + boost + 4;
+        if (outR > 255) outR = 255;
+        let outG = g + ((lg + rg) >> 3) + boost + 2;
+        if (outG > 255) outG = 255;
+        let outB = b + ((lb + rb) >> 3) + (boost >> 1);
+        if (outB > 255) outB = 255;
+
+        out32[rowOff + x] = outR | (outG << 8) | (outB << 16) | (cur & 0xff000000);
+
+        lr = r;
+        lg = g;
+        lb = b;
+        cur = next;
+        r = rr;
+        g = rg;
+        b = rb;
+        if (x + 2 <= lastX) {
+          next = src32[rowOff + x + 2];
+          rr = next & 0xff;
+          rg = (next >>> 8) & 0xff;
+          rb = (next >>> 16) & 0xff;
+        }
+      }
+    }
+
+    return { width: w, height: h, rgba: out };
+  }
 
   for (let y = 0; y < h; y += 1) {
+    const rowOff = y * w * 4;
+    let r = rgba[rowOff];
+    let g = rgba[rowOff + 1];
+    let b = rgba[rowOff + 2];
+    let lr = r;
+    let lg = g;
+    let lb = b;
+    let rr = w > 1 ? rgba[rowOff + 4] : r;
+    let rg = w > 1 ? rgba[rowOff + 5] : g;
+    let rb = w > 1 ? rgba[rowOff + 6] : b;
+
     for (let x = 0; x < w; x += 1) {
-      const idx = (y * w + x) * 4;
-      const leftIdx = (y * w + (x > 0 ? x - 1 : x)) * 4;
-      const rightIdx = (y * w + (x + 1 < w ? x + 1 : x)) * 4;
-
-      const r = rgba[idx];
-      const g = rgba[idx + 1];
-      const b = rgba[idx + 2];
-
-      const neighborGlowR = (rgba[leftIdx] + rgba[rightIdx]) >> 3;
-      const neighborGlowG = (rgba[leftIdx + 1] + rgba[rightIdx + 1]) >> 3;
-      const neighborGlowB = (rgba[leftIdx + 2] + rgba[rightIdx + 2]) >> 3;
-
+      const idx = rowOff + x * 4;
       const luma = (r * 77 + g * 150 + b * 29) >> 8;
       const boost = luma > 140 ? (luma - 140) >> 2 : 0;
 
-      out[idx] = Math.min(255, r + neighborGlowR + boost + 4);
-      out[idx + 1] = Math.min(255, g + neighborGlowG + boost + 2);
-      out[idx + 2] = Math.min(255, b + neighborGlowB + (boost >> 1));
+      out[idx] = r + ((lr + rr) >> 3) + boost + 4;
+      out[idx + 1] = g + ((lg + rg) >> 3) + boost + 2;
+      out[idx + 2] = b + ((lb + rb) >> 3) + (boost >> 1);
       out[idx + 3] = rgba[idx + 3];
+
+      lr = r;
+      lg = g;
+      lb = b;
+      r = rr;
+      g = rg;
+      b = rb;
+      if (x + 2 <= lastX) {
+        const nextIdx = idx + 8;
+        rr = rgba[nextIdx];
+        rg = rgba[nextIdx + 1];
+        rb = rgba[nextIdx + 2];
+      }
     }
   }
 

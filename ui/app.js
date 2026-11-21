@@ -40,31 +40,120 @@ const viewportRecorder = new ViewportRecorder();
 const framePacer = new FramePacer();
 const canvasImageCache = new Map();
 
-const SHADER_MODES = ["mode-crt", "mode-trinitron", "mode-dmg", "mode-lcd", "mode-clean"];
+const SHADER_MODES = ["mode-clean", "mode-lcd", "mode-crt", "mode-trinitron", "mode-dmg"];
 const SHADER_LABELS = {
-  "mode-crt": "Shader : CRT Scanlines",
-  "mode-trinitron": "Shader : Trinitron Courbé",
-  "mode-dmg": "Shader : Game Boy DMG Vert",
-  "mode-lcd": "Shader : Matrice LCD",
-  "mode-clean": "Shader : Pixel-Perfect"
+  "mode-clean": "Pixel-Perfect",
+  "mode-lcd": "Matrice LCD",
+  "mode-crt": "CRT Scanlines",
+  "mode-trinitron": "Trinitron Courbé",
+  "mode-dmg": "Game Boy DMG Vert"
 };
 const UPSCALER_LABELS = {
-  OFF: "Upscaler : Natif 1x",
-  SCALE2X: "Upscaler : Scale2x EPX",
-  XBRZ: "Upscaler : xBRZ 2x",
-  BLOOM: "Upscaler : CRT Bloom"
+  XBRZ: "xBRZ 2x",
+  SCALE2X: "Scale2x EPX",
+  BLOOM: "CRT Bloom",
+  OFF: "Natif 1x"
 };
 const NDS_LAYOUT_LABELS = {
-  vertical: "Écrans NDS : Vertical",
-  horizontal: "Écrans NDS : Côte à côte",
-  "vertical-swapped": "Écrans NDS : Vertical (Inversé)",
-  "horizontal-swapped": "Écrans NDS : Côte à côte (Inversé)"
+  vertical: "DS : Vertical",
+  horizontal: "DS : Côte à côte",
+  "vertical-swapped": "DS : Inversé",
+  "horizontal-swapped": "DS : Côte à côte inv."
 };
 
 let toastTimer = null;
 let lastSurfacedWarning = "";
 let stepInFlight = false;
 let lastTelemetryDomUpdateMs = 0;
+let activePaneId = "view-library";
+let cachedKeyBindings = null;
+let cachedKeyWidgetsRef = null;
+let lastGamepadLabel = "";
+let lastOscilloscopeDrawMs = 0;
+const oscPlotBuffer = new Float32Array(48);
+let oscCanvasVisible = false;
+let vramCanvasVisible = false;
+let lastDebuggerRefreshMs = 0;
+let debuggerRefreshInFlight = false;
+let pendingNdsStylus = null;
+const domCache = Object.create(null);
+
+function setText(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
+}
+
+function getCachedEl(id) {
+  let el = domCache[id];
+  if (el && el.isConnected) return el;
+  el = document.getElementById(id);
+  if (el) domCache[id] = el;
+  return el;
+}
+
+function getCachedKeyBindings() {
+  if (cachedKeyBindings && cachedKeyWidgetsRef === state.keymapperWidgets) {
+    return cachedKeyBindings;
+  }
+  cachedKeyWidgetsRef = state.keymapperWidgets;
+  cachedKeyBindings = buildKeyBindingsFromWidgets(state.keymapperWidgets);
+  return cachedKeyBindings;
+}
+
+function invalidateKeyBindingsCache() {
+  cachedKeyBindings = null;
+  cachedKeyWidgetsRef = null;
+}
+
+function getCanvasEntry(canvasId, opaque = false) {
+  let entry = canvasImageCache.get(canvasId);
+  if (entry && entry.canvas && entry.canvas.isConnected) {
+    return entry;
+  }
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return null;
+  const ctx =
+    (opaque ? canvas.getContext("2d", { alpha: false }) : null) ||
+    canvas.getContext("2d");
+  if (!ctx) return null;
+  entry = { canvas, ctx, width: 0, height: 0, imgData: null };
+  canvasImageCache.set(canvasId, entry);
+  return entry;
+}
+
+function switchSettingsSubTab(paneId) {
+  const target = paneId || "settings-pane-general";
+  document.querySelectorAll(".settings-nav-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.settingsTab === target);
+  });
+  document.querySelectorAll(".settings-pane").forEach((pane) => {
+    pane.classList.toggle("active", pane.id === target);
+  });
+}
+
+function openSettingsTab(paneId = "settings-pane-general") {
+  switchTab("view-settings");
+  switchSettingsSubTab(paneId);
+}
+
+function setAudioVolumePct(rawPct, persist = true) {
+  const pct = Math.max(0, Math.min(100, Math.round(Number(rawPct) || 0)));
+  state.audioVolume = pct;
+  apuAudio.setVolume(pct / 100);
+  for (const sliderId of ["audio-volume-slider", "settings-volume-slider"]) {
+    const s = document.getElementById(sliderId);
+    if (s) s.value = String(pct);
+  }
+  setText("audio-volume-label", `${pct}%`);
+  setText("settings-volume-label", `${pct}%`);
+  if (persist) {
+    try {
+      window.localStorage?.setItem("zaimule.audioVolume", String(pct));
+    } catch {
+      // Ignore storage write errors
+    }
+  }
+}
 
 let state = {
   activeGameId: "",
@@ -281,8 +370,8 @@ let state = {
   prevNavMask: 0,
   vramPaintColorIdx: 3,
   stylusPressed: false,
-  activeShaderCss: "mode-crt",
-  upscalerMode: "OFF",
+  activeShaderCss: "mode-clean",
+  upscalerMode: "XBRZ",
   speedMult: 1,
   ndsLayout: "vertical",
   activeMacroId: null,
@@ -654,10 +743,13 @@ function setEmulationPaused(paused) {
   if (state.debuggerPaused) {
     framePacer.reset();
     apuAudio.reset();
+    if (state.isEmulationRunning) {
+      scheduleDebuggerRefresh(performance.now(), true);
+    }
   }
   const topBtn = document.getElementById("btn-emu-pause");
   if (topBtn) {
-    topBtn.textContent = state.debuggerPaused ? "Reprendre (F9)" : "Pause (F9)";
+    topBtn.textContent = state.debuggerPaused ? "Reprendre" : "Pause";
     topBtn.classList.toggle("btn-paused", state.debuggerPaused);
   }
   const dbgBtn = document.getElementById("btn-dbg-pause");
@@ -672,7 +764,7 @@ async function setViewportFullscreen(enabled) {
   document.querySelector(".app-shell")?.classList.toggle("viewport-fullscreen", next);
   const btn = document.getElementById("btn-fullscreen-toggle");
   if (btn) {
-    btn.textContent = next ? "Quitter plein écran" : "Plein écran";
+    btn.textContent = next ? "Quitter" : "Plein écran";
   }
   try {
     if (appWindow?.setFullscreen) {
@@ -728,7 +820,9 @@ function captureScreenshotPng() {
 }
 
 function syncViewportScreenAspect(game) {
-  const isNds = Boolean(game && String(game.console).toUpperCase() === "NDS");
+  const consoleKey = String(game?.console || "").toUpperCase();
+  const isNds = consoleKey === "NDS";
+  const isSwitch = isSwitchGame(game);
   const isHorizontal = isNds && String(state.ndsLayout || "vertical").startsWith("horizontal");
   ["screen-1", "screen-2", "screen-3", "screen-4"].forEach((id) => {
     const el = document.getElementById(id);
@@ -740,14 +834,28 @@ function syncViewportScreenAspect(game) {
   if (layoutBtn) {
     layoutBtn.style.display = isNds ? "inline-flex" : "none";
   }
+  const drawerNdsRow = document.getElementById("emu-nds-layout-row");
+  if (drawerNdsRow) {
+    drawerNdsRow.style.display = isNds ? "flex" : "none";
+  }
+  const linkSection = document.getElementById("emu-link-section");
+  if (linkSection) {
+    linkSection.style.display = isNds || isSwitch ? "none" : "block";
+  }
+  setText(
+    "emu-controls-hint",
+    isNds
+      ? "Flèches / ZQSD : Déplacer · J / Espace : A · K / Shift : B · E / R : L / R · Souris : Écran tactile · Retour : Rembobiner"
+      : "Flèches / ZQSD : Déplacer · J / Espace : A · K / Shift : B · E / R : L / R · Entrée : Start · Retour : Rembobiner"
+  );
 }
 
 function applyDisplayPreferencesToDom() {
-  const shaderCss = SHADER_MODES.includes(state.activeShaderCss) ? state.activeShaderCss : "mode-crt";
+  const shaderCss = SHADER_MODES.includes(state.activeShaderCss) ? state.activeShaderCss : "mode-clean";
   state.activeShaderCss = shaderCss;
-  const shaderBtn = document.getElementById("btn-shader-cycle");
-  if (shaderBtn) {
-    shaderBtn.textContent = SHADER_LABELS[shaderCss] || SHADER_LABELS["mode-crt"];
+  for (const id of ["emu-shader-select", "settings-shader-select"]) {
+    const sel = document.getElementById(id);
+    if (sel) sel.value = shaderCss;
   }
   ["screen-1", "screen-2", "screen-3", "screen-4"].forEach((id) => {
     const el = document.getElementById(id);
@@ -756,31 +864,30 @@ function applyDisplayPreferencesToDom() {
     el.classList.add(shaderCss);
   });
 
-  const upscalerMode = UPSCALER_LABELS[state.upscalerMode] ? state.upscalerMode : "OFF";
+  const upscalerMode = UPSCALER_LABELS[state.upscalerMode] ? state.upscalerMode : "XBRZ";
   state.upscalerMode = upscalerMode;
-  const upBtn = document.getElementById("btn-upscaler-cycle");
-  if (upBtn) {
-    upBtn.textContent = UPSCALER_LABELS[upscalerMode];
+  for (const id of ["emu-upscaler-select", "settings-upscaler-select"]) {
+    const sel = document.getElementById(id);
+    if (sel) sel.value = upscalerMode;
   }
 
   const speed = [1, 2, 4, 8].includes(Number(state.speedMult)) ? Number(state.speedMult) : 1;
   state.speedMult = speed;
-  const speedBtn = document.getElementById("btn-speed-cycle");
-  if (speedBtn) {
-    speedBtn.textContent = `Vitesse : ${speed}x`;
-  }
+  setText("btn-speed-cycle", `${speed}x`);
 
   const ndsLayout = NDS_LAYOUT_LABELS[state.ndsLayout] ? state.ndsLayout : "vertical";
   state.ndsLayout = ndsLayout;
-  const ndsBtn = document.getElementById("btn-nds-layout");
-  if (ndsBtn) {
-    ndsBtn.textContent = NDS_LAYOUT_LABELS[ndsLayout];
+  setText("btn-nds-layout", NDS_LAYOUT_LABELS[ndsLayout]);
+  for (const id of ["emu-nds-layout-select", "settings-nds-layout-select"]) {
+    const sel = document.getElementById(id);
+    if (sel) sel.value = ndsLayout;
   }
   syncViewportScreenAspect(getSelectedGame());
 }
 
 function releaseTransientInputs() {
   pressedKeys.clear();
+  pendingNdsStylus = null;
   if (state.stylusPressed) {
     state.stylusPressed = false;
     const g = getSelectedGame();
@@ -799,6 +906,7 @@ function stopEmulationPlayback() {
   releaseTransientInputs();
   hideEmuBanner();
   renderStandbyCanvas();
+  setText("tel-fps", "Prêt");
 }
 
 async function launchSelectedGame() {
@@ -821,7 +929,7 @@ async function launchSelectedGame() {
     if (status) {
       showToast(status, "ok", 6500);
     } else {
-      switchTab("view-cores");
+      openSettingsTab("settings-pane-switch");
     }
     return;
   }
@@ -829,34 +937,14 @@ async function launchSelectedGame() {
   apuAudio.ensureContext();
   apuAudio.reset();
   setEmulationPaused(false);
-
-  const consoleKey = String(game.console || "").toUpperCase();
-  if (consoleKey === "NDS") {
-    showEmuBanner(
-      `nds-info-${game.id}`,
-      "Nintendo DS Natif (nds_core Rust)",
-      "Exécution locale ARM9/ARM7 256×384 : stylet tactile inférieur, audio SPU 16 canaux 48 kHz, moteur 3D (textures 4×4, Decal/Toon) et PPU 2D affine/étendu.",
-      [
-        {
-          label: "Masquer",
-          onClick: () => hideEmuBanner()
-        }
-      ],
-      "info"
-    );
-  } else {
-    hideEmuBanner();
-  }
+  hideEmuBanner();
 
   syncViewportScreenAspect(game);
   framePacer.reset();
   lastTelemetryDomUpdateMs = 0;
   state.isEmulationRunning = true;
   const targetFps = targetFpsForConsole(game.console);
-  const fpsEl = document.getElementById("tel-fps");
-  if (fpsEl) fpsEl.textContent = `${(targetFps * state.speedMult).toFixed(1)} FPS`;
-  const ftEl = document.getElementById("tel-ft");
-  if (ftEl) ftEl.textContent = `${(1000 / targetFps).toFixed(1)} ms`;
+  setText("tel-fps", `${Math.round(targetFps * state.speedMult)} FPS`);
   switchTab("view-emulator");
 }
 
@@ -870,11 +958,14 @@ function getConnectedGamepad() {
   return null;
 }
 
-function pollGamepadBitmask() {
-  const pad = getConnectedGamepad();
+function pollGamepadBitmask(pad = getConnectedGamepad()) {
   if (pad) {
-    const el = document.getElementById("tel-pad");
-    if (el) el.textContent = pad.id.slice(0, 18);
+    const label = pad.id.slice(0, 18);
+    if (label !== lastGamepadLabel) {
+      lastGamepadLabel = label;
+      const el = getCachedEl("tel-pad");
+      if (el) el.textContent = label;
+    }
     return computeBitmaskFromGamepad(pad);
   }
   return 0;
@@ -898,8 +989,8 @@ async function handleBigPictureNavigation(currentMask) {
   state.prevNavMask = currentMask;
   if (!action || !state.bigPictureMode) return;
 
-  const tabs = ["view-library", "view-emulator", "view-netplay", "view-cores"];
-  const activePane = document.querySelector(".view-pane.active")?.id || "view-library";
+  const tabs = ["view-library", "view-emulator", "view-settings"];
+  const activePane = activePaneId || "view-library";
 
   if (action === "PREV_TAB" || action === "NEXT_TAB") {
     const curIdx = Math.max(0, tabs.indexOf(activePane));
@@ -1010,16 +1101,16 @@ function renderCatalogGrid() {
         <div class="empty-catalog-icon" aria-hidden="true">
           <svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 7h8M9 14h6M12 11v6"/></svg>
         </div>
-        <div class="empty-catalog-title">Aucune cartouche ou image dans votre bibliothèque</div>
+        <div class="empty-catalog-title">Aucun jeu dans votre bibliothèque</div>
         <div class="empty-catalog-desc">
-          Importez vos jeux <strong>Game Boy / GBC</strong> (.gb, .gbc), <strong>GBA</strong> (.gba), <strong>Nintendo DS</strong> (.nds),
-          <strong>Switch 1</strong> (.nsp, .xci, .nsz) ou <strong>Switch 2</strong> (.nx, .nup) — y compris compressés en <strong>.zip</strong> ou <strong>.7z</strong> —
+          Ajoutez vos jeux <strong>Game Boy / GBC</strong>, <strong>GBA</strong>, <strong>Nintendo DS</strong>
+          ou <strong>Nintendo Switch</strong> (.gb, .gbc, .gba, .nds, .nsp, .xci, .nx, .zip, .7z),
           ou glissez-déposez vos fichiers directement dans cette fenêtre.
         </div>
         <div class="empty-catalog-actions">
-          <button class="btn btn-primary" id="btn-empty-import-rom" type="button">Importer ROM / Archive...</button>
+          <button class="btn btn-primary" id="btn-empty-import-rom" type="button">Ajouter un jeu...</button>
           <button class="btn" id="btn-empty-scan-folder" type="button">Scanner un dossier...</button>
-          <button class="btn btn-ghost" id="btn-empty-open-vault" type="button">Configurer Coffre Switch (Torzu / Fritchii)</button>
+          <button class="btn btn-ghost" id="btn-empty-open-vault" type="button">Configurer Switch</button>
         </div>
       `;
       emptyEl.querySelector("#btn-empty-import-rom")?.addEventListener("click", () => {
@@ -1029,12 +1120,12 @@ function renderCatalogGrid() {
         handleScanFolderTrigger();
       });
       emptyEl.querySelector("#btn-empty-open-vault")?.addEventListener("click", () => {
-        switchTab("view-cores");
+        openSettingsTab("settings-pane-switch");
       });
     } else {
       emptyEl.innerHTML = `
-        <div class="empty-catalog-title">Aucune ROM ne correspond au filtre actif</div>
-        <div class="empty-catalog-desc">Modifiez votre recherche ou sélectionnez « Catalogue complet ».</div>
+        <div class="empty-catalog-title">Aucun jeu ne correspond à votre recherche</div>
+        <div class="empty-catalog-desc">Modifiez votre filtre ou sélectionnez « Tous les jeux ».</div>
       `;
     }
     grid.appendChild(emptyEl);
@@ -1046,16 +1137,10 @@ function renderCatalogGrid() {
     const spec = EDITORIAL_COVER_PALETTE[consoleKey] || EDITORIAL_COVER_PALETTE.GBC;
     const switchMode = isSwitchGame(game);
     const hasSpine = consoleKey === "SWITCH" || consoleKey === "SWITCH2";
-    const engineClass = switchMode ? "core-external" : "core-rust";
-    const engineLabel = switchMode
-      ? resolveTargetEngineForGame(game) === "fritchii"
-        ? "FRITCHII"
-        : "TORZU"
-      : "RUST";
-    const archiveType = String(game.romPath || "").toLowerCase().endsWith(".7z")
-      ? "7Z → ROM"
-      : "ZIP → ROM";
-    const subTag = game.titleId ? game.titleId : game.archiveEntry ? archiveType : "";
+    const switchBadge = switchMode
+      ? `<span class="core-tag mono core-external">${resolveTargetEngineForGame(game) === "fritchii" ? "FRITCHII" : "TORZU"}</span>`
+      : "";
+    const regionLabel = String(game.region || "").split("(")[0].trim();
 
     const card = document.createElement("article");
     card.className = `game-card${game.id === state.activeGameId ? " selected" : ""}`;
@@ -1075,15 +1160,12 @@ function renderCatalogGrid() {
           }
           <div class="cover-top">
             <span class="console-tag mono">${escapeHtml(consoleKey === "SWITCH2" ? "SWITCH 2" : consoleKey)}</span>
-            <span class="core-tag mono ${engineClass}">
-              ${escapeHtml(engineLabel)}
-            </span>
+            ${switchBadge}
           </div>
-          ${subTag ? `<div class="cover-subtag mono">${escapeHtml(subTag)}</div>` : ""}
           <div class="cover-art-graphic" aria-hidden="true">${spec.svg}</div>
-          <span class="cover-action-prompt">[A] Lancer</span>
+          <span class="cover-action-prompt">Jouer</span>
           <div class="cover-bottom mono">
-            <span>${escapeHtml(game.crc32Hex)}${game.fastFingerprint ? " · FAST" : ""}</span>
+            <span>${escapeHtml(regionLabel || "Jeu")}</span>
             <span>${escapeHtml(formatFileSize(game.sizeBytes))}</span>
           </div>
         </div>
@@ -1091,7 +1173,7 @@ function renderCatalogGrid() {
       <div class="game-body">
         <div class="game-title" title="${escapeHtml(game.title)}">${escapeHtml(game.title)}</div>
         <div class="game-meta">
-          <span>${escapeHtml(String(game.region || "N/A").split("(")[0].trim())}</span>
+          <span>${escapeHtml(consoleKey === "SWITCH2" ? "Switch 2" : consoleKey)}</span>
           <span class="mono">${escapeHtml(formatPlaytime(game.playtimeSeconds))}</span>
         </div>
       </div>
@@ -1148,46 +1230,22 @@ function renderCatalogGrid() {
 function renderInspector() {
   const g = getSelectedGame();
   const playLabelEl = document.querySelector("#btn-insp-play span:first-child");
-  const titleIdRow = document.getElementById("insp-titleid-row");
-  const titleIdVal = document.getElementById("insp-titleid");
   const pathRow = document.getElementById("insp-path-row");
   const pathVal = document.getElementById("insp-path");
   const switchEngineRow = document.getElementById("insp-switch-engine-row");
   const switchEngineSel = document.getElementById("insp-switch-engine");
-  const sramActionsRow = document.getElementById("sram-actions-row");
 
   if (g) {
     const consoleKey = String(g.console || "").toUpperCase();
     const isSwitch = isSwitchGame(g);
     const targetEngine = resolveTargetEngineForGame(g);
 
-    document.getElementById("insp-title").textContent = g.title;
-    document.getElementById("insp-console").textContent =
-      consoleKey === "SWITCH2" ? "SWITCH 2" : consoleKey;
-    document.getElementById("insp-core").textContent = isSwitch
-      ? formatSwitchEngineLabel(g.switchEngine, consoleKey)
-      : g.coreId;
-    document.getElementById("insp-region").textContent = String(g.region || "—").split("(")[0].trim();
-    document.getElementById("insp-crc").textContent = g.fastFingerprint
-      ? `${g.crc32Hex} (Échantillon)`
-      : g.crc32Hex;
-    const crcTop = document.getElementById("insp-crc-top");
-    if (crcTop) crcTop.textContent = `CRC · ${g.crc32Hex}`;
-    document.getElementById("insp-sram").textContent = g.sramSummary;
-    document.getElementById("insp-playtime").textContent = formatPlaytime(g.playtimeSeconds);
-    document.getElementById("active-emu-game").textContent = `${consoleKey} · ${g.title}`;
-    document.getElementById("tel-core").textContent = isSwitch
-      ? `${targetEngine} (${consoleKey})`
-      : `${g.coreId} (${consoleKey})`;
+    setText("insp-title", g.title);
+    setText("insp-console", consoleKey === "SWITCH2" ? "SWITCH 2" : consoleKey);
+    setText("insp-region", String(g.region || "—").split("(")[0].trim());
+    setText("insp-playtime", formatPlaytime(g.playtimeSeconds));
+    setText("active-emu-game", g.title);
 
-    if (titleIdRow && titleIdVal) {
-      if (g.titleId) {
-        titleIdRow.style.display = "flex";
-        titleIdVal.textContent = g.titleId;
-      } else {
-        titleIdRow.style.display = "none";
-      }
-    }
     if (pathRow && pathVal) {
       if (g.romPath) {
         const displayPath = g.archiveEntry ? `${g.romPath} [${g.archiveEntry}]` : g.romPath;
@@ -1213,49 +1271,21 @@ function renderInspector() {
     if (playLabelEl) {
       playLabelEl.textContent = isSwitch
         ? targetEngine === "fritchii"
-          ? "Lancer avec Fritchii (Switch 2)"
-          : "Lancer avec Torzu (Switch 1)"
-        : "Lancer dans le Viewport 60 Hz";
-    }
-    if (sramActionsRow) {
-      sramActionsRow.style.display = isSwitch ? "none" : "grid";
+          ? "Jouer avec Fritchii"
+          : "Jouer avec Torzu"
+        : "Jouer";
     }
     syncViewportScreenAspect(g);
   } else {
-    document.getElementById("insp-title").textContent = "Aucune ROM sélectionnée";
-    document.getElementById("insp-console").textContent = "—";
-    document.getElementById("insp-core").textContent = "—";
-    document.getElementById("insp-region").textContent = "—";
-    document.getElementById("insp-crc").textContent = "00000000";
-    const crcTop = document.getElementById("insp-crc-top");
-    if (crcTop) crcTop.textContent = "CRC · —";
-    document.getElementById("insp-sram").textContent = "Aucune mémoire active";
-    document.getElementById("insp-playtime").textContent = "0m";
-    document.getElementById("active-emu-game").textContent = "Aucune ROM active";
-    document.getElementById("tel-core").textContent = "En veille";
-    if (titleIdRow) titleIdRow.style.display = "none";
+    setText("insp-title", "Aucun jeu sélectionné");
+    setText("insp-console", "—");
+    setText("insp-region", "—");
+    setText("insp-playtime", "0m");
+    setText("active-emu-game", "Aucun jeu lancé");
     if (pathRow) pathRow.style.display = "none";
     if (switchEngineRow) switchEngineRow.style.display = "none";
-    if (playLabelEl) playLabelEl.textContent = "Lancer dans le Viewport 60 Hz";
-    if (sramActionsRow) sramActionsRow.style.display = "grid";
+    if (playLabelEl) playLabelEl.textContent = "Jouer";
     syncViewportScreenAspect(null);
-  }
-
-  const sramHexEl = document.getElementById("sram-hex-dump");
-  if (sramHexEl) {
-    const sramRows = state.sramHexInspection?.hexRows || state.sramHexInspection?.rows || [];
-    if (sramRows.length > 0) {
-      sramHexEl.innerHTML = sramRows.map((r) => `<div>${escapeHtml(r)}</div>`).join("");
-    } else {
-      sramHexEl.innerHTML = `<div class="empty-list-hint">Aucune donnée SRAM chargée</div>`;
-    }
-  }
-  const sramCrcBadge = document.getElementById("sram-crc-badge");
-  if (sramCrcBadge) {
-    sramCrcBadge.textContent =
-      state.sramHexInspection?.totalBytes > 0
-        ? `CRC ${state.sramHexInspection.crc32Hex}`
-        : "CRC —";
   }
 
   const ocBadge = document.getElementById("insp-overclock-badge");
@@ -1374,22 +1404,20 @@ function renderInspector() {
     for (const slot of state.saveSlots.slice(0, 9)) {
       const card = document.createElement("div");
       card.className = "slot-card";
-      const metaLabel = slot.occupied
-        ? `${slot.label}${slot.crc32Hex && slot.crc32Hex !== "00000000" ? ` · ${slot.crc32Hex}` : ""}`
-        : "Emplacement libre";
+      const metaLabel = slot.occupied ? slot.label || "Sauvegardé" : "Libre";
       card.innerHTML = `
         <div class="slot-head">
-          <div class="slot-num mono">SLOT #${slot.slot}</div>
-          <div class="slot-time mono" title="${escapeHtml(metaLabel)}">${escapeHtml(metaLabel)}</div>
+          <div class="slot-num mono">Emplacement #${slot.slot}</div>
+          <div class="slot-time" title="${escapeHtml(metaLabel)}">${escapeHtml(metaLabel)}</div>
         </div>
         <div class="slot-actions">
-          <button class="slot-action-btn mono btn-slot-save" type="button" ${canUseStates ? "" : "disabled"}>
+          <button class="slot-action-btn btn-slot-save" type="button" ${canUseStates ? "" : "disabled"}>
             ${slot.occupied ? "Écraser" : "Sauver"}
           </button>
-          <button class="slot-action-btn mono btn-slot-load" type="button" ${canUseStates && slot.occupied ? "" : "disabled"}>
+          <button class="slot-action-btn btn-slot-load" type="button" ${canUseStates && slot.occupied ? "" : "disabled"}>
             Charger
           </button>
-          <button class="slot-action-btn danger mono btn-slot-delete" type="button" title="Supprimer le Slot #${slot.slot}" aria-label="Supprimer le Slot #${slot.slot}" ${canUseStates && slot.occupied ? "" : "disabled"}>
+          <button class="slot-action-btn danger btn-slot-delete" type="button" title="Supprimer l'emplacement #${slot.slot}" aria-label="Supprimer l'emplacement #${slot.slot}" ${canUseStates && slot.occupied ? "" : "disabled"}>
             ✕
           </button>
         </div>
@@ -1399,16 +1427,15 @@ function renderInspector() {
         if (!canUseStates) return;
         const info = await invokeBackend("create_save_state", {
           slot: slot.slot,
-          label: `Frame #${state.currentFrame}`
+          label: `Sauvegarde #${slot.slot}`
         });
         if (info) {
           const boot = await invokeBackend("get_station_bootstrap");
           if (boot) applyBootstrap(boot);
-          const toast = document.getElementById("save-toast");
-          if (toast) toast.textContent = `Slot #${slot.slot} sauvegardé (${info.crc32Hex})`;
+          showToast(`Emplacement #${slot.slot} sauvegardé.`, "ok", 2600);
         } else if (!tauriInvoke) {
           slot.occupied = true;
-          slot.label = `Frame #${state.currentFrame}`;
+          slot.label = `Sauvegarde #${slot.slot}`;
           renderInspector();
         }
       });
@@ -1417,10 +1444,7 @@ function renderInspector() {
         if (!canUseStates || !slot.occupied) return;
         const info = await invokeBackend("restore_save_state", { slot: slot.slot });
         if (info || !tauriInvoke) {
-          const toast = document.getElementById("save-toast");
-          if (toast) {
-            toast.textContent = `Slot #${slot.slot} chargé (${info?.crc32Hex || slot.crc32Hex})`;
-          }
+          showToast(`Emplacement #${slot.slot} chargé.`, "ok", 2600);
         }
       });
 
@@ -1431,8 +1455,7 @@ function renderInspector() {
           if (Array.isArray(slots)) {
             state.saveSlots = slots;
             renderInspector();
-            const toast = document.getElementById("save-toast");
-            if (toast) toast.textContent = `Slot #${slot.slot} supprimé`;
+            showToast(`Emplacement #${slot.slot} supprimé.`, "info", 2600);
           }
         } else {
           slot.occupied = false;
@@ -1484,6 +1507,7 @@ function renderKeymapperAndMacros() {
 
       badge.addEventListener("dblclick", async () => {
         w.turboHz = w.turboHz ? null : 20;
+        invalidateKeyBindingsCache();
         renderKeymapperAndMacros();
         await invokeBackend("save_keymapper_layout", { widgets: state.keymapperWidgets });
       });
@@ -1511,7 +1535,7 @@ function renderKeymapperAndMacros() {
         row.querySelector("button").addEventListener("click", async () => {
           const nextId = isRunning ? null : mac.id;
           state.activeMacroId = nextId;
-          document.getElementById("macro-status").textContent = nextId ? "LECTURE TAS" : "PRÊT";
+          setText("macro-status", nextId ? "LECTURE TAS" : "PRÊT");
           const boot = await invokeBackend("set_active_macro", { macroId: nextId });
           if (boot) applyBootstrap(boot);
           else renderKeymapperAndMacros();
@@ -1644,20 +1668,14 @@ function renderNetplayAndCores() {
   const portBadge = document.getElementById("udp-port-badge");
   if (portBadge) {
     portBadge.textContent = state.udpLocalPort
-      ? `UDP ZML2 : 0.0.0.0:${state.udpLocalPort}`
-      : "UDP ZML2 : Inactif";
-  }
-  const stunBadge = document.getElementById("stun-endpoint-badge");
-  if (stunBadge) {
-    stunBadge.textContent = state.stunCandidate
-      ? `${state.stunCandidate.natType} : ${state.stunCandidate.publicEndpoint}`
-      : "LAN UDP : En attente";
+      ? `UDP 0.0.0.0:${state.udpLocalPort}`
+      : "UDP inactif";
   }
   const packetsBadge = document.getElementById("udp-packets-badge");
   if (packetsBadge) {
     packetsBadge.textContent = state.udpPeerAddr
-      ? `Pair ${state.udpPeerAddr} · ${state.udpPacketsSent} ↑ / ${state.udpPacketsReceived} ↓`
-      : `Aucun pair · ${state.udpPacketsSent} ↑ / ${state.udpPacketsReceived} ↓`;
+      ? `Pair ${state.udpPeerAddr} (${state.udpPacketsSent} ↑ / ${state.udpPacketsReceived} ↓)`
+      : "Aucun pair connecté";
   }
   const disconnectBtn = document.getElementById("btn-disconnect-peer");
   if (disconnectBtn) {
@@ -1666,15 +1684,6 @@ function renderNetplayAndCores() {
   const peerInp = document.getElementById("netplay-peer-input");
   if (peerInp && document.activeElement !== peerInp && state.udpPeerAddr) {
     peerInp.value = state.udpPeerAddr;
-  }
-  const specBtn = document.getElementById("btn-toggle-spectator");
-  if (specBtn) {
-    const active = state.tournamentBracket?.spectatorModeActive || false;
-    const count =
-      state.tournamentBracket?.spectatorCount ??
-      state.tournamentBracket?.matches?.[0]?.spectatorsCount ??
-      0;
-    specBtn.textContent = `Spectateur (${count}) : ${active ? "ACTIF" : "OFF"}`;
   }
 
   const chatList = document.getElementById("netplay-chat-list");
@@ -1695,7 +1704,7 @@ function renderNetplayAndCores() {
           <span><strong style="color:var(--accent-secondary)">[${escapeHtml(msg.sender)}]</strong> ${escapeHtml(msg.text)}</span>
           ${
             sharedCrc
-              ? `<button class="btn mono" style="padding:1px 6px; font-size:10px; border-color:var(--status-ok); color:var(--status-ok);">Charger State #${sharedSlot} (${escapeHtml(sharedCrc)})</button>`
+              ? `<button class="btn mono" style="padding:1px 6px; font-size:10px; border-color:var(--status-ok); color:var(--status-ok);">Charger Slot #${sharedSlot}</button>`
               : ""
           }
         `;
@@ -1713,74 +1722,19 @@ function renderNetplayAndCores() {
   const netGrid = document.getElementById("netplay-grid");
   if (netGrid) {
     netGrid.innerHTML = "";
-
-    if (state.tournamentBracket?.matches?.length > 0) {
-      const t = state.tournamentBracket;
-      const specTotal = t.spectatorCount ?? t.matches?.[0]?.spectatorsCount ?? 0;
-      const tourneyCard = document.createElement("div");
-      tourneyCard.className = "panel-card";
-      tourneyCard.id = "tournament-bracket-card";
-      tourneyCard.innerHTML = `
-        <div class="section-title">
-          <span>${escapeHtml(t.title)}</span>
-          <span class="pill-badge pill-gold mono">
-            ${t.champion ? `Champion : ${escapeHtml(t.champion)}` : `${specTotal} Spectateurs`}
-          </span>
-        </div>
-        <div class="bracket-matches"></div>
-      `;
-      const matchesWrap = tourneyCard.querySelector(".bracket-matches");
-      for (const m of t.matches || []) {
-        const matchId = m.id ?? m.matchId;
-        const mRow = document.createElement("div");
-        mRow.className = "mod-item";
-        mRow.innerHTML = `
-          <div>
-            <div class="mono" style="font-size:10.5px; color:var(--accent-primary)">${escapeHtml(m.roundLabel)}</div>
-            <div style="font-weight:600">${escapeHtml(m.playerA)} <span style="color:var(--text-muted)">vs</span> ${escapeHtml(m.playerB)}</div>
-            <div class="mono" style="font-size:10.5px; color:${m.winner ? "var(--status-ok)" : "var(--text-muted)"}">
-              ${m.winner ? `Vainqueur : ${escapeHtml(m.winner)}` : `Score Live : ${m.scoreA} - ${m.scoreB}`}
-            </div>
-          </div>
-          <div style="display:flex; gap:4px;">
-            <button class="btn mono btn-win-a" style="padding:3px 7px; font-size:10px;">${escapeHtml(m.playerA)}</button>
-            <button class="btn mono btn-win-b" style="padding:3px 7px; font-size:10px;">${escapeHtml(m.playerB)}</button>
-          </div>
-        `;
-        mRow.querySelector(".btn-win-a")?.addEventListener("click", async () => {
-          const boot = await invokeBackend("advance_tournament_match", {
-            matchId,
-            scoreA: 3,
-            scoreB: 1
-          });
-          if (boot) applyBootstrap(boot);
-        });
-        mRow.querySelector(".btn-win-b")?.addEventListener("click", async () => {
-          const boot = await invokeBackend("advance_tournament_match", {
-            matchId,
-            scoreA: 1,
-            scoreB: 3
-          });
-          if (boot) applyBootstrap(boot);
-        });
-        matchesWrap.appendChild(mRow);
-      }
-      netGrid.appendChild(tourneyCard);
-    }
-
     for (const r of state.netplayRooms) {
       const card = document.createElement("div");
       card.className = "panel-card";
       card.innerHTML = `
         <div class="section-title">
           <span>${escapeHtml(r.title)}</span>
-          <span class="pill-badge pill-green mono">${r.pingMs} ms · Rollback ${r.rollbackFrames}f</span>
+          <span class="pill-badge pill-green mono">${r.pingMs} ms</span>
         </div>
         <div class="kv-row"><span class="kv-label">Jeu</span><span class="kv-val">${escapeHtml(r.gameTitle)} (${escapeHtml(r.console)})</span></div>
-        <div class="kv-row"><span class="kv-label">Hôte &amp; Joueurs</span><span class="kv-val mono">${escapeHtml(r.hostName)} (${r.playersCurrent}/${r.playersMax})</span></div>
-        <div class="kv-row"><span class="kv-label">Invitation Deep-Link</span><span class="kv-val mono" style="color:var(--accent-secondary)">${escapeHtml(r.deepLinkUri)}</span></div>
+        <div class="kv-row"><span class="kv-label">Hôte</span><span class="kv-val mono">${escapeHtml(r.hostName)} (${r.playersCurrent}/${r.playersMax})</span></div>
+        <div class="kv-row"><span class="kv-label">Lien</span><span class="kv-val mono" style="color:var(--accent-secondary)">${escapeHtml(r.deepLinkUri)}</span></div>
         <div style="margin-top:10px; display:flex; justify-content:flex-end;">
-          <button class="btn btn-primary mono" style="font-size:11px;">Synchroniser Salon &amp; Link 2P</button>
+          <button class="btn btn-primary" style="font-size:11px;">Rejoindre &amp; Jouer</button>
         </div>
       `;
       card.querySelector("button").addEventListener("click", async () => {
@@ -1797,45 +1751,134 @@ function renderNetplayAndCores() {
       });
       netGrid.appendChild(card);
     }
-
-    for (const ghost of state.ghostLeaderboard || []) {
-      const card = document.createElement("div");
-      card.className = "panel-card";
-      card.innerHTML = `
-        <div class="section-title">
-          <span>Record Fantôme TAS · ${escapeHtml(ghost.playerName)}</span>
-          <span class="pill-badge pill-cobalt mono">${ghost.score} pts · CRC ${escapeHtml(ghost.traceCrc32Hex)}</span>
-        </div>
-        <div class="kv-row"><span class="kv-label">Jeu &amp; Console</span><span class="kv-val">${escapeHtml(ghost.gameTitle)} (${escapeHtml(ghost.console)})</span></div>
-        <div class="kv-row"><span class="kv-label">Trace Déterministe</span><span class="kv-val mono" style="color:var(--status-ok)">Vérifié (${ghost.framesCount} frames)</span></div>
-        <div style="margin-top:10px; display:flex; justify-content:flex-end;">
-          <button class="btn mono" style="font-size:11px; border-color:var(--accent-primary); color:var(--accent-primary);">Défier Fantôme TAS</button>
-        </div>
-      `;
-      card.querySelector("button").addEventListener("click", async () => {
-        const boot = await invokeBackend("challenge_ghost_run", { ghostId: ghost.id });
-        if (boot) applyBootstrap(boot);
-        document.getElementById("macro-status").textContent = "DÉFI FANTÔME TAS";
-        launchSelectedGame();
-      });
-      netGrid.appendChild(card);
-    }
-
     if (netGrid.children.length === 0) {
-      const emptyCard = document.createElement("div");
-      emptyCard.className = "panel-card";
-      emptyCard.innerHTML = `
-        <div class="section-title"><span>Salons P2P &amp; Fantômes TAS</span></div>
-        <div class="empty-list-hint">Aucun salon P2P ou fantôme TAS actif. Créez un salon ou rejoignez une URI zaimule://room/.</div>
-      `;
-      netGrid.appendChild(emptyCard);
+      netGrid.innerHTML = `<div class="empty-list-hint">Aucun salon actif. Créez un salon ou saisissez une adresse IP:PORT pour jouer en réseau local.</div>`;
     }
   }
 
-  const coresGrid = document.getElementById("cores-grid");
-  if (coresGrid) {
-    coresGrid.innerHTML = "";
+  // 1. Paramètres -> Bibliothèque & Dossiers
+  const libContainer = document.getElementById("settings-library-container");
+  if (libContainer) {
+    libContainer.innerHTML = "";
+    const foldersCard = document.createElement("div");
+    foldersCard.className = "panel-card";
+    foldersCard.innerHTML = `
+      <div class="section-title">
+        <span>Dossiers de jeux</span>
+        <span class="mono" style="font-size:10px; color:var(--text-muted);">${state.romDirectories.length} dossier(s)</span>
+      </div>
+      <div class="vault-actions" style="margin-bottom:12px;">
+        <button class="btn btn-primary" id="btn-cores-import-files" type="button">Ajouter des jeux...</button>
+        <button class="btn" id="btn-cores-scan-folder" type="button">Scanner un dossier...</button>
+        ${
+          state.romDirectories.length > 0
+            ? `<button class="btn" id="btn-cores-rescan-all" type="button">Tout actualiser</button>`
+            : ""
+        }
+      </div>
+      <div id="rom-dirs-container"></div>
+      ${
+        state.lastScanReport
+          ? `<div class="mono" style="margin-top:10px; font-size:10.5px; color:var(--text-secondary);">
+               Dernier scan (${escapeHtml(state.lastScanReport.scannedRoot)}) : ${state.lastScanReport.importedEntries?.length || 0} jeu(x) ajouté(s)
+             </div>`
+          : ""
+      }
+    `;
+    const dirsWrap = foldersCard.querySelector("#rom-dirs-container");
+    if (dirsWrap) {
+      if (state.romDirectories.length > 0) {
+        const listBox = document.createElement("div");
+        listBox.style.cssText = "padding-top:8px; border-top:1px solid var(--border-subtle);";
+        for (const dir of state.romDirectories) {
+          const row = document.createElement("div");
+          row.className = "rom-dir-row";
+          row.innerHTML = `
+            <span class="mono path-ellipsis" style="font-size:11px; color:var(--text-secondary); min-width:0; flex:1;" title="${escapeHtml(dir)}">${escapeHtml(dir)}</span>
+            <span class="rom-dir-actions">
+              <button class="btn btn-rescan-dir" type="button" style="padding:2px 8px; font-size:11px;" title="Actualiser ce dossier">Actualiser</button>
+              <button class="btn btn-inline-delete btn-remove-dir" type="button" title="Retirer ce dossier" aria-label="Retirer ce dossier">✕</button>
+            </span>
+          `;
+          row.querySelector(".btn-rescan-dir")?.addEventListener("click", async (ev) => {
+            const btn = ev.currentTarget;
+            if (!tauriInvoke) {
+              showToast("Le rescan de dossier requiert l'application desktop Zaimule.", "error");
+              return;
+            }
+            btn.disabled = true;
+            btn.textContent = "Scan...";
+            const boot = await invokeBackend("scan_rom_directory", { dirPath: dir });
+            if (boot) {
+              applyBootstrap(boot);
+              const added = boot.lastScanReport?.importedEntries?.length || 0;
+              showToast(
+                added > 0
+                  ? `${added} jeu(x) ajouté(s) depuis ${dir}.`
+                  : "Dossier à jour : aucun nouveau jeu.",
+                added > 0 ? "ok" : "info"
+              );
+            } else {
+              btn.disabled = false;
+              btn.textContent = "Actualiser";
+            }
+          });
+          row.querySelector(".btn-remove-dir")?.addEventListener("click", async () => {
+            if (tauriInvoke) {
+              const boot = await invokeBackend("remove_rom_directory", { dirPath: dir });
+              if (boot) {
+                applyBootstrap(boot);
+                showToast("Dossier retiré de la liste (vos jeux déjà ajoutés restent conservés).", "info");
+              }
+            } else {
+              state.romDirectories = state.romDirectories.filter((d) => d !== dir);
+              renderNetplayAndCores();
+            }
+          });
+          listBox.appendChild(row);
+        }
+        dirsWrap.appendChild(listBox);
+      } else {
+        dirsWrap.innerHTML = `<div class="empty-list-hint">Aucun dossier configuré. Ajoutez vos fichiers ou un dossier pour remplir la bibliothèque.</div>`;
+      }
+    }
+    foldersCard.querySelector("#btn-cores-import-files")?.addEventListener("click", () => {
+      handleImportRomsTrigger();
+    });
+    foldersCard.querySelector("#btn-cores-scan-folder")?.addEventListener("click", () => {
+      handleScanFolderTrigger();
+    });
+    foldersCard.querySelector("#btn-cores-rescan-all")?.addEventListener("click", async (ev) => {
+      const btn = ev.currentTarget;
+      if (!tauriInvoke) {
+        showToast("Le rescan des dossiers requiert l'application desktop Zaimule.", "error");
+        return;
+      }
+      const prev = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Scan...";
+      const boot = await invokeBackend("rescan_all_rom_directories");
+      if (boot) {
+        applyBootstrap(boot);
+        const added = boot.lastScanReport?.importedEntries?.length || 0;
+        showToast(
+          added > 0
+            ? `${added} nouveau(x) jeu(x) trouvé(s).`
+            : "Bibliothèque déjà à jour.",
+          added > 0 ? "ok" : "info"
+        );
+      } else {
+        btn.disabled = false;
+        btn.textContent = prev;
+      }
+    });
+    libContainer.appendChild(foldersCard);
+  }
 
+  // 2. Paramètres -> Nintendo Switch
+  const switchContainer = document.getElementById("settings-switch-container");
+  if (switchContainer) {
+    switchContainer.innerHTML = "";
     const vault = state.switchVault || {};
     const keys = vault.keys || {};
     const fw = vault.firmware || {};
@@ -1843,67 +1886,61 @@ function renderNetplayAndCores() {
     const titleOk = Boolean(keys.titleKeysFound);
     const fwOk = Boolean(fw.installed);
 
-    // 1. Coffre Switch (Option A)
     const vaultCard = document.createElement("div");
     vaultCard.className = "panel-card";
     vaultCard.innerHTML = `
       <div class="section-title">
-        <span>Coffre Switch (Option A : Torzu &amp; Fritchii)</span>
-        <button class="btn mono" id="btn-refresh-vault" type="button" style="padding:2px 8px; font-size:10px;">Actualiser</button>
+        <span>Coffre Switch (Torzu &amp; Fritchii)</span>
+        <button class="btn" id="btn-refresh-vault" type="button" style="padding:2px 8px; font-size:11px;">Actualiser</button>
       </div>
       <div class="switch-vault-row">
         <div class="switch-vault-head">
-          <div style="font-weight:600;">Clés Nintendo Switch (prod.keys / title.keys)</div>
+          <div style="font-weight:600;">1. Clés Nintendo Switch (prod.keys / title.keys)</div>
           <span class="pill-badge ${prodOk ? "pill-green" : "pill-terracotta"} mono">
-            ${prodOk ? (titleOk ? "prod + title OK" : "prod.keys OK") : "Clés requises"}
+            ${prodOk ? (titleOk ? "Clés prêtes" : "prod.keys OK") : "Requis"}
           </span>
         </div>
         <div class="mono path-ellipsis" style="font-size:10.5px; color:${prodOk ? "var(--status-ok)" : "var(--text-muted)"};" title="${escapeHtml(keys.prodKeysPath || keys.keysDir || "")}">
           ${
             prodOk
-              ? `prod.keys : ${escapeHtml(keys.prodKeysPath)}`
-              : "Importez manuellement vos fichiers prod.keys / title.keys (synchronisés à chaque lancement)."
+              ? escapeHtml(keys.prodKeysPath)
+              : "Importez vos fichiers prod.keys / title.keys pour déchiffrer vos jeux Switch."
           }
         </div>
         <div class="vault-actions">
-          <button class="btn btn-primary mono" id="btn-import-switch-keys" type="button" style="padding:4px 9px; font-size:11px;">
+          <button class="btn btn-primary" id="btn-import-switch-keys" type="button" style="padding:4px 10px; font-size:11px;">
             Importer Clés (.keys)...
           </button>
         </div>
       </div>
       <div class="switch-vault-row">
         <div class="switch-vault-head">
-          <div style="font-weight:600;">Firmware Nintendo Switch (.nca · Polices &amp; Applets)</div>
+          <div style="font-weight:600;">2. Firmware Nintendo Switch (.nca)</div>
           <span class="pill-badge ${fwOk ? "pill-green" : "pill-gold"} mono">
             ${
               fwOk
-                ? `${fw.ncaCount} .nca · ${escapeHtml(fw.versionHint || formatFileSize(fw.totalBytes || 0))}`
-                : "Optionnel (Recommandé)"
+                ? `${fw.ncaCount} fichiers · ${escapeHtml(fw.versionHint || formatFileSize(fw.totalBytes || 0))}`
+                : "Recommandé"
             }
           </span>
         </div>
         <div class="mono path-ellipsis" style="font-size:10.5px; color:${fwOk ? "var(--status-ok)" : "var(--text-muted)"};" title="${escapeHtml(fw.firmwareDir || "")}">
           ${
             fwOk
-              ? `${escapeHtml(fw.firmwareDir)} (${escapeHtml(formatFileSize(fw.totalBytes || 0))}) · synchronisé vers Torzu & Fritchii`
-              : "Recommandé pour les polices système, Mii et jeux récents (MK8D, Animal Crossing, Pokémon). Importez .zip/.7z ou dossier .nca."
+              ? `${escapeHtml(fw.firmwareDir)} (${escapeHtml(formatFileSize(fw.totalBytes || 0))})`
+              : "Nécessaire pour les polices système et certains jeux récents (MK8D, Animal Crossing, Pokémon)."
           }
         </div>
         <div class="vault-actions">
-          <button class="btn btn-primary mono" id="btn-import-switch-fw-archive" type="button" style="padding:4px 9px; font-size:11px;">
-            ${fwOk ? "Remplacer Firmware (.zip / .7z)..." : "Importer Firmware (.zip / .7z)..."}
+          <button class="btn btn-primary" id="btn-import-switch-fw-archive" type="button" style="padding:4px 10px; font-size:11px;">
+            ${fwOk ? "Remplacer (.zip / .7z)..." : "Importer archive (.zip / .7z)..."}
           </button>
-          <button class="btn mono" id="btn-import-switch-fw-folder" type="button" style="padding:4px 9px; font-size:11px;">
-            Importer Dossier Firmware...
+          <button class="btn" id="btn-import-switch-fw-folder" type="button" style="padding:4px 10px; font-size:11px;">
+            Importer dossier...
           </button>
         </div>
       </div>
       <div id="vault-engines-wrap"></div>
-      ${
-        vault.vaultRoot
-          ? `<div class="mono path-ellipsis" style="margin-top:8px; font-size:10px; color:var(--text-muted);" title="${escapeHtml(vault.vaultRoot)}">Coffre : ${escapeHtml(vault.vaultRoot)}</div>`
-          : ""
-      }
     `;
     vaultCard.querySelector("#btn-refresh-vault")?.addEventListener("click", async () => {
       const boot = await invokeBackend("refresh_switch_vault");
@@ -1924,215 +1961,31 @@ function renderNetplayAndCores() {
     const enginesWrap = vaultCard.querySelector("#vault-engines-wrap");
     if (enginesWrap) {
       enginesWrap.appendChild(
-        buildSwitchEngineBlock(vault.torzu, "torzu", "Torzu (Nintendo Switch 1)")
+        buildSwitchEngineBlock(vault.torzu, "torzu", "3. Torzu (Nintendo Switch 1)")
       );
       enginesWrap.appendChild(
-        buildSwitchEngineBlock(vault.fritchii, "fritchii", "Fritchii / Lichii (Switch 2)")
+        buildSwitchEngineBlock(vault.fritchii, "fritchii", "4. Fritchii (Nintendo Switch 2)")
       );
     }
+    switchContainer.appendChild(vaultCard);
+  }
 
-    // 2. Cœurs Natifs Rust Purs
-    const nativeCard = document.createElement("div");
-    nativeCard.className = "panel-card";
-    nativeCard.innerHTML = `<div class="section-title"><span>Cœurs Natifs Rust Purs (Viewport 60 Hz)</span></div>`;
-    for (const c of state.nativeCores || []) {
-      const row = document.createElement("div");
-      row.className = "mod-item";
-      row.innerHTML = `
-        <div style="min-width:0; flex:1;">
-          <div style="font-weight:600; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-            <span>${escapeHtml(c.name)}</span>
-            <span class="pill-badge mono" style="font-size:9.5px;">${escapeHtml(c.consoles)}</span>
-          </div>
-          <div class="mono" style="font-size:10.5px; color:var(--accent-primary);">${escapeHtml(c.engine)}</div>
-          <div style="font-size:11px; color:var(--text-secondary);">${escapeHtml(c.audioSummary)}</div>
-          ${
-            c.limitations
-              ? `<div style="font-size:10.5px; color:var(--accent-secondary); margin-top:2px;">${escapeHtml(c.limitations)}</div>`
-              : ""
-          }
-        </div>
-        <span class="pill-badge pill-green mono">ACTIF</span>
-      `;
-      nativeCard.appendChild(row);
-    }
-
-    // 3. Importation & Dossiers ROMs (manuel uniquement)
-    const foldersCard = document.createElement("div");
-    foldersCard.className = "panel-card";
-    foldersCard.innerHTML = `
-      <div class="section-title">
-        <span>Importation &amp; Dossiers ROMs (Manuel)</span>
-        <span class="mono" style="font-size:10px; color:var(--text-muted);">${state.romDirectories.length} dossier(s)</span>
-      </div>
-      <div class="vault-actions" style="margin-bottom:10px;">
-        <button class="btn btn-primary" id="btn-cores-import-files" type="button">Importer fichiers...</button>
-        <button class="btn" id="btn-cores-scan-folder" type="button">Scanner un dossier...</button>
-        ${
-          state.romDirectories.length > 0
-            ? `<button class="btn" id="btn-cores-rescan-all" type="button">Tout rescanner</button>`
-            : ""
-        }
-      </div>
-      <div id="rom-dirs-container"></div>
-      ${
-        state.lastScanReport
-          ? `<div class="mono" style="margin-top:10px; font-size:10.5px; color:var(--text-secondary);">
-               Dernier import (${escapeHtml(state.lastScanReport.scannedRoot)}) : ${state.lastScanReport.importedEntries?.length || 0} importé(s) · ${state.lastScanReport.skippedFiles || 0} ignoré(s)
-             </div>`
-          : ""
-      }
-    `;
-    const dirsWrap = foldersCard.querySelector("#rom-dirs-container");
-    if (dirsWrap) {
-      if (state.romDirectories.length > 0) {
-        const listBox = document.createElement("div");
-        listBox.style.cssText = "padding-top:8px; border-top:1px solid var(--border-subtle);";
-        const head = document.createElement("div");
-        head.className = "mono";
-        head.style.cssText = "font-size:10px; color:var(--text-muted); margin-bottom:6px;";
-        head.textContent = "DOSSIERS SCANNÉS";
-        listBox.appendChild(head);
-
-        for (const dir of state.romDirectories) {
-          const row = document.createElement("div");
-          row.className = "rom-dir-row";
-          row.innerHTML = `
-            <span class="mono path-ellipsis" style="font-size:11px; color:var(--text-secondary); min-width:0; flex:1;" title="${escapeHtml(dir)}">${escapeHtml(dir)}</span>
-            <span class="rom-dir-actions">
-              <button class="btn mono btn-rescan-dir" type="button" style="padding:2px 7px; font-size:10px;" title="Rescanner ce dossier">Rescanner</button>
-              <button class="btn mono btn-inline-delete btn-remove-dir" type="button" title="Retirer ce dossier de la liste" aria-label="Retirer ce dossier">✕</button>
-            </span>
-          `;
-          row.querySelector(".btn-rescan-dir")?.addEventListener("click", async (ev) => {
-            const btn = ev.currentTarget;
-            if (!tauriInvoke) {
-              showToast("Le rescan de dossier requiert l'application desktop Zaimule.", "error");
-              return;
-            }
-            btn.disabled = true;
-            btn.textContent = "Scan...";
-            const boot = await invokeBackend("scan_rom_directory", { dirPath: dir });
-            if (boot) {
-              applyBootstrap(boot);
-              const added = boot.lastScanReport?.importedEntries?.length || 0;
-              showToast(
-                added > 0
-                  ? `${added} jeu(x) synchronisé(s) depuis ${dir}.`
-                  : `Dossier rescanné (${dir}) : aucun nouveau jeu.`,
-                added > 0 ? "ok" : "info"
-              );
-            } else {
-              btn.disabled = false;
-              btn.textContent = "Rescanner";
-            }
-          });
-          row.querySelector(".btn-remove-dir")?.addEventListener("click", async () => {
-            if (tauriInvoke) {
-              const boot = await invokeBackend("remove_rom_directory", { dirPath: dir });
-              if (boot) {
-                applyBootstrap(boot);
-                showToast("Dossier retiré de la liste (ROMs existantes conservées).", "info");
-              }
-            } else {
-              state.romDirectories = state.romDirectories.filter((d) => d !== dir);
-              renderNetplayAndCores();
-            }
-          });
-          listBox.appendChild(row);
-        }
-        dirsWrap.appendChild(listBox);
-      } else {
-        dirsWrap.innerHTML = `<div class="empty-list-hint">Aucun scan automatique au démarrage. Ajoutez vos fichiers ou dossiers manuellement, ou par glisser-déposer.</div>`;
-      }
-    }
-    foldersCard.querySelector("#btn-cores-import-files")?.addEventListener("click", () => {
-      handleImportRomsTrigger();
-    });
-    foldersCard.querySelector("#btn-cores-scan-folder")?.addEventListener("click", () => {
-      handleScanFolderTrigger();
-    });
-    foldersCard.querySelector("#btn-cores-rescan-all")?.addEventListener("click", async (ev) => {
-      const btn = ev.currentTarget;
-      if (!tauriInvoke) {
-        showToast("Le rescan des dossiers requiert l'application desktop Zaimule.", "error");
-        return;
-      }
-      const prev = btn.textContent;
-      btn.disabled = true;
-      btn.textContent = "Rescan...";
-      const boot = await invokeBackend("rescan_all_rom_directories");
-      if (boot) {
-        applyBootstrap(boot);
-        const added = boot.lastScanReport?.importedEntries?.length || 0;
-        showToast(
-          added > 0
-            ? `Rescan complet terminé : ${added} jeu(x) synchronisé(s).`
-            : "Rescan complet terminé : bibliothèque à jour.",
-          added > 0 ? "ok" : "info"
-        );
-      } else {
-        btn.disabled = false;
-        btn.textContent = prev;
-      }
-    });
-
-    // 4. Patchs .IPS Non-Destructifs
-    const communityCard = document.createElement("div");
-    communityCard.className = "panel-card";
-    communityCard.innerHTML = `<div class="section-title"><span>Patchs .IPS Non-Destructifs</span></div>`;
-    if ((state.communityMods || []).length === 0) {
-      const hint = document.createElement("div");
-      hint.className = "empty-list-hint";
-      hint.textContent =
-        "Aucun patch .IPS chargé. Utilisez « Patch .IPS » dans la barre supérieure pour appliquer un patch local sans modifier la ROM d'origine.";
-      communityCard.appendChild(hint);
-    } else {
-      for (const mod of state.communityMods) {
-        const row = document.createElement("div");
-        row.className = "mod-item";
-        row.innerHTML = `
-          <div>
-            <div style="font-weight:600">${escapeHtml(mod.title)}</div>
-            <div style="font-size:11px; color:var(--text-muted)">${escapeHtml(mod.description)}</div>
-            <div class="mono" style="font-size:10.5px; color:var(--accent-secondary)">Par ${escapeHtml(mod.author)} · Cible : ${escapeHtml(mod.targetConsole)}</div>
-          </div>
-          <button class="btn mono" style="padding:4px 10px; font-size:11px;">
-            ${mod.installed ? "Patch .IPS Actif" : "Installer .IPS"}
-          </button>
-        `;
-        row.querySelector("button").addEventListener("click", async () => {
-          const boot = await invokeBackend("install_community_ips_mod", { modId: mod.id });
-          if (boot) {
-            applyBootstrap(boot);
-          } else {
-            mod.installed = true;
-            state.modLayers.unshift({
-              id: `comm-${mod.id}`,
-              label: mod.title,
-              enabled: true
-            });
-            updateAllViews();
-          }
-        });
-        communityCard.appendChild(row);
-      }
-    }
-
-    // 5. Registre Cryptographique des BIOS & Firmware
+  // 3. Paramètres -> Avancé : BIOS optionnels
+  const biosContainer = document.getElementById("settings-bios-container");
+  if (biosContainer) {
+    biosContainer.innerHTML = "";
     const biosCard = document.createElement("div");
     biosCard.className = "panel-card";
     biosCard.innerHTML = `
       <div class="section-title">
-        <span>Registre Cryptographique des BIOS &amp; Firmware</span>
-        <button class="btn mono" id="btn-import-bios" type="button" style="padding:3px 9px; font-size:10.5px;">
-          Importer BIOS / Firmware (.zip / .7z / .bin)...
+        <span>BIOS &amp; Firmware (Optionnel)</span>
+        <button class="btn" id="btn-import-bios" type="button" style="padding:3px 10px; font-size:11px;">
+          Importer BIOS (.zip / .7z / .bin)...
         </button>
       </div>
-      <div style="font-size:11px; color:var(--text-secondary); margin-bottom:8px; line-height:1.45;">
-        Optionnel — les cœurs fonctionnent déjà en HLE. Importer vos propres dumps
-        (<strong>bios7.bin</strong>, <strong>bios9.bin</strong>, <strong>firmware.bin</strong> en <strong>.zip</strong>, <strong>.7z</strong> ou <strong>.bin</strong>)
-        active la table KEY1 officielle, les appels BIOS et la calibration tactile sur Nintendo DS.
+      <div style="font-size:12px; color:var(--text-secondary); margin-bottom:10px; line-height:1.45;">
+        Les consoles fonctionnent déjà prêtes à l'emploi sans BIOS. Importer vos propres fichiers DS
+        (<strong>bios7.bin</strong>, <strong>bios9.bin</strong>, <strong>firmware.bin</strong>) améliore la compatibilité de certains titres.
       </div>
       ${state.biosEntries
         .map((b) => {
@@ -2153,12 +2006,29 @@ function renderNetplayAndCores() {
     biosCard.querySelector("#btn-import-bios")?.addEventListener("click", (ev) => {
       handleImportBios(ev.currentTarget);
     });
+    biosContainer.appendChild(biosCard);
+  }
 
-    coresGrid.appendChild(vaultCard);
-    coresGrid.appendChild(nativeCard);
-    coresGrid.appendChild(foldersCard);
-    coresGrid.appendChild(communityCard);
-    coresGrid.appendChild(biosCard);
+  // 4. Paramètres -> Avancé : Cœurs natifs intégrés
+  const nativeContainer = document.getElementById("settings-native-cores-container");
+  if (nativeContainer) {
+    nativeContainer.innerHTML = "";
+    for (const c of state.nativeCores || []) {
+      const row = document.createElement("div");
+      row.className = "mod-item";
+      row.innerHTML = `
+        <div style="min-width:0; flex:1;">
+          <div style="font-weight:600; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+            <span>${escapeHtml(c.name)}</span>
+            <span class="pill-badge mono" style="font-size:9.5px;">${escapeHtml(c.consoles)}</span>
+          </div>
+          <div class="mono" style="font-size:10.5px; color:var(--accent-primary);">${escapeHtml(c.engine)}</div>
+          <div style="font-size:11px; color:var(--text-secondary);">${escapeHtml(c.audioSummary)}</div>
+        </div>
+        <span class="pill-badge pill-green mono">PRÊT</span>
+      `;
+      nativeContainer.appendChild(row);
+    }
   }
 }
 
@@ -2175,6 +2045,7 @@ function applyBootstrap(boot) {
   state.keymapperWidgets = Array.isArray(boot.keymapperWidgets)
     ? boot.keymapperWidgets
     : state.keymapperWidgets;
+  invalidateKeyBindingsCache();
   state.macros = Array.isArray(boot.macros) ? boot.macros : state.macros;
   state.tasTimeline = Array.isArray(boot.tasTimeline) ? boot.tasTimeline : state.tasTimeline;
   state.netplayRooms = Array.isArray(boot.netplayRooms) ? boot.netplayRooms : state.netplayRooms;
@@ -2253,7 +2124,8 @@ function updateAllViews() {
 }
 
 function switchTab(targetId) {
-  const prevPane = document.querySelector(".view-pane.active")?.id;
+  const prevPane = activePaneId || document.querySelector(".view-pane.active")?.id;
+  activePaneId = targetId;
   if (prevPane === "view-emulator" && targetId !== "view-emulator") {
     if (state.isFullscreen) {
       setViewportFullscreen(false);
@@ -2273,7 +2145,7 @@ function switchTab(targetId) {
   document.querySelectorAll(".view-pane").forEach((pane) => {
     pane.classList.toggle("active", pane.id === targetId);
   });
-  if ((targetId === "view-library" || targetId === "view-netplay") && tauriInvoke) {
+  if ((targetId === "view-library" || targetId === "view-settings") && tauriInvoke) {
     invokeBackend("get_station_bootstrap", {}, { silent: true }).then((boot) => {
       if (boot) applyBootstrap(boot);
     });
@@ -2281,9 +2153,9 @@ function switchTab(targetId) {
 }
 
 function renderStandbyCanvas() {
-  const canvas = document.getElementById("canvas-p1");
-  if (canvas) {
-    const ctx = canvas.getContext("2d");
+  const p1 = getCanvasEntry("canvas-p1", true);
+  if (p1) {
+    const { canvas, ctx } = p1;
     const w = canvas.width || 160;
     const h = canvas.height || 144;
     ctx.fillStyle = "#110F0E";
@@ -2292,9 +2164,9 @@ function renderStandbyCanvas() {
     ctx.lineWidth = 1;
     ctx.strokeRect(8.5, 8.5, w - 17, h - 17);
   }
-  const osc = document.getElementById("audio-oscilloscope-canvas");
-  if (osc) {
-    const ctx = osc.getContext("2d");
+  const oscEntry = getCanvasEntry("audio-oscilloscope-canvas", true);
+  if (oscEntry) {
+    const { canvas: osc, ctx } = oscEntry;
     ctx.fillStyle = "#110F0E";
     ctx.fillRect(0, 0, osc.width, osc.height);
     ctx.strokeStyle = "#332E2B";
@@ -2305,16 +2177,20 @@ function renderStandbyCanvas() {
   }
 }
 
-function paintRgbaFrame(canvasId, frame) {
-  const canvas = document.getElementById(canvasId);
-  if (!canvas || !frame || !frame.rgba) return;
+function paintRgbaFrame(canvasId, frame, activeGame = null) {
+  if (!frame || !frame.rgba) return;
+  const isPlayerCanvas = canvasId.startsWith("canvas-p");
+  const entry = getCanvasEntry(canvasId, isPlayerCanvas);
+  if (!entry) return;
+  const { canvas, ctx } = entry;
+
   let processed =
-    canvasId.startsWith("canvas-p") && state.upscalerMode !== "OFF"
+    isPlayerCanvas && state.upscalerMode !== "OFF"
       ? upscaleFrameIfEnabled(frame, state.upscalerMode)
       : frame;
 
-  if (canvasId.startsWith("canvas-p") && state.ndsLayout !== "vertical") {
-    const g = getSelectedGame();
+  if (isPlayerCanvas && state.ndsLayout !== "vertical") {
+    const g = activeGame || getSelectedGame();
     if (g && String(g.console || "").toUpperCase() === "NDS") {
       processed = arrangeNdsDualScreenFrame(processed, state.ndsLayout);
     }
@@ -2322,30 +2198,36 @@ function paintRgbaFrame(canvasId, frame) {
 
   const w = processed.width;
   const h = processed.height;
-  if (!w || !h || processed.rgba.length !== w * h * 4) return;
+  const expectedLen = w * h * 4;
+  if (!w || !h || processed.rgba.length !== expectedLen) return;
 
   if (canvas.width !== w || canvas.height !== h) {
     canvas.width = w;
     canvas.height = h;
   }
-  const ctx = canvas.getContext("2d");
-  let cached = canvasImageCache.get(canvasId);
-  if (!cached || cached.width !== w || cached.height !== h) {
-    cached = {
-      width: w,
-      height: h,
-      imgData: ctx.createImageData(w, h)
-    };
-    canvasImageCache.set(canvasId, cached);
+
+  if (typeof ImageData === "function" && processed.rgba instanceof Uint8ClampedArray) {
+    ctx.putImageData(new ImageData(processed.rgba, w, h), 0, 0);
+    return;
   }
-  cached.imgData.data.set(processed.rgba);
-  ctx.putImageData(cached.imgData, 0, 0);
+
+  if (!entry.imgData || entry.width !== w || entry.height !== h) {
+    entry.width = w;
+    entry.height = h;
+    entry.imgData = ctx.createImageData(w, h);
+  }
+  entry.imgData.data.set(processed.rgba);
+  ctx.putImageData(entry.imgData, 0, 0);
 }
 
-function renderAudioOscilloscope(freqHz, frameNumber, pcmSamples = null, consoleKind = "") {
-  const osc = document.getElementById("audio-oscilloscope-canvas");
-  if (!osc) return;
-  const ctx = osc.getContext("2d");
+function renderAudioOscilloscope(freqHz, frameNumber, pcmSamples = null, nowMs = 0) {
+  if (state.isFullscreen || !oscCanvasVisible) return;
+  if (nowMs > 0 && nowMs - lastOscilloscopeDrawMs < 50) return;
+  lastOscilloscopeDrawMs = nowMs || performance.now();
+
+  const entry = getCanvasEntry("audio-oscilloscope-canvas", true);
+  if (!entry) return;
+  const { canvas: osc, ctx } = entry;
   const w = osc.width;
   const h = osc.height;
   ctx.fillStyle = "#110F0E";
@@ -2358,25 +2240,33 @@ function renderAudioOscilloscope(freqHz, frameNumber, pcmSamples = null, console
   ctx.stroke();
 
   let plotSamples;
+  let sampleCount = 0;
   const hasRealPcm = pcmSamples && pcmSamples.length >= 2;
   if (hasRealPcm) {
     const pairCount = pcmSamples.length >> 1;
     const step = Math.max(1, Math.floor(pairCount / 48));
-    plotSamples = [];
-    for (let i = 0; i < pairCount && plotSamples.length < 48; i += step) {
-      plotSamples.push((pcmSamples[i * 2] + pcmSamples[i * 2 + 1]) * 0.5);
+    for (let i = 0; i < pairCount && sampleCount < 48; i += step) {
+      oscPlotBuffer[sampleCount] = (pcmSamples[i * 2] + pcmSamples[i * 2 + 1]) * 0.5;
+      sampleCount += 1;
     }
+    plotSamples = oscPlotBuffer;
   } else {
     plotSamples = synthesizeMultiChannelSamples(freqHz || 0, frameNumber, 48);
+    sampleCount = plotSamples.length;
   }
 
   ctx.strokeStyle = freqHz > 0 || hasRealPcm ? "#7D9B76" : "#3B6EF5";
   ctx.lineWidth = 1.5;
   ctx.beginPath();
-  for (let i = 0; i < plotSamples.length; i++) {
-    const x = (i / Math.max(1, plotSamples.length - 1)) * w;
-    const clamped = Math.max(-1, Math.min(1, plotSamples[i] * 1.4));
-    const y = h / 2 - clamped * (h * 0.42);
+  const invSpan = w / Math.max(1, sampleCount - 1);
+  const halfH = h * 0.5;
+  const ampScale = h * 0.42;
+  for (let i = 0; i < sampleCount; i++) {
+    const x = i * invSpan;
+    let s = plotSamples[i] * 1.4;
+    if (s > 1) s = 1;
+    else if (s < -1) s = -1;
+    const y = halfH - s * ampScale;
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   }
@@ -2416,11 +2306,11 @@ async function handleImportedFile(file, options = {}) {
 
   if (lower.endsWith(".keys")) {
     showToast(
-      "Importez prod.keys / title.keys depuis l'onglet « Cœurs & Switch » (ou glissez le fichier dans l'application desktop).",
+      "Importez prod.keys / title.keys depuis « Paramètres → Nintendo Switch » (ou glissez le fichier dans l'application desktop).",
       "info",
       6000
     );
-    switchTab("view-cores");
+    openSettingsTab("settings-pane-switch");
     return;
   }
 
@@ -2595,21 +2485,37 @@ async function refreshDebuggerDrawer() {
   }
 }
 
+function scheduleDebuggerRefresh(nowMs, force = false) {
+  if (debuggerRefreshInFlight) return;
+  if (!force && (!vramCanvasVisible || state.isFullscreen || nowMs - lastDebuggerRefreshMs < 750)) {
+    return;
+  }
+  debuggerRefreshInFlight = true;
+  lastDebuggerRefreshMs = nowMs;
+  refreshDebuggerDrawer().finally(() => {
+    debuggerRefreshInFlight = false;
+  });
+}
+
 async function tickEmulationLoop(nowMs) {
+  requestAnimationFrame(tickEmulationLoop);
   if (stepInFlight) {
-    requestAnimationFrame(tickEmulationLoop);
     return;
   }
   stepInFlight = true;
   try {
     const activeGame = getSelectedGame();
     const isSwitch = isSwitchGame(activeGame);
-    const activePane = document.querySelector(".view-pane.active")?.id || "view-library";
-    const keyBindings = buildKeyBindingsFromWidgets(state.keymapperWidgets);
-    const rawMask = computeBitmaskFromPressedCodes(pressedKeys, keyBindings) | pollGamepadBitmask();
+    const activePane = activePaneId || "view-library";
+    const keyBindings = getCachedKeyBindings();
+    const connectedPad = getConnectedGamepad();
+    const rawMask =
+      computeBitmaskFromPressedCodes(pressedKeys, keyBindings) | pollGamepadBitmask(connectedPad);
 
-    if (!document.hidden) {
+    if (state.bigPictureMode && !document.hidden) {
       await handleBigPictureNavigation(rawMask);
+    } else {
+      state.prevNavMask = rawMask;
     }
 
     if (!state.isEmulationRunning || !activeGame || isSwitch) {
@@ -2654,13 +2560,28 @@ async function tickEmulationLoop(nowMs) {
       state.recordedFrames.push(buttonsP1);
     }
 
+    const wantTelemetry =
+      !lastTelemetryDomUpdateMs ||
+      nowMs - lastTelemetryDomUpdateMs >= 250 ||
+      state.debuggerPaused ||
+      manualStep;
+
+    const stepOptions = { includeDebugMeta: wantTelemetry };
+    if (pendingNdsStylus) {
+      stepOptions.stylusX = pendingNdsStylus.x;
+      stepOptions.stylusY = pendingNdsStylus.y;
+      stepOptions.stylusPressed = pendingNdsStylus.pressed;
+      pendingNdsStylus = null;
+    }
+
     const rawPkt = await invokeBackend(
       "step_viewport_binary",
       {
         buttonsP1,
         buttonsP2: 0,
         turboActive: false,
-        speedMult: state.speedMult
+        speedMult: state.speedMult,
+        options: stepOptions
       },
       { silent: true }
     );
@@ -2670,75 +2591,57 @@ async function tickEmulationLoop(nowMs) {
       const primary = pkt.views[0];
       if (primary) {
         state.currentFrame = pkt.frameNumber || state.currentFrame + 1;
-        paintRgbaFrame("canvas-p1", primary);
+        paintRgbaFrame("canvas-p1", primary, activeGame);
         if (pkt.views[1]) {
-          paintRgbaFrame("canvas-p2", pkt.views[1]);
+          paintRgbaFrame("canvas-p2", pkt.views[1], activeGame);
         }
         if (pkt.views[2]) {
-          paintRgbaFrame("canvas-p3", pkt.views[2]);
+          paintRgbaFrame("canvas-p3", pkt.views[2], activeGame);
         } else if (state.quadLinkMode) {
-          paintRgbaFrame("canvas-p3", primary);
+          paintRgbaFrame("canvas-p3", primary, activeGame);
         }
         if (pkt.views[3]) {
-          paintRgbaFrame("canvas-p4", pkt.views[3]);
+          paintRgbaFrame("canvas-p4", pkt.views[3], activeGame);
         } else if (state.quadLinkMode) {
-          paintRgbaFrame("canvas-p4", primary);
+          paintRgbaFrame("canvas-p4", primary, activeGame);
         }
 
         // Draw waveform BEFORE transferring pkt.pcmSamples buffer ownership to AudioWorklet
-        renderAudioOscilloscope(
-          pkt.audioFreqHz || 0,
-          pkt.frameNumber,
-          pkt.pcmSamples,
-          pkt.meta?.console || activeGame.console
-        );
+        renderAudioOscilloscope(pkt.audioFreqHz || 0, pkt.frameNumber, pkt.pcmSamples, nowMs);
         apuAudio.pushPcmSamples(pkt.pcmSamples, pkt.sampleRateHz);
 
-        if (pkt.audioFreqHz >= 1200) {
-          triggerGamepadRumble(getConnectedGamepad(), 55, 0.35, 0.65);
+        if (pkt.audioFreqHz >= 1200 && connectedPad) {
+          triggerGamepadRumble(connectedPad, 55, 0.35, 0.65);
         }
 
         const meta = pkt.meta || {};
         if (meta.newlyUnlockedAchievement) {
-          triggerGamepadRumble(getConnectedGamepad(), 140, 0.6, 0.95);
+          if (connectedPad) {
+            triggerGamepadRumble(connectedPad, 140, 0.6, 0.95);
+          }
           showToast(`Succès débloqué : ${meta.newlyUnlockedAchievement}`, "ok");
           const boot = await invokeBackend("get_station_bootstrap", {}, { silent: true });
           if (boot) applyBootstrap(boot);
           else renderInspector();
         }
 
-        if (
-          !lastTelemetryDomUpdateMs ||
-          nowMs - lastTelemetryDomUpdateMs >= 250 ||
-          state.debuggerPaused ||
-          manualStep
-        ) {
+        if (wantTelemetry) {
           lastTelemetryDomUpdateMs = nowMs;
-          const fpsEl = document.getElementById("tel-fps");
-          if (fpsEl) fpsEl.textContent = `${(pacing.measuredFps * state.speedMult).toFixed(1)} FPS`;
-          const ftEl = document.getElementById("tel-ft");
-          if (ftEl) ftEl.textContent = `${pacing.frameTimeMs.toFixed(1)} ms`;
+          const fpsEl = getCachedEl("tel-fps");
+          if (fpsEl) fpsEl.textContent = `${Math.round(pacing.measuredFps * state.speedMult)} FPS`;
 
           const cpu = meta.cpu || {};
-          const score = cpu.score ?? 0;
-          document.getElementById("emu-score-pill").textContent = `Score : ${score}`;
-          document.getElementById("p1-reg-readout").textContent = `${cpu.arch || "—"} · PC:${cpu.pcHex || "—"}`;
-          document.getElementById("rewind-readout").textContent = `Frame #${pkt.frameNumber}`;
-          document.getElementById("dbg-pc-sp").textContent = `${cpu.pcHex || "—"} / ${cpu.spHex || "—"}`;
-          document.getElementById("dbg-af-bc").textContent = `${cpu.regAHex || "—"} / ${cpu.regBcHex || "—"}`;
-          document.getElementById("dbg-de-hl").textContent = `${cpu.regDeHex || "—"} / ${cpu.regHlHex || "—"}`;
-          document.getElementById("dbg-sio").textContent = `${cpu.serialSbHex || "0x00"} / ${pkt.audioFreqHz || 0} Hz`;
-          document.getElementById("tel-rewind").textContent = `${pkt.rewindSnapshotsCount} clichés (${Math.round(pkt.rewindMemoryBytes / 1024)} Ko)`;
-
-          const link = meta.linkTelemetry;
-          if (link?.enabled) {
-            const modePrefix = link.quadMode ? "4P Tournoi" : "2P Sync";
-            document.getElementById("tel-link").textContent =
-              `${modePrefix} (${link.packetsTransferred} pkts · ${link.lastP1ToP2Hex})`;
-          }
+          const pcSpEl = getCachedEl("dbg-pc-sp");
+          if (pcSpEl) pcSpEl.textContent = `${cpu.pcHex || "—"} / ${cpu.spHex || "—"}`;
+          const afBcEl = getCachedEl("dbg-af-bc");
+          if (afBcEl) afBcEl.textContent = `${cpu.regAHex || "—"} / ${cpu.regBcHex || "—"}`;
+          const deHlEl = getCachedEl("dbg-de-hl");
+          if (deHlEl) deHlEl.textContent = `${cpu.regDeHex || "—"} / ${cpu.regHlHex || "—"}`;
+          const sioEl = getCachedEl("dbg-sio");
+          if (sioEl) sioEl.textContent = `${cpu.serialSbHex || "0x00"} / ${pkt.audioFreqHz || 0} Hz`;
         }
-        if ((pkt.frameNumber & 15) === 1 || state.debuggerPaused) {
-          await refreshDebuggerDrawer();
+        if (manualStep || state.debuggerPaused || vramCanvasVisible) {
+          scheduleDebuggerRefresh(nowMs, manualStep || state.debuggerPaused);
         }
       }
     }
@@ -2746,7 +2649,6 @@ async function tickEmulationLoop(nowMs) {
     console.warn("[zaimule] Erreur boucle viewport:", err);
   } finally {
     stepInFlight = false;
-    requestAnimationFrame(tickEmulationLoop);
   }
 }
 
@@ -2874,6 +2776,10 @@ function bindEvents() {
     btn.addEventListener("click", () => switchTab(btn.dataset.target));
   });
 
+  document.querySelectorAll(".settings-nav-btn").forEach((btn) => {
+    btn.addEventListener("click", () => switchSettingsSubTab(btn.dataset.settingsTab));
+  });
+
   document.querySelectorAll(".inspector-tab-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       const targetPane = btn.dataset.inspTab;
@@ -2893,7 +2799,19 @@ function bindEvents() {
     drawer?.classList.toggle("collapsed");
   };
   document.getElementById("btn-toggle-inspector")?.addEventListener("click", toggleInspectorDrawer);
+  document.getElementById("btn-close-inspector")?.addEventListener("click", () => {
+    document.getElementById("inspector-drawer")?.classList.add("collapsed");
+  });
   document.getElementById("prompt-options")?.addEventListener("click", toggleInspectorDrawer);
+
+  const toggleEmuDrawer = () => {
+    const drawer = document.getElementById("emu-options-drawer");
+    drawer?.classList.toggle("collapsed");
+  };
+  document.getElementById("btn-toggle-emu-drawer")?.addEventListener("click", toggleEmuDrawer);
+  document.getElementById("btn-close-emu-drawer")?.addEventListener("click", () => {
+    document.getElementById("emu-options-drawer")?.classList.add("collapsed");
+  });
 
   document.getElementById("prompt-launch")?.addEventListener("click", () => {
     launchSelectedGame();
@@ -2901,6 +2819,13 @@ function bindEvents() {
 
   document.getElementById("prompt-savestate")?.addEventListener("click", () => {
     document.getElementById("btn-quick-save")?.click();
+  });
+
+  document.getElementById("prompt-fullscreen")?.addEventListener("click", async () => {
+    if (activePaneId !== "view-emulator" && state.isEmulationRunning) {
+      switchTab("view-emulator");
+    }
+    await setViewportFullscreen(!state.isFullscreen);
   });
 
   const cycleConsoleFilter = (dir = 1) => {
@@ -2915,7 +2840,7 @@ function bindEvents() {
   document.getElementById("btn-big-picture")?.addEventListener("click", (e) => {
     state.bigPictureMode = !state.bigPictureMode;
     document.querySelector(".app-shell")?.classList.toggle("big-picture", state.bigPictureMode);
-    e.currentTarget.textContent = `Big Picture : ${state.bigPictureMode ? "ACTIF" : "OFF"}`;
+    e.currentTarget.textContent = state.bigPictureMode ? "Activé" : "Désactivé";
     triggerGamepadRumble(getConnectedGamepad(), 70, 0.4, 0.7);
   });
 
@@ -2956,25 +2881,34 @@ function bindEvents() {
     const g = getSelectedGame();
     return Boolean(g && String(g.console || "").toUpperCase() === "NDS");
   };
-  const handleStylusEvent = async (ev, pressed) => {
+  const dispatchStylusState = (x, y, pressed) => {
+    const payload = { x, y, pressed };
+    if (
+      state.isEmulationRunning &&
+      !state.debuggerPaused &&
+      activePaneId === "view-emulator"
+    ) {
+      pendingNdsStylus = payload;
+      return;
+    }
+    pendingNdsStylus = null;
+    invokeBackend("set_nds_stylus", payload, { silent: true });
+  };
+  const handleStylusEvent = (ev, pressed) => {
     if (!canvasP1 || !isNdsActive()) return false;
     const rect = canvasP1.getBoundingClientRect();
     const normX = Math.max(0, Math.min(1, (ev.clientX - rect.left) / Math.max(1, rect.width)));
     const normY = Math.max(0, Math.min(1, (ev.clientY - rect.top) / Math.max(1, rect.height)));
     const mapped = mapCanvasToNdsStylus(normX, normY, state.ndsLayout);
     if (pressed && !mapped.onBottomScreen) {
-      await invokeBackend("set_nds_stylus", { x: mapped.x, y: 0, pressed: false }, { silent: true });
+      dispatchStylusState(mapped.x, 0, false);
       return false;
     }
-    await invokeBackend(
-      "set_nds_stylus",
-      { x: mapped.x, y: mapped.y, pressed: pressed && mapped.onBottomScreen },
-      { silent: true }
-    );
+    dispatchStylusState(mapped.x, mapped.y, pressed && mapped.onBottomScreen);
     return mapped.onBottomScreen;
   };
 
-  canvasP1?.addEventListener("mousedown", async (e) => {
+  canvasP1?.addEventListener("mousedown", (e) => {
     if (!isNdsActive()) return;
     const rect = canvasP1.getBoundingClientRect();
     const normX = Math.max(0, Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width)));
@@ -2982,16 +2916,16 @@ function bindEvents() {
     const mapped = mapCanvasToNdsStylus(normX, normY, state.ndsLayout);
     if (!mapped.onBottomScreen) return;
     state.stylusPressed = true;
-    await invokeBackend("set_nds_stylus", { x: mapped.x, y: mapped.y, pressed: true }, { silent: true });
+    dispatchStylusState(mapped.x, mapped.y, true);
   });
-  canvasP1?.addEventListener("mousemove", async (e) => {
+  canvasP1?.addEventListener("mousemove", (e) => {
     if (!state.stylusPressed) return;
-    await handleStylusEvent(e, true);
+    handleStylusEvent(e, true);
   });
-  window.addEventListener("mouseup", async (e) => {
+  window.addEventListener("mouseup", (e) => {
     if (!state.stylusPressed) return;
     state.stylusPressed = false;
-    await handleStylusEvent(e, false);
+    handleStylusEvent(e, false);
   });
 
   document.getElementById("insp-switch-engine")?.addEventListener("change", async (e) => {
@@ -3107,48 +3041,6 @@ function bindEvents() {
     });
     if (boot) applyBootstrap(boot);
     else renderInspector();
-  });
-
-  document.getElementById("btn-sram-boost")?.addEventListener("click", async () => {
-    if (!getSelectedGame()) return;
-    const updated = await invokeBackend("write_sram_byte_live", {
-      offset: 4,
-      value: 0xff
-    });
-    if (updated?.sramHexInspection) {
-      applyBootstrap(updated);
-    } else if (updated) {
-      state.sramHexInspection = updated;
-      renderInspector();
-    }
-    const toast = document.getElementById("save-toast");
-    if (toast) toast.textContent = "Octet SRAM 0x0004 = 0xFF écrit & CRC32 recalculé";
-  });
-
-  document.getElementById("btn-sram-transfer")?.addEventListener("click", async () => {
-    if (!getSelectedGame()) return;
-    const boot = await invokeBackend("transfer_sram_p1_to_p2");
-    if (boot) applyBootstrap(boot);
-    const toast = document.getElementById("save-toast");
-    if (toast) toast.textContent = "Batterie SRAM / Carte Mémoire synchronisée J1 → J2";
-  });
-
-  document.getElementById("btn-toggle-spectator")?.addEventListener("click", async () => {
-    const boot = await invokeBackend("toggle_tournament_spectator");
-    if (boot) {
-      applyBootstrap(boot);
-    }
-  });
-
-  document.getElementById("btn-submit-ghost")?.addEventListener("click", async () => {
-    const g = getSelectedGame();
-    if (!g) return;
-    const boot = await invokeBackend("submit_ghost_leaderboard_run", {
-      playerName: "Joueur 1"
-    });
-    if (boot) {
-      applyBootstrap(boot);
-    }
   });
 
   document.getElementById("btn-export-pack")?.addEventListener("click", async () => {
@@ -3353,21 +3245,14 @@ function bindEvents() {
     if (on && state.isEmulationRunning) {
       apuAudio.ensureContext();
     }
-    e.currentTarget.textContent = `Audio APU : ${on ? "ON" : "MUET"}`;
+    e.currentTarget.textContent = on ? "Son" : "Muet";
   });
 
-  document.getElementById("audio-volume-slider")?.addEventListener("input", (e) => {
-    const pct = Math.max(0, Math.min(100, Math.round(Number(e.target.value) || 0)));
-    state.audioVolume = pct;
-    apuAudio.setVolume(pct / 100);
-    const label = document.getElementById("audio-volume-label");
-    if (label) label.textContent = `${pct}%`;
-    try {
-      window.localStorage?.setItem("zaimule.audioVolume", String(pct));
-    } catch {
-      // Ignore storage write errors
-    }
-  });
+  for (const sliderId of ["audio-volume-slider", "settings-volume-slider"]) {
+    document.getElementById(sliderId)?.addEventListener("input", (e) => {
+      setAudioVolumePct(e.target.value, true);
+    });
+  }
 
   document.getElementById("btn-record-video")?.addEventListener("click", (e) => {
     if (!getSelectedGame()) return;
@@ -3375,12 +3260,11 @@ function bindEvents() {
     if (!viewportRecorder.isRecording) {
       viewportRecorder.start(canvas, state.activeGameId);
       e.currentTarget.textContent = "Stop .WebM";
-      document.getElementById("save-toast").textContent = "Capture vidéo 60 FPS en cours...";
+      setText("save-toast", "Enregistrement vidéo en cours...");
     } else {
       const res = viewportRecorder.stop();
       e.currentTarget.textContent = "Clip .WebM";
-      document.getElementById("save-toast").textContent =
-        `Clip enregistré : ${res.fileName} (${res.durationText})`;
+      setText("save-toast", `Clip enregistré (${res.durationText})`);
     }
   });
 
@@ -3392,7 +3276,7 @@ function bindEvents() {
   document.getElementById("btn-emu-reset")?.addEventListener("click", async () => {
     const g = getSelectedGame();
     if (!g || isSwitchGame(g)) {
-      showToast("Lancez d'abord un jeu natif (GB/GBC/GBA/NDS) pour effectuer un reset.", "info");
+      showToast("Lancez d'abord un jeu natif (GB/GBC/GBA/NDS) pour redémarrer.", "info");
       return;
     }
     if (tauriInvoke) {
@@ -3404,16 +3288,15 @@ function bindEvents() {
     framePacer.reset();
     apuAudio.reset();
     setEmulationPaused(false);
-    showToast("Reset matériel effectué (sauvegarde SRAM préservée).", "ok");
+    showToast("Jeu redémarré (sauvegarde conservée).", "ok");
   });
 
   document.getElementById("btn-screenshot-png")?.addEventListener("click", () => {
     captureScreenshotPng();
   });
 
-  document.getElementById("btn-nds-layout")?.addEventListener("click", () => {
-    const curIdx = Math.max(0, NDS_LAYOUT_MODES.indexOf(state.ndsLayout));
-    state.ndsLayout = NDS_LAYOUT_MODES[(curIdx + 1) % NDS_LAYOUT_MODES.length];
+  const applyNdsLayout = (nextLayout) => {
+    state.ndsLayout = nextLayout;
     applyDisplayPreferencesToDom();
     invokeBackend(
       "update_ui_preferences",
@@ -3425,7 +3308,18 @@ function bindEvents() {
       },
       { silent: true }
     );
+  };
+
+  document.getElementById("btn-nds-layout")?.addEventListener("click", () => {
+    const curIdx = Math.max(0, NDS_LAYOUT_MODES.indexOf(state.ndsLayout));
+    applyNdsLayout(NDS_LAYOUT_MODES[(curIdx + 1) % NDS_LAYOUT_MODES.length]);
   });
+
+  for (const id of ["emu-nds-layout-select", "settings-nds-layout-select"]) {
+    document.getElementById(id)?.addEventListener("change", (e) => {
+      applyNdsLayout(e.target.value);
+    });
+  }
 
   document.getElementById("btn-fullscreen-toggle")?.addEventListener("click", async () => {
     await setViewportFullscreen(!state.isFullscreen);
@@ -3435,20 +3329,12 @@ function bindEvents() {
     if (!document.fullscreenElement && state.isFullscreen) {
       state.isFullscreen = false;
       document.querySelector(".app-shell")?.classList.remove("viewport-fullscreen");
-      const btn = document.getElementById("btn-fullscreen-toggle");
-      if (btn) btn.textContent = "Plein écran";
+      setText("btn-fullscreen-toggle", "Plein écran");
     }
   });
 
-  document.getElementById("btn-upscaler-cycle")?.addEventListener("click", () => {
-    state.upscalerMode =
-      state.upscalerMode === "OFF"
-        ? "SCALE2X"
-        : state.upscalerMode === "SCALE2X"
-          ? "XBRZ"
-          : state.upscalerMode === "XBRZ"
-            ? "BLOOM"
-            : "OFF";
+  const applyUpscalerMode = (mode) => {
+    state.upscalerMode = mode;
     applyDisplayPreferencesToDom();
     invokeBackend(
       "update_ui_preferences",
@@ -3460,11 +3346,16 @@ function bindEvents() {
       },
       { silent: true }
     );
-  });
+  };
 
-  document.getElementById("btn-shader-cycle")?.addEventListener("click", () => {
-    const curIdx = Math.max(0, SHADER_MODES.indexOf(state.activeShaderCss));
-    state.activeShaderCss = SHADER_MODES[(curIdx + 1) % SHADER_MODES.length];
+  for (const id of ["emu-upscaler-select", "settings-upscaler-select"]) {
+    document.getElementById(id)?.addEventListener("change", (e) => {
+      applyUpscalerMode(e.target.value);
+    });
+  }
+
+  const applyShaderMode = (shader) => {
+    state.activeShaderCss = shader;
     applyDisplayPreferencesToDom();
     invokeBackend(
       "update_ui_preferences",
@@ -3476,28 +3367,58 @@ function bindEvents() {
       },
       { silent: true }
     );
+  };
+
+  for (const id of ["emu-shader-select", "settings-shader-select"]) {
+    document.getElementById(id)?.addEventListener("change", (e) => {
+      applyShaderMode(e.target.value);
+    });
+  }
+
+  document.getElementById("btn-reset-optimal")?.addEventListener("click", async () => {
+    state.upscalerMode = "XBRZ";
+    state.activeShaderCss = "mode-clean";
+    state.speedMult = 1;
+    state.cpuOverclockPct = 100;
+    state.pgxpSubpixel = true;
+    applyDisplayPreferencesToDom();
+    setAudioVolumePct(85, true);
+    await invokeBackend(
+      "update_ui_preferences",
+      {
+        shaderCss: "mode-clean",
+        upscalerMode: "XBRZ",
+        speedMultiplier: 1,
+        ndsLayout: null
+      },
+      { silent: true }
+    );
+    const boot = await invokeBackend(
+      "set_hardware_overclock_profile",
+      { cpuOverclockPct: 100, pgxpSubpixel: true },
+      { silent: true }
+    );
+    if (boot) applyBootstrap(boot);
+    else renderInspector();
+    showToast("Qualité optimale restaurée (xBRZ 2x · Pixel-Perfect).", "ok");
   });
 
   const toggleKm = () => {
     state.keymapperVisible = !state.keymapperVisible;
     document.getElementById("keymapper-p1")?.classList.toggle("visible", state.keymapperVisible);
-    const btn = document.getElementById("btn-toggle-keymapper");
-    if (btn) {
-      btn.textContent = `Keymapper : ${state.keymapperVisible ? "ON" : "OFF"}`;
-    }
+    setText("btn-toggle-keymapper", state.keymapperVisible ? "Masquer touches" : "Touches écran");
   };
   document.getElementById("btn-toggle-keymapper")?.addEventListener("click", toggleKm);
-  document.getElementById("btn-dock-keymapper")?.addEventListener("click", toggleKm);
 
   document.getElementById("btn-record-macro")?.addEventListener("click", async (e) => {
     if (!state.recordingMacro) {
       state.recordingMacro = true;
       state.recordedFrames = [];
-      e.currentTarget.textContent = "Arrêter & Sauver Macro";
-      document.getElementById("macro-status").textContent = "ENREGISTREMENT...";
+      e.currentTarget.textContent = "Arrêter & Sauver";
+      setText("macro-status", "ENREGISTREMENT...");
     } else {
       state.recordingMacro = false;
-      e.currentTarget.textContent = "Enregistrer Séquence Live";
+      e.currentTarget.textContent = "Enregistrer Séquence";
       const frames = state.recordedFrames.length > 0 ? state.recordedFrames : [BTN_A];
       const name = `Combo Live (${frames.length}f)`;
       const boot = await invokeBackend("save_recorded_macro", { name, frames });
@@ -3509,26 +3430,40 @@ function bindEvents() {
         state.activeMacroId = id;
         renderKeymapperAndMacros();
       }
-      document.getElementById("macro-status").textContent = "LECTURE TAS";
+      setText("macro-status", "LECTURE TAS");
     }
   });
+
+  const syncLinkPill = () => {
+    const pill = document.getElementById("link-status-pill");
+    if (!pill) return;
+    if (state.quadLinkMode) {
+      pill.style.display = "inline-flex";
+      pill.textContent = "Link 4P";
+    } else if (state.dualLinkMode) {
+      pill.style.display = "inline-flex";
+      pill.textContent = "Link 2P";
+    } else {
+      pill.style.display = "none";
+    }
+  };
 
   document.getElementById("btn-toggle-dual")?.addEventListener("click", async (e) => {
     state.dualLinkMode = !state.dualLinkMode;
     if (!state.dualLinkMode) {
       state.quadLinkMode = false;
-      document.getElementById("bezel-p3").style.display = "none";
-      document.getElementById("bezel-p4").style.display = "none";
-      document.getElementById("screens-wrap").classList.remove("quad-mode");
-      const quadBtn = document.getElementById("btn-toggle-quad");
-      if (quadBtn) quadBtn.textContent = "Tournoi 4P : OFF";
+      const p3 = document.getElementById("bezel-p3");
+      const p4 = document.getElementById("bezel-p4");
+      if (p3) p3.style.display = "none";
+      if (p4) p4.style.display = "none";
+      document.getElementById("screens-wrap")?.classList.remove("quad-mode");
+      setText("btn-toggle-quad", "Link 4P : OFF");
     }
-    document.getElementById("bezel-p2").style.display = state.dualLinkMode ? "flex" : "none";
-    document.getElementById("screens-wrap").classList.toggle("dual-mode", state.dualLinkMode && !state.quadLinkMode);
-    e.currentTarget.textContent = `Link 2P : ${state.dualLinkMode ? "ACTIF" : "OFF"}`;
-    document.getElementById("link-status-pill").textContent = state.dualLinkMode
-      ? "Câble Link 2P Synchronisé"
-      : "Mode 1P Solo";
+    const p2 = document.getElementById("bezel-p2");
+    if (p2) p2.style.display = state.dualLinkMode ? "flex" : "none";
+    document.getElementById("screens-wrap")?.classList.toggle("dual-mode", state.dualLinkMode && !state.quadLinkMode);
+    e.currentTarget.textContent = `Link 2P : ${state.dualLinkMode ? "ON" : "OFF"}`;
+    syncLinkPill();
     await invokeBackend("set_dual_link_enabled", { enabled: state.dualLinkMode });
   });
 
@@ -3538,17 +3473,17 @@ function bindEvents() {
       state.dualLinkMode = true;
     }
     const wrap = document.getElementById("screens-wrap");
-    wrap.classList.remove("dual-mode");
-    wrap.classList.toggle("quad-mode", state.quadLinkMode);
-    document.getElementById("bezel-p2").style.display = state.quadLinkMode || state.dualLinkMode ? "flex" : "none";
-    document.getElementById("bezel-p3").style.display = state.quadLinkMode ? "flex" : "none";
-    document.getElementById("bezel-p4").style.display = state.quadLinkMode ? "flex" : "none";
-    e.currentTarget.textContent = `Tournoi 4P : ${state.quadLinkMode ? "ACTIF" : "OFF"}`;
-    document.getElementById("link-status-pill").textContent = state.quadLinkMode
-      ? "Tournoi 4P Multi-SIO"
-      : state.dualLinkMode
-        ? "Câble Link 2P Synchronisé"
-        : "Mode 1P Solo";
+    wrap?.classList.remove("dual-mode");
+    wrap?.classList.toggle("quad-mode", state.quadLinkMode);
+    const p2 = document.getElementById("bezel-p2");
+    const p3 = document.getElementById("bezel-p3");
+    const p4 = document.getElementById("bezel-p4");
+    if (p2) p2.style.display = state.quadLinkMode || state.dualLinkMode ? "flex" : "none";
+    if (p3) p3.style.display = state.quadLinkMode ? "flex" : "none";
+    if (p4) p4.style.display = state.quadLinkMode ? "flex" : "none";
+    e.currentTarget.textContent = `Link 4P : ${state.quadLinkMode ? "ON" : "OFF"}`;
+    setText("btn-toggle-dual", `Link 2P : ${state.dualLinkMode ? "ON" : "OFF"}`);
+    syncLinkPill();
     await invokeBackend("set_quad_link_enabled", { enabled: state.quadLinkMode });
   });
 
@@ -3580,18 +3515,14 @@ function bindEvents() {
 
   document.getElementById("btn-quick-save")?.addEventListener("click", async () => {
     if (!getSelectedGame()) return;
-    const info = await invokeBackend("create_save_state", { slot: 1, label: "QuickSave F5" });
-    document.getElementById("save-toast").textContent = info
-      ? `Sauvé Slot #1 (Frame #${info.frame} · CRC ${info.crc32Hex})`
-      : `Sauvé Slot #1 (Frame #${state.currentFrame})`;
+    const info = await invokeBackend("create_save_state", { slot: 1, label: "Sauvegarde rapide" });
+    setText("save-toast", info ? "Sauvegardé (Slot #1)" : "Sauvegardé (Slot #1)");
   });
 
   document.getElementById("btn-quick-load")?.addEventListener("click", async () => {
     if (!getSelectedGame()) return;
-    const info = await invokeBackend("restore_save_state", { slot: 1 });
-    document.getElementById("save-toast").textContent = info
-      ? `Chargé Slot #1 (Frame #${info.frame})`
-      : `Chargé Slot #1`;
+    await invokeBackend("restore_save_state", { slot: 1 });
+    setText("save-toast", "Chargé (Slot #1)");
   });
 
   document.getElementById("btn-rewind-step")?.addEventListener("click", async () => {
@@ -3753,6 +3684,29 @@ function bindEvents() {
 }
 
 async function init() {
+  activePaneId = document.querySelector(".view-pane.active")?.id || "view-library";
+  if (typeof IntersectionObserver === "function") {
+    const vramEl = document.getElementById("vram-atlas-canvas");
+    const oscEl = document.getElementById("audio-oscilloscope-canvas");
+    const visObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.target === vramEl) {
+            const wasVisible = vramCanvasVisible;
+            vramCanvasVisible = entry.isIntersecting;
+            if (vramCanvasVisible && !wasVisible && state.isEmulationRunning) {
+              scheduleDebuggerRefresh(performance.now(), true);
+            }
+          } else if (entry.target === oscEl) {
+            oscCanvasVisible = entry.isIntersecting;
+          }
+        }
+      },
+      { threshold: 0.05 }
+    );
+    if (vramEl) visObserver.observe(vramEl);
+    if (oscEl) visObserver.observe(oscEl);
+  }
   bindEvents();
   await setupDragAndDrop();
 
@@ -3778,11 +3732,7 @@ async function init() {
     }
   }
 
-  apuAudio.setVolume(state.audioVolume / 100);
-  const volSlider = document.getElementById("audio-volume-slider");
-  if (volSlider) volSlider.value = String(state.audioVolume);
-  const volLabel = document.getElementById("audio-volume-label");
-  if (volLabel) volLabel.textContent = `${state.audioVolume}%`;
+  setAudioVolumePct(state.audioVolume, false);
   applyDisplayPreferencesToDom();
   renderStandbyCanvas();
   updateAllViews();
@@ -3790,7 +3740,6 @@ async function init() {
   if (boot) {
     applyBootstrap(boot);
   }
-  await refreshDebuggerDrawer();
   requestAnimationFrame(tickEmulationLoop);
 }
 

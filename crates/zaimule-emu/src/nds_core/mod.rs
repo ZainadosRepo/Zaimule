@@ -297,6 +297,9 @@ impl NdsMachine {
             self.machine.borrow_mut().tick_timers(2124);
             // HDraw phase (~74% of scanline)
             for _ in 0..hdraw_slices {
+                if self.cpu9.is_halted_idle() && self.cpu7.is_halted_idle() {
+                    break;
+                }
                 self.cpu9.run_slice(arm9_per_slice);
                 self.cpu7.run_slice(ARM7_SLICE_QUANTUM);
             }
@@ -315,6 +318,9 @@ impl NdsMachine {
             }
             // HBlank phase (~26% of scanline)
             for _ in 0..hblank_slices {
+                if self.cpu9.is_halted_idle() && self.cpu7.is_halted_idle() {
+                    break;
+                }
                 self.cpu9.run_slice(arm9_per_slice);
                 self.cpu7.run_slice(ARM7_SLICE_QUANTUM);
             }
@@ -333,20 +339,13 @@ impl NdsMachine {
             [&self.ppu.fb_b, &self.ppu.fb_a]
         };
 
-        let half_pixels = ppu::WIDTH * ppu::HEIGHT;
-        for (idx, &px) in upper.iter().enumerate() {
-            let off = idx * 4;
-            self.framebuffer_rgba[off] = (px >> 16) as u8;
-            self.framebuffer_rgba[off + 1] = (px >> 8) as u8;
-            self.framebuffer_rgba[off + 2] = px as u8;
-            self.framebuffer_rgba[off + 3] = 0xFF;
+        let half_bytes = ppu::WIDTH * ppu::HEIGHT * 4;
+        let (top_dst, bot_dst) = self.framebuffer_rgba.split_at_mut(half_bytes);
+        for (dst, &px) in top_dst.as_chunks_mut::<4>().0.iter_mut().zip(upper.iter()) {
+            *dst = [(px >> 16) as u8, (px >> 8) as u8, px as u8, 0xFF];
         }
-        for (idx, &px) in lower.iter().enumerate() {
-            let off = (half_pixels + idx) * 4;
-            self.framebuffer_rgba[off] = (px >> 16) as u8;
-            self.framebuffer_rgba[off + 1] = (px >> 8) as u8;
-            self.framebuffer_rgba[off + 2] = px as u8;
-            self.framebuffer_rgba[off + 3] = 0xFF;
+        for (dst, &px) in bot_dst.as_chunks_mut::<4>().0.iter_mut().zip(lower.iter()) {
+            *dst = [(px >> 16) as u8, (px >> 8) as u8, px as u8, 0xFF];
         }
 
         &self.framebuffer_rgba

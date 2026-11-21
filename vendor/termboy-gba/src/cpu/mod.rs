@@ -43,6 +43,7 @@ impl Cpu {
     }
 
     /// Address of the instruction `step()` will execute next.
+    #[inline(always)]
     pub fn exec_addr(&self) -> u32 {
         let i = if self.regs.cpsr.thumb() { 2 } else { 4 };
         self.regs.get(15).wrapping_sub(2 * i)
@@ -69,17 +70,27 @@ impl Cpu {
     }
 
     /// One whole-system tick: service DMA if any channel is pending, else
-    /// run one instruction (or idle while halted), then deliver timing
-    /// events and any pending interrupt.
+    /// run one instruction (or skip directly to the next event while halted),
+    /// then deliver timing events and any pending interrupt.
     pub fn step_system(&mut self) {
+        self.step_system_until(u64::MAX);
+    }
+
+    /// Same as [`Self::step_system`], capping halted fast-forwards at `limit`.
+    #[inline]
+    pub fn step_system_until(&mut self, limit: u64) {
         if let Some(ch) = self.bus.dma_ready() {
             self.bus.run_dma(ch);
         } else if self.bus.halted {
-            self.bus.idle();
+            if self.bus.irq_asserted() {
+                self.bus.idle();
+            } else {
+                self.bus.skip_halt_until(limit);
+            }
         } else {
             self.step();
         }
-        self.bus.catch_up();
+        self.bus.catch_up_fast();
         if self.bus.halted && self.bus.irq_asserted() {
             self.bus.halted = false;
         }
@@ -89,6 +100,7 @@ impl Cpu {
     }
 
     /// Execute one instruction.
+    #[inline]
     pub fn step(&mut self) {
         if self.hle_bios && self.exec_addr() == BIOS_IRQ_RETURN {
             return self.hle_irq_return();
@@ -106,7 +118,8 @@ impl Cpu {
             let op = self.pipeline[0];
             self.pipeline[0] = self.pipeline[1];
             self.pipeline[1] = self.bus.read32(self.regs.get(15));
-            if self.check_cond((op >> 28) as u8) {
+            let cond = (op >> 28) as u8;
+            if cond == 0xE || self.check_cond(cond) {
                 self.exec_arm(op);
             }
             if !self.flushed {
@@ -115,6 +128,7 @@ impl Cpu {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn check_cond(&self, cond: u8) -> bool {
         use psr::{C, N, V, Z};
         let p = self.regs.cpsr;

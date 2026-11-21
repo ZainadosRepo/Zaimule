@@ -134,6 +134,10 @@ pub trait EmulatorBackend: Send {
     fn set_color_correction(&mut self, _enabled: bool) {}
     /// Refreshes internal SRAM cache on demand (avoids copying SRAM on every video frame).
     fn sync_sram_cache(&mut self) {}
+    /// Returns `false` when the core tracks SRAM writes precisely and knows no write occurred since last sync.
+    fn sram_maybe_dirty(&self) -> bool {
+        true
+    }
     /// Refreshes RAM/VRAM debug mirror slices on demand (avoids per-frame copies when debugger/watchpoints are idle).
     fn sync_debug_caches(&mut self) {}
     /// Applies CPU instruction budget scaling (`50..=400`, default `100`%) on cores that support overclocking.

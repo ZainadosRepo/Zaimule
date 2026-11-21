@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="Zaimule — Interface d'émulation multi-consoles haute précision."
+      content="Zaimule — Émulateur multi-consoles simple, rapide et haute qualité."
     />
     <title>Zaimule</title>
     <link rel="stylesheet" href="./styles.css" />
@@ -20,7 +20,7 @@
         </div>
 
         <nav class="nav-tabs" role="tablist" aria-label="Navigation principale">
-          <button class="nav-tab active" data-target="view-library" id="tab-library">
+          <button class="nav-tab active" data-target="view-library" id="tab-library" role="tab" aria-selected="true">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <rect x="3" y="3" width="7" height="9" rx="1" />
               <rect x="14" y="3" width="7" height="9" rx="1" />
@@ -29,39 +29,22 @@
             </svg>
             Bibliothèque
           </button>
-          <button class="nav-tab" data-target="view-emulator" id="tab-emulator">
+          <button class="nav-tab" data-target="view-emulator" id="tab-emulator" role="tab" aria-selected="false">
             <svg viewBox="0 0 24 24" aria-hidden="true">
-              <rect x="2" y="4" width="20" height="15" rx="2" />
-              <line x1="8" y1="21" x2="16" y2="21" />
+              <polygon points="6 4 20 12 6 20 6 4" />
             </svg>
-            Viewport
+            Jeu
           </button>
-          <button class="nav-tab" data-target="view-netplay" id="tab-netplay">
+          <button class="nav-tab" data-target="view-settings" id="tab-settings" role="tab" aria-selected="false">
             <svg viewBox="0 0 24 24" aria-hidden="true">
-              <circle cx="6" cy="12" r="3" />
-              <circle cx="18" cy="6" r="3" />
-              <circle cx="18" cy="18" r="3" />
-              <line x1="8.7" y1="10.7" x2="15.3" y2="7.3" />
-              <line x1="8.7" y1="13.3" x2="15.3" y2="16.7" />
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
             </svg>
-            Réseau &amp; Link
-          </button>
-          <button class="nav-tab" data-target="view-cores" id="tab-cores">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <rect x="6" y="6" width="12" height="12" rx="1.5" />
-              <path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4" />
-            </svg>
-            Cœurs &amp; Switch
+            Paramètres
           </button>
         </nav>
 
         <div class="titlebar-right">
-          <button class="btn btn-ghost mono" id="btn-big-picture" title="Mode Manette Plein Écran">
-            Big Picture : OFF
-          </button>
-          <span class="pill-badge pill-green mono" id="sram-pill">
-            <span class="dot-pulse"></span> SRAM OK
-          </span>
           <div class="win-controls">
             <button class="win-btn" id="win-min" title="Réduire" aria-label="Réduire la fenêtre">─</button>
             <button class="win-btn" id="win-max" title="Agrandir" aria-label="Agrandir ou restaurer la fenêtre">□</button>
@@ -96,8 +79,7 @@
         <section id="view-library" class="view-pane active">
           <aside class="sidebar-consoles" aria-label="Filtres par console">
             <div class="sidebar-heading">
-              <span>Systèmes</span>
-              <span>[L / R]</span>
+              <span>Consoles</span>
             </div>
 
             <button class="console-btn active" data-console="ALL">
@@ -108,7 +90,7 @@
                   <rect x="3" y="14" width="7" height="7" rx="1" />
                   <rect x="14" y="14" width="7" height="7" rx="1" />
                 </svg>
-                <span>Catalogue complet</span>
+                <span>Tous les jeux</span>
               </span>
               <span class="console-count mono" id="count-all">0</span>
             </button>
@@ -168,7 +150,7 @@
                   <circle cx="6.5" cy="9" r="1.1" />
                   <circle cx="17.5" cy="14" r="1.1" />
                 </svg>
-                <span>Switch 1 (Torzu)</span>
+                <span>Switch 1</span>
               </span>
               <span class="console-count mono" id="count-switch">0</span>
             </button>
@@ -182,35 +164,9 @@
                   <circle cx="17.75" cy="14" r="1.1" />
                   <path d="M11 8h2v2h-2l2 4h-2" />
                 </svg>
-                <span>Switch 2 (Fritchii)</span>
+                <span>Switch 2</span>
               </span>
               <span class="console-count mono" id="count-switch2">0</span>
-            </button>
-
-            <div class="sidebar-heading" style="margin-top: 14px;">
-              <span>Architecture</span>
-            </div>
-
-            <button class="console-btn" data-console="RUST_ONLY">
-              <span class="console-btn-label">
-                <svg class="console-icon" viewBox="0 0 24 24">
-                  <rect x="6" y="6" width="12" height="12" rx="1.5" />
-                  <path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3" />
-                </svg>
-                <span>Cœurs Natifs Rust</span>
-              </span>
-              <span class="console-count mono" id="count-rust">0</span>
-            </button>
-
-            <button class="console-btn" data-console="LINK_READY">
-              <span class="console-btn-label">
-                <svg class="console-icon" viewBox="0 0 24 24">
-                  <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
-                  <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
-                </svg>
-                <span>Bus Link 2P / 4P</span>
-              </span>
-              <span class="console-count mono" id="count-link">0</span>
             </button>
           </aside>
 
@@ -225,7 +181,7 @@
                   type="text"
                   id="search-input"
                   class="search-input"
-                  placeholder="Filtrer par titre, système, région ou empreinte CRC32..."
+                  placeholder="Rechercher un jeu..."
                 />
                 <span class="kbd-hint">/</span>
               </div>
@@ -233,38 +189,32 @@
               <div class="toolbar-actions">
                 <select
                   id="library-sort-select"
-                  class="field-inline mono library-sort-select"
+                  class="field-inline library-sort-select"
                   title="Trier la bibliothèque"
                 >
-                  <option value="recent">Tri : Récent</option>
-                  <option value="title">Tri : Titre A–Z</option>
-                  <option value="playtime">Tri : Temps de jeu</option>
-                  <option value="console">Tri : Console</option>
+                  <option value="recent">Récents</option>
+                  <option value="title">Titre A–Z</option>
+                  <option value="playtime">Temps de jeu</option>
+                  <option value="console">Console</option>
                 </select>
-                <button class="btn" id="btn-import-rom" title="Importer un ou plusieurs jeux (.gb, .gbc, .gba, .nds, .nsp, .xci, .nx, .zip, .7z)">
+                <button class="btn" id="btn-import-rom" title="Ajouter un ou plusieurs jeux (.gb, .gbc, .gba, .nds, .nsp, .xci, .nx, .zip, .7z)">
                   <svg viewBox="0 0 24 24">
                     <path d="M12 5v14M5 12h14" />
                   </svg>
-                  Importer ROM
+                  Ajouter
                 </button>
-                <button class="btn" id="btn-scan-folder" title="Scanner un dossier local choisi manuellement">
-                  Dossier...
-                </button>
-                <button class="btn btn-ghost" id="btn-import-ips">Patch .IPS</button>
-                <button class="btn btn-ghost" id="btn-export-pack" title="Exporter l'archive portable .zaimule-pack">
-                  Exporter Pack
-                </button>
-                <button class="btn btn-ghost" id="btn-import-pack" title="Importer une archive .zaimule-pack">
-                  Importer Pack
+                <button class="btn" id="btn-scan-folder" title="Scanner un dossier de jeux">
+                  Dossier
                 </button>
                 <div class="toolbar-divider"></div>
-                <button class="btn" id="btn-toggle-inspector" title="Afficher/Masquer l'inspecteur [Y]">
-                  <span>Options</span>
-                  <span class="kbd-hint">Y</span>
+                <button class="btn btn-ghost" id="btn-toggle-inspector" title="Afficher les sauvegardes et options du jeu [Y]">
+                  <span>Détails</span>
                 </button>
                 <button class="btn btn-primary" id="btn-launch-selected">
-                  <span>Lancer</span>
-                  <span class="kbd-hint">A</span>
+                  <svg viewBox="0 0 24 24">
+                    <polygon points="6 4 20 12 6 20 6 4" />
+                  </svg>
+                  <span>Jouer</span>
                 </button>
               </div>
             </div>
@@ -272,100 +222,65 @@
             <div class="games-grid" id="games-grid" role="list"></div>
           </div>
 
-          <aside class="inspector-panel" id="inspector-drawer" aria-label="Fiche technique">
+          <aside class="inspector-panel collapsed" id="inspector-drawer" aria-label="Détails du jeu">
             <div class="inspector-header">
               <div class="inspector-eyebrow">
-                <span>Fiche Technique</span>
-                <span id="insp-crc-top" class="mono">CRC32</span>
+                <span>Détails du jeu</span>
+                <button class="btn-icon-close" id="btn-close-inspector" type="button" title="Fermer" aria-label="Fermer les détails">✕</button>
               </div>
-              <div class="inspector-title" id="insp-title">Aucune ROM sélectionnée</div>
+              <div class="inspector-title" id="insp-title">Aucun jeu sélectionné</div>
               <div class="inspector-sub">
                 <span class="pill-badge pill-cobalt mono" id="insp-console">—</span>
-                <span class="pill-badge mono" id="insp-core">—</span>
-                <span class="pill-badge pill-green mono" id="insp-region">—</span>
+                <span class="pill-badge" id="insp-region">—</span>
               </div>
               <button class="btn btn-primary" style="width: 100%; justify-content: center;" id="btn-insp-play">
-                <span>Lancer dans le Viewport 60 Hz</span>
-                <span class="kbd-hint">A</span>
+                <span>Jouer</span>
               </button>
             </div>
 
-            <div class="inspector-tabs" role="tablist">
-              <button class="inspector-tab-btn active" data-insp-tab="insp-pane-hw">Matériel</button>
-              <button class="inspector-tab-btn" data-insp-tab="insp-pane-mods">Patchs &amp; RAM</button>
-              <button class="inspector-tab-btn" data-insp-tab="insp-pane-states">États &amp; Succès</button>
+            <div class="inspector-tabs inspector-tabs-2" role="tablist">
+              <button class="inspector-tab-btn active" data-insp-tab="insp-pane-states">Sauvegardes</button>
+              <button class="inspector-tab-btn" data-insp-tab="insp-pane-mods">Mods &amp; Triche</button>
             </div>
 
-            <!-- SOUS-ONGLET 1 : MATÉRIEL & SRAM -->
-            <div class="inspector-tab-pane active" id="insp-pane-hw">
+            <!-- SOUS-ONGLET 1 : INFOS ESSENTIELLES & SAVE STATES -->
+            <div class="inspector-tab-pane active" id="insp-pane-states">
               <div class="inspector-section">
-                <div class="section-title">
-                  <span>Intégrité &amp; Batterie SRAM</span>
-                  <span class="mono" style="color: var(--status-ok);" id="sram-crc-badge">CRC —</span>
-                </div>
                 <div class="kv-row">
-                  <span class="kv-label">Empreinte CRC32</span>
-                  <span class="kv-val mono" id="insp-crc">—</span>
-                </div>
-                <div class="kv-row" id="insp-titleid-row" style="display: none;">
-                  <span class="kv-label">Title ID / Code</span>
-                  <span class="kv-val mono" id="insp-titleid">—</span>
-                </div>
-                <div class="kv-row" id="insp-path-row" style="display: none;">
-                  <span class="kv-label">Source disque</span>
-                  <span class="kv-val mono path-ellipsis" id="insp-path" style="max-width: 175px;">—</span>
+                  <span class="kv-label">Temps de jeu</span>
+                  <span class="kv-val mono" id="insp-playtime">—</span>
                 </div>
                 <div class="kv-row" id="insp-switch-engine-row" style="display: none;">
                   <span class="kv-label">Moteur Switch</span>
-                  <select id="insp-switch-engine" class="field-inline mono" style="max-width: 175px;">
+                  <select id="insp-switch-engine" class="field-inline" style="max-width: 175px;">
                     <option value="auto">Auto</option>
                     <option value="torzu">Torzu (Switch 1)</option>
                     <option value="fritchii">Fritchii (Switch 2)</option>
                   </select>
                 </div>
-                <div class="kv-row">
-                  <span class="kv-label">Support Sauvegarde</span>
-                  <span class="kv-val mono" id="insp-sram">—</span>
-                </div>
-                <div class="kv-row">
-                  <span class="kv-label">Durée de session</span>
-                  <span class="kv-val mono" id="insp-playtime">—</span>
-                </div>
-                <div id="sram-hex-dump" class="hex-dump-box mono"></div>
-                <div id="sram-actions-row" style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:10px;">
-                  <button class="btn mono" id="btn-sram-boost" style="font-size:11px; justify-content:center;" title="Écrire 0xFF en SRAM et recalculer le CRC32 atomique">
-                    Boost Octet SRAM
-                  </button>
-                  <button class="btn mono" id="btn-sram-transfer" style="font-size:11px; justify-content:center;" title="Cloner la sauvegarde Batterie / Carte Mémoire J1 vers J2">
-                    Cloner J1 → J2
-                  </button>
+                <div class="kv-row" id="insp-path-row" style="display: none;">
+                  <span class="kv-label">Fichier</span>
+                  <span class="kv-val mono path-ellipsis" id="insp-path" style="max-width: 185px;">—</span>
                 </div>
               </div>
 
               <div class="inspector-section">
                 <div class="section-title">
-                  <span>Cadence CPU &amp; Géométrie PGXP</span>
-                  <span class="mono" style="color: var(--accent-primary);" id="insp-overclock-badge">100% · PGXP ON</span>
+                  <span>Sauvegardes rapides</span>
+                  <span class="mono">F5 / F8</span>
                 </div>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
-                  <button class="btn mono" id="btn-overclock-cycle" style="font-size:11px; justify-content:center;">
-                    CPU : 100% Natif
-                  </button>
-                  <button class="btn mono" id="btn-pgxp-toggle" style="font-size:11px; justify-content:center;">
-                    PGXP 3D : ON
-                  </button>
-                </div>
+                <div class="savestate-slots" id="savestate-slots"></div>
               </div>
             </div>
 
-            <!-- SOUS-ONGLET 2 : PATCHS .IPS & CODES RAM -->
+            <!-- SOUS-ONGLET 2 : PATCHS .IPS & CODES DE TRICHE -->
             <div class="inspector-tab-pane" id="insp-pane-mods">
               <div class="inspector-section">
                 <div class="section-title">
-                  <span>Couches .IPS</span>
+                  <span>Patchs .IPS</span>
                   <span style="display:flex; gap:4px;">
-                    <button class="btn mono" id="btn-insp-ips" style="padding:2px 8px; font-size:10px;">+ .IPS</button>
-                    <button class="btn mono" id="btn-export-ips" style="padding:2px 8px; font-size:10px;" title="Exporter un patch .IPS binaire par diff ROM">Diff .IPS</button>
+                    <button class="btn" id="btn-insp-ips" style="padding:2px 8px; font-size:11px;">+ Ajouter</button>
+                    <button class="btn btn-ghost" id="btn-export-ips" style="padding:2px 8px; font-size:11px;" title="Exporter un patch .IPS">Exporter</button>
                   </span>
                 </div>
                 <div id="mods-list"></div>
@@ -373,7 +288,7 @@
 
               <div class="inspector-section">
                 <div class="section-title">
-                  <span>Codes RAM / GameShark</span>
+                  <span>Codes de triche</span>
                 </div>
                 <div style="display:flex; gap:6px; margin-bottom:8px;">
                   <input
@@ -383,79 +298,56 @@
                     placeholder="Ex: 016404A0 ou C104:01"
                     style="flex:1;"
                   />
-                  <button class="btn mono" id="btn-add-cheat" style="padding:4px 10px;">Ajouter</button>
+                  <button class="btn" id="btn-add-cheat" style="padding:4px 10px;">Ajouter</button>
                 </div>
                 <div id="cheats-list"></div>
-              </div>
-            </div>
-
-            <!-- SOUS-ONGLET 3 : SAVE STATES & SUCCÈS -->
-            <div class="inspector-tab-pane" id="insp-pane-states">
-              <div class="inspector-section">
-                <div class="section-title">
-                  <span>Save States Atomiques (.zst)</span>
-                  <span class="mono">F5 / F8</span>
-                </div>
-                <div class="savestate-slots" id="savestate-slots"></div>
-              </div>
-
-              <div class="inspector-section">
-                <div class="section-title">
-                  <span>Succès Déterministes</span>
-                </div>
-                <div id="achievements-list"></div>
               </div>
             </div>
           </aside>
         </section>
 
-        <!-- VUE 2 : VIEWPORT ÉMULATEUR LIVE -->
+        <!-- VUE 2 : ÉCRAN DE JEU -->
         <section id="view-emulator" class="view-pane">
           <div class="emu-layout">
             <div class="emu-stage">
               <div class="emu-topbar">
-                <div style="display:flex; align-items:center; gap:8px;">
-                  <span class="pill-badge pill-cobalt mono" id="active-emu-game">Aucune ROM active</span>
-                  <span class="pill-badge pill-green mono" id="link-status-pill">Mode 1P Solo</span>
-                  <span class="pill-badge mono" id="emu-score-pill">Score : 0</span>
+                <div class="emu-topbar-left">
+                  <span class="emu-game-title" id="active-emu-game">Aucun jeu lancé</span>
+                  <span class="pill-badge pill-green mono" id="link-status-pill" style="display: none;">Link 2P</span>
                 </div>
 
-                <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-                  <button class="btn" id="btn-emu-pause" title="Mettre en pause / reprendre l'émulation [F9]">Pause (F9)</button>
-                  <button class="btn" id="btn-emu-reset" title="Reset matériel à froid (préserve la sauvegarde SRAM)">Reset</button>
-                  <button class="btn" id="btn-screenshot-png" title="Enregistrer une capture d'écran PNG [F12]">Capture PNG</button>
-                  <button class="btn" id="btn-nds-layout" style="display:none;" title="Basculer la disposition des deux écrans Nintendo DS">Écrans NDS : Vertical</button>
-                  <button class="btn" id="btn-audio-toggle">Audio APU : ON</button>
-                  <label class="audio-vol-control mono" title="Volume principal">
-                    <input type="range" id="audio-volume-slider" min="0" max="100" value="85" />
-                    <span id="audio-volume-label">85%</span>
-                  </label>
-                  <button class="btn" id="btn-record-video">Clip .WebM</button>
-                  <button class="btn" id="btn-upscaler-cycle">Upscaler : Natif 1x</button>
-                  <button class="btn" id="btn-shader-cycle">Shader : CRT Scanlines</button>
-                  <button class="btn" id="btn-toggle-keymapper">Keymapper : OFF</button>
-                  <button class="btn" id="btn-toggle-dual">Link 2P : OFF</button>
-                  <button class="btn" id="btn-toggle-quad">Tournoi 4P : OFF</button>
-                  <button class="btn" id="btn-speed-cycle" title="Basculer la vitesse : 1x / 2x / 4x / 8x">Vitesse : 1x</button>
-                  <button class="btn" id="btn-fullscreen-toggle" title="Basculer le mode plein écran [F11]">Plein écran</button>
+                <div class="emu-topbar-controls">
+                  <button class="btn" id="btn-emu-pause" title="Pause / Reprendre [F9]">Pause</button>
+                  <button class="btn" id="btn-rewind-step" title="Revenir en arrière [Retour arrière]">Rembobiner</button>
+                  <div class="toolbar-divider"></div>
+                  <button class="btn" id="btn-quick-save" title="Sauvegarde rapide Slot #1 [F5]">Sauver</button>
+                  <button class="btn" id="btn-quick-load" title="Charger Slot #1 [F8]">Charger</button>
+                  <div class="toolbar-divider"></div>
+                  <button class="btn mono" id="btn-speed-cycle" title="Changer la vitesse (1x / 2x / 4x / 8x)">1x</button>
+                  <button class="btn" id="btn-nds-layout" style="display:none;" title="Disposition des deux écrans Nintendo DS">Écrans DS</button>
+                  <div class="audio-cluster">
+                    <button class="btn btn-ghost" id="btn-audio-toggle" title="Couper ou activer le son">Son</button>
+                    <label class="audio-vol-control mono" title="Volume">
+                      <input type="range" id="audio-volume-slider" min="0" max="100" value="85" />
+                      <span id="audio-volume-label">85%</span>
+                    </label>
+                  </div>
+                  <button class="btn" id="btn-fullscreen-toggle" title="Plein écran [F11]">Plein écran</button>
+                  <button class="btn btn-ghost" id="btn-toggle-emu-drawer" title="Qualité d'image et outils avancés">Options</button>
                 </div>
               </div>
 
               <div id="emu-external-banner" class="emu-external-banner" style="display: none;">
                 <div class="emu-banner-text">
-                  <strong id="emu-banner-title">Information Cœur Natif</strong>
-                  <span id="emu-banner-desc" class="mono"></span>
+                  <strong id="emu-banner-title">Information</strong>
+                  <span id="emu-banner-desc"></span>
                 </div>
                 <div class="emu-banner-actions" id="emu-banner-actions"></div>
               </div>
 
               <div class="emu-screens-wrap" id="screens-wrap">
                 <div class="crt-bezel">
-                  <div class="bezel-header">
-                    <span class="mono">UNITÉ #1 (J1 · ZQSD/FLÈCHES · A:J/ESPACE · B:K/SHIFT · L/R:E/R · STYLET NDS)</span>
-                    <span class="mono" style="color:var(--status-ok);" id="p1-reg-readout">En veille</span>
-                  </div>
-                  <div class="screen-container mode-crt" id="screen-1">
+                  <div class="screen-container mode-clean" id="screen-1">
                     <canvas id="canvas-p1" class="game-canvas" width="160" height="144"></canvas>
                     <div class="shader-scanlines"></div>
                     <div class="shader-lcd"></div>
@@ -465,10 +357,10 @@
 
                 <div class="crt-bezel" id="bezel-p2" style="display: none;">
                   <div class="bezel-header">
-                    <span class="mono">UNITÉ #2 (BUS LINK P2 · SIO 0xFF01)</span>
-                    <span class="mono" style="color:var(--accent-primary);" id="p2-link-readout">SYNC 256 Kbps</span>
+                    <span class="mono">Joueur 2</span>
+                    <span class="mono" style="color:var(--accent-primary);" id="p2-link-readout">Link actif</span>
                   </div>
-                  <div class="screen-container mode-crt" id="screen-2">
+                  <div class="screen-container mode-clean" id="screen-2">
                     <canvas id="canvas-p2" class="game-canvas" width="160" height="144"></canvas>
                     <div class="shader-scanlines"></div>
                     <div class="shader-lcd"></div>
@@ -477,10 +369,10 @@
 
                 <div class="crt-bezel" id="bezel-p3" style="display: none;">
                   <div class="bezel-header">
-                    <span class="mono">UNITÉ #3 (MULTI-SIO #3)</span>
-                    <span class="mono" style="color:var(--accent-primary);">RING P2→P3</span>
+                    <span class="mono">Joueur 3</span>
+                    <span class="mono" style="color:var(--accent-primary);">Multi-Link</span>
                   </div>
-                  <div class="screen-container mode-crt" id="screen-3">
+                  <div class="screen-container mode-clean" id="screen-3">
                     <canvas id="canvas-p3" class="game-canvas" width="160" height="144"></canvas>
                     <div class="shader-scanlines"></div>
                     <div class="shader-lcd"></div>
@@ -489,10 +381,10 @@
 
                 <div class="crt-bezel" id="bezel-p4" style="display: none;">
                   <div class="bezel-header">
-                    <span class="mono">UNITÉ #4 (MULTI-SIO #4)</span>
-                    <span class="mono" style="color:var(--status-ok);">RING P4→P1</span>
+                    <span class="mono">Joueur 4</span>
+                    <span class="mono" style="color:var(--status-ok);">Multi-Link</span>
                   </div>
-                  <div class="screen-container mode-crt" id="screen-4">
+                  <div class="screen-container mode-clean" id="screen-4">
                     <canvas id="canvas-p4" class="game-canvas" width="160" height="144"></canvas>
                     <div class="shader-scanlines"></div>
                     <div class="shader-lcd"></div>
@@ -500,204 +392,398 @@
                 </div>
               </div>
 
-              <div class="rewind-bar">
-                <button class="btn" id="btn-rewind-step">Rembobiner (Backspace)</button>
-                <span class="mono" style="font-size:11px; color:var(--text-secondary);" id="rewind-info">
-                  Rewind 60s · A [J/Espace] · B [K/Shift] · Start [Entrée] · Select [N/ShiftD] · Pause [F9] · F11 Plein écran · F12 PNG
+              <div class="emu-hints-bar">
+                <span class="emu-hints-text" id="emu-controls-hint">
+                  Flèches / ZQSD : Déplacer · J / Espace : A · K / Shift : B · E / R : L / R · Entrée : Start · Retour : Rembobiner
                 </span>
-                <span class="mono" id="rewind-readout" style="margin-left:auto; color:var(--accent-primary);">
-                  Frame #0
-                </span>
+                <span id="save-toast" class="emu-inline-status"></span>
               </div>
             </div>
 
-            <aside class="bluestacks-dock">
-              <div class="dock-card">
-                <div class="section-title">
-                  <span>Keymapper Tactile</span>
-                  <span class="mono">20 Hz</span>
-                </div>
-                <button class="btn" style="width:100%; justify-content:center;" id="btn-dock-keymapper">
-                  Éditer la disposition
-                </button>
+            <!-- PANNEAU OPTIONS EN JEU (FERMÉ PAR DÉFAUT) -->
+            <aside class="emu-drawer collapsed" id="emu-options-drawer" aria-label="Options en jeu">
+              <div class="drawer-header">
+                <span>Options de jeu</span>
+                <button class="btn-icon-close" id="btn-close-emu-drawer" type="button" title="Fermer" aria-label="Fermer les options">✕</button>
               </div>
 
               <div class="dock-card">
-                <div class="section-title">
-                  <span>Séquenceur TAS</span>
-                  <span class="mono" id="macro-status">PRÊT</span>
+                <div class="section-title"><span>Qualité d'image</span></div>
+
+                <div class="setting-field">
+                  <label class="setting-field-label" for="emu-upscaler-select">Amélioration (Upscaler)</label>
+                  <select id="emu-upscaler-select" class="field-inline field-full">
+                    <option value="XBRZ">xBRZ 2x (Recommandé)</option>
+                    <option value="SCALE2X">Scale2x EPX (Pixel-art)</option>
+                    <option value="BLOOM">CRT Bloom</option>
+                    <option value="OFF">Natif 1x</option>
+                  </select>
                 </div>
-                <div style="margin-bottom:8px;">
-                  <button class="btn" style="width:100%; justify-content:center;" id="btn-record-macro">
-                    Enregistrer Séquence Live
-                  </button>
+
+                <div class="setting-field">
+                  <label class="setting-field-label" for="emu-shader-select">Filtre d'écran</label>
+                  <select id="emu-shader-select" class="field-inline field-full">
+                    <option value="mode-clean">Pixel-Perfect (Recommandé)</option>
+                    <option value="mode-lcd">Matrice LCD</option>
+                    <option value="mode-crt">CRT Scanlines</option>
+                    <option value="mode-trinitron">Trinitron Courbé</option>
+                    <option value="mode-dmg">Game Boy DMG Vert</option>
+                  </select>
                 </div>
-                <div id="macros-list"></div>
-                <div id="tas-timeline-list" class="mono" style="margin-top:6px;"></div>
+
+                <div class="setting-field" id="emu-nds-layout-row" style="display:none;">
+                  <label class="setting-field-label" for="emu-nds-layout-select">Écrans Nintendo DS</label>
+                  <select id="emu-nds-layout-select" class="field-inline field-full">
+                    <option value="vertical">Vertical (Classique)</option>
+                    <option value="horizontal">Côte à côte</option>
+                    <option value="vertical-swapped">Vertical inversé</option>
+                    <option value="horizontal-swapped">Côte à côte inversé</option>
+                  </select>
+                </div>
               </div>
 
               <div class="dock-card">
-                <div class="section-title">
-                  <span>Clichés Rapides</span>
-                  <span class="mono">RLE + CRC32</span>
-                </div>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
-                  <button class="btn" id="btn-quick-save">Sauver (F5)</button>
-                  <button class="btn" id="btn-quick-load">Charger (F8)</button>
-                </div>
-                <div id="save-toast" class="mono" style="margin-top:8px; font-size:11px; color:var(--status-ok);">
-                  Aucune ROM chargée
+                <div class="section-title"><span>Actions</span></div>
+                <div class="action-grid-2">
+                  <button class="btn" id="btn-emu-reset" title="Redémarrer le jeu (conserve votre sauvegarde)">Redémarrer</button>
+                  <button class="btn" id="btn-screenshot-png" title="Capture d'écran PNG [F12]">Capture PNG</button>
+                  <button class="btn" id="btn-record-video" title="Enregistrer une vidéo .WebM">Clip .WebM</button>
+                  <button class="btn" id="btn-toggle-keymapper" title="Afficher les boutons tactiles à l'écran">Touches écran</button>
                 </div>
               </div>
 
-              <div class="dock-card">
-                <div class="section-title">
-                  <span>Registres CPU &amp; APU</span>
-                  <button class="btn mono" id="btn-add-watchpoint" style="padding:2px 6px; font-size:10px;" title="Épingler l'adresse RAM">+ Pin RAM</button>
+              <div class="dock-card" id="emu-link-section">
+                <div class="section-title"><span>Multijoueur local (Link)</span></div>
+                <div class="action-grid-2">
+                  <button class="btn" id="btn-toggle-dual">Link 2P : OFF</button>
+                  <button class="btn" id="btn-toggle-quad">Link 4P : OFF</button>
                 </div>
-                <div class="kv-row mono"><span class="kv-label">PC / SP</span><span id="dbg-pc-sp">— / —</span></div>
-                <div class="kv-row mono"><span class="kv-label">AF / BC</span><span id="dbg-af-bc">— / —</span></div>
-                <div class="kv-row mono"><span class="kv-label">DE / HL</span><span id="dbg-de-hl">— / —</span></div>
-                <div class="kv-row mono"><span class="kv-label">SIO / APU</span><span id="dbg-sio">— / —</span></div>
-                <canvas
-                  id="audio-oscilloscope-canvas"
-                  width="240"
-                  height="38"
-                  style="width:100%; height:38px; background:var(--bg-inset); border-radius:3px; border:1px solid var(--border-subtle); margin-top:8px;"
-                ></canvas>
-                <div style="display:flex; gap:4px; margin-top:8px;">
-                  <input
-                    type="text"
-                    id="ram-scan-input"
-                    class="field-inline mono"
-                    placeholder="Octet ou 0xC110=7F"
-                    style="flex:1;"
-                  />
-                  <button class="btn mono" id="btn-scan-ram" style="padding:3px 8px; font-size:11px;">Scan</button>
-                </div>
-                <div id="ram-scan-results" class="mono" style="margin-top:4px; font-size:10px; color:var(--accent-primary);"></div>
-                <div id="watchpoints-list" class="mono" style="margin-top:6px;"></div>
               </div>
 
-              <div class="dock-card">
-                <div class="section-title">
-                  <span>Atlas VRAM 2bpp</span>
-                  <button class="btn mono" id="btn-vram-color" style="padding:2px 6px; font-size:10px;">#3 Pigment</button>
+              <!-- OUTILS AVANCÉS / DÉVELOPPEUR REPLIÉS PAR DÉFAUT -->
+              <details class="advanced-disclosure" id="emu-dev-disclosure">
+                <summary class="advanced-summary">
+                  <span>Outils avancés (TAS &amp; Débogueur)</span>
+                </summary>
+
+                <div class="dock-card">
+                  <div class="section-title">
+                    <span>Séquenceur TAS</span>
+                    <span class="mono" id="macro-status">PRÊT</span>
+                  </div>
+                  <div style="margin-bottom:8px;">
+                    <button class="btn" style="width:100%; justify-content:center;" id="btn-record-macro">
+                      Enregistrer Séquence
+                    </button>
+                  </div>
+                  <div id="macros-list"></div>
+                  <div id="tas-timeline-list" class="mono" style="margin-top:6px;"></div>
                 </div>
-                <canvas
-                  id="vram-atlas-canvas"
-                  width="128"
-                  height="64"
-                  title="Cliquer pour éditer un pixel 2bpp en VRAM"
-                  style="width:100%; height:72px; background:var(--bg-inset); border-radius:3px; border:1px solid var(--border-subtle); image-rendering:pixelated; margin-bottom:6px; cursor:crosshair;"
-                ></canvas>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-bottom:6px;">
-                  <button class="btn mono" id="btn-dbg-pause" style="font-size:11px; justify-content:center;">Pause CPU</button>
-                  <button class="btn mono" id="btn-dbg-step" style="font-size:11px; justify-content:center;">Step Into</button>
+
+                <div class="dock-card">
+                  <div class="section-title">
+                    <span>Registres CPU &amp; RAM</span>
+                    <button class="btn mono" id="btn-add-watchpoint" style="padding:2px 6px; font-size:10px;" title="Épingler une adresse RAM">+ Pin RAM</button>
+                  </div>
+                  <div class="kv-row mono"><span class="kv-label">PC / SP</span><span id="dbg-pc-sp">— / —</span></div>
+                  <div class="kv-row mono"><span class="kv-label">AF / BC</span><span id="dbg-af-bc">— / —</span></div>
+                  <div class="kv-row mono"><span class="kv-label">DE / HL</span><span id="dbg-de-hl">— / —</span></div>
+                  <div class="kv-row mono"><span class="kv-label">SIO / APU</span><span id="dbg-sio">— / —</span></div>
+                  <canvas
+                    id="audio-oscilloscope-canvas"
+                    width="240"
+                    height="38"
+                    style="width:100%; height:38px; background:var(--bg-inset); border-radius:3px; border:1px solid var(--border-subtle); margin-top:8px;"
+                  ></canvas>
+                  <div style="display:flex; gap:4px; margin-top:8px;">
+                    <input
+                      type="text"
+                      id="ram-scan-input"
+                      class="field-inline mono"
+                      placeholder="Octet ou 0xC110=7F"
+                      style="flex:1;"
+                    />
+                    <button class="btn mono" id="btn-scan-ram" style="padding:3px 8px; font-size:11px;">Scan</button>
+                  </div>
+                  <div id="ram-scan-results" class="mono" style="margin-top:4px; font-size:10px; color:var(--accent-primary);"></div>
+                  <div id="watchpoints-list" class="mono" style="margin-top:6px;"></div>
                 </div>
-                <div id="disasm-list" class="mono" style="max-height:130px; overflow-y:auto;"></div>
-              </div>
+
+                <div class="dock-card">
+                  <div class="section-title">
+                    <span>VRAM &amp; Désassembleur</span>
+                    <button class="btn mono" id="btn-vram-color" style="padding:2px 6px; font-size:10px;">#3 Pigment</button>
+                  </div>
+                  <canvas
+                    id="vram-atlas-canvas"
+                    width="128"
+                    height="64"
+                    title="Cliquer pour éditer un pixel 2bpp en VRAM"
+                    style="width:100%; height:72px; background:var(--bg-inset); border-radius:3px; border:1px solid var(--border-subtle); image-rendering:pixelated; margin-bottom:6px; cursor:crosshair;"
+                  ></canvas>
+                  <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-bottom:6px;">
+                    <button class="btn mono" id="btn-dbg-pause" style="font-size:11px; justify-content:center;">Pause CPU</button>
+                    <button class="btn mono" id="btn-dbg-step" style="font-size:11px; justify-content:center;">Pas à pas</button>
+                  </div>
+                  <div id="disasm-list" class="mono" style="max-height:130px; overflow-y:auto;"></div>
+                </div>
+              </details>
             </aside>
           </div>
         </section>
 
-        <!-- VUE 3 : SALONS NETPLAY, FANTÔMES & CÂBLE LINK -->
-        <section id="view-netplay" class="view-pane" style="flex-direction:column; width:100%;">
-          <div class="subbar-strip">
-            <span class="pill-badge pill-green mono" id="udp-port-badge">UDP ZML2 : En attente</span>
-            <span class="pill-badge pill-cobalt mono" id="stun-endpoint-badge">LAN UDP : En attente</span>
-            <span class="pill-badge mono" id="udp-packets-badge">Aucun pair · 0 ↑ / 0 ↓</span>
-            <input
-              type="text"
-              id="netplay-peer-input"
-              class="field-inline mono"
-              placeholder="Pair LAN IP:PORT (ex: 192.168.1.20:54920)"
-              style="width:265px;"
-            />
-            <button class="btn" id="btn-connect-peer">Connecter Pair</button>
-            <button class="btn btn-ghost" id="btn-disconnect-peer" style="display:none;">Déconnecter</button>
-          </div>
-          <div class="subbar-strip inset">
-            <input
-              type="text"
-              id="deeplink-input"
-              class="field-inline mono"
-              placeholder="zaimule://room/CODE?crc=..."
-              style="width:260px;"
-            />
-            <button class="btn" id="btn-join-deeplink">Rejoindre Deep-Link</button>
-            <button class="btn" id="btn-toggle-spectator">Spectateur : OFF</button>
-            <button class="btn" id="btn-submit-ghost">Publier Trace TAS</button>
-            <button class="btn btn-primary" id="btn-create-room">+ Créer Salon P2P</button>
-            <span class="mono" style="font-size:11px; color:var(--text-secondary); margin-left:8px;">Canal P2P :</span>
-            <input
-              type="text"
-              id="netplay-chat-input"
-              class="field-inline mono"
-              placeholder="Message ou partage d'état dans le salon..."
-              style="width:260px;"
-            />
-            <button class="btn mono" id="btn-send-chat" style="font-size:11px;">Envoyer</button>
-            <button class="btn mono" id="btn-share-state-chat" style="font-size:11px;">Partager Slot #1</button>
-          </div>
-          <div id="netplay-chat-list" style="padding:8px 24px; max-height:100px; overflow-y:auto; border-bottom:1px solid var(--border-subtle); background:var(--bg-canvas);"></div>
-          <div class="page-grid" id="netplay-grid" style="flex:1;"></div>
-        </section>
+        <!-- VUE 3 : PARAMÈTRES -->
+        <section id="view-settings" class="view-pane">
+          <aside class="settings-nav" aria-label="Catégories de paramètres">
+            <div class="sidebar-heading"><span>Paramètres</span></div>
+            <button class="settings-nav-btn active" data-settings-tab="settings-pane-general">
+              Affichage &amp; Audio
+            </button>
+            <button class="settings-nav-btn" data-settings-tab="settings-pane-library">
+              Bibliothèque
+            </button>
+            <button class="settings-nav-btn" data-settings-tab="settings-pane-switch">
+              Nintendo Switch
+            </button>
+            <div class="settings-nav-sep"></div>
+            <button class="settings-nav-btn" data-settings-tab="settings-pane-advanced">
+              Réglages avancés
+            </button>
+          </aside>
 
-        <!-- VUE 4 : CŒURS NATIFS & COFFRE SWITCH -->
-        <section id="view-cores" class="view-pane">
-          <div class="page-grid" id="cores-grid"></div>
+          <div class="settings-body">
+            <!-- SOUS-VUE 1 : AFFICHAGE & AUDIO -->
+            <div class="settings-pane active" id="settings-pane-general">
+              <div class="settings-page-head">
+                <div>
+                  <h2 class="settings-title">Affichage &amp; Audio</h2>
+                  <p class="settings-subtitle">
+                    Zaimule applique par défaut les meilleurs réglages visuels (xBRZ 2x + Pixel-Perfect) pour une image nette et fluide.
+                  </p>
+                </div>
+                <button class="btn" id="btn-reset-optimal" type="button">
+                  Qualité optimale
+                </button>
+              </div>
+
+              <div class="settings-group">
+                <div class="setting-row">
+                  <div class="setting-copy">
+                    <div class="setting-name">Amélioration d'image (Upscaler)</div>
+                    <div class="setting-desc">Lisse les contours en haute définition (xBRZ 2x recommandé) ou conserve les pixels bruts.</div>
+                  </div>
+                  <select id="settings-upscaler-select" class="field-inline setting-select">
+                    <option value="XBRZ">xBRZ 2x (Recommandé)</option>
+                    <option value="SCALE2X">Scale2x EPX (Pixel-art)</option>
+                    <option value="BLOOM">CRT Bloom</option>
+                    <option value="OFF">Natif 1x</option>
+                  </select>
+                </div>
+
+                <div class="setting-row">
+                  <div class="setting-copy">
+                    <div class="setting-name">Filtre d'écran</div>
+                    <div class="setting-desc">Pixel-Perfect offre les couleurs les plus fidèles et une netteté maximale.</div>
+                  </div>
+                  <select id="settings-shader-select" class="field-inline setting-select">
+                    <option value="mode-clean">Pixel-Perfect (Recommandé)</option>
+                    <option value="mode-lcd">Matrice LCD</option>
+                    <option value="mode-crt">CRT Scanlines</option>
+                    <option value="mode-trinitron">Trinitron Courbé</option>
+                    <option value="mode-dmg">Game Boy DMG Vert</option>
+                  </select>
+                </div>
+
+                <div class="setting-row">
+                  <div class="setting-copy">
+                    <div class="setting-name">Disposition Nintendo DS</div>
+                    <div class="setting-desc">Choisissez comment placer les deux écrans de la Nintendo DS.</div>
+                  </div>
+                  <select id="settings-nds-layout-select" class="field-inline setting-select">
+                    <option value="vertical">Vertical (Classique)</option>
+                    <option value="horizontal">Côte à côte</option>
+                    <option value="vertical-swapped">Vertical inversé</option>
+                    <option value="horizontal-swapped">Côte à côte inversé</option>
+                  </select>
+                </div>
+
+                <div class="setting-row">
+                  <div class="setting-copy">
+                    <div class="setting-name">Volume principal</div>
+                    <div class="setting-desc">Niveau sonore global pour Game Boy, GBA et Nintendo DS.</div>
+                  </div>
+                  <label class="audio-vol-control mono" style="height:32px; padding:0 12px;">
+                    <input type="range" id="settings-volume-slider" min="0" max="100" value="85" style="width:120px;" />
+                    <span id="settings-volume-label">85%</span>
+                  </label>
+                </div>
+
+                <div class="setting-row">
+                  <div class="setting-copy">
+                    <div class="setting-name">Mode Manette (Big Picture)</div>
+                    <div class="setting-desc">Agrandit les jaquettes et active la navigation complète au pad.</div>
+                  </div>
+                  <button class="btn" id="btn-big-picture" type="button">Désactivé</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- SOUS-VUE 2 : BIBLIOTHÈQUE -->
+            <div class="settings-pane" id="settings-pane-library">
+              <div class="settings-page-head">
+                <div>
+                  <h2 class="settings-title">Bibliothèque</h2>
+                  <p class="settings-subtitle">
+                    Ajoutez vos jeux ou dossiers locaux. Vous pouvez aussi glisser-déposer vos fichiers directement dans la fenêtre.
+                  </p>
+                </div>
+              </div>
+              <div id="settings-library-container"></div>
+            </div>
+
+            <!-- SOUS-VUE 3 : NINTENDO SWITCH -->
+            <div class="settings-pane" id="settings-pane-switch">
+              <div class="settings-page-head">
+                <div>
+                  <h2 class="settings-title">Nintendo Switch</h2>
+                  <p class="settings-subtitle">
+                    Configurez vos clés, votre firmware et vos moteurs Torzu (Switch 1) ou Fritchii (Switch 2).
+                  </p>
+                </div>
+              </div>
+              <div id="settings-switch-container"></div>
+            </div>
+
+            <!-- SOUS-VUE 4 : RÉGLAGES AVANCÉS -->
+            <div class="settings-pane" id="settings-pane-advanced">
+              <div class="settings-page-head">
+                <div>
+                  <h2 class="settings-title">Réglages avancés</h2>
+                  <p class="settings-subtitle">
+                    Paramètres techniques destinés aux utilisateurs expérimentés. Inutile d'y toucher pour jouer dans de bonnes conditions.
+                  </p>
+                </div>
+              </div>
+
+              <div class="settings-group">
+                <div class="setting-row">
+                  <div class="setting-copy">
+                    <div class="setting-name">Cadence CPU &amp; Précision 3D</div>
+                    <div class="setting-desc">100 % garantit la compatibilité matérielle exacte. PGXP stabilise la géométrie 3D.</div>
+                  </div>
+                  <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                    <span class="pill-badge mono" id="insp-overclock-badge">100% · PGXP ON</span>
+                    <button class="btn mono" id="btn-overclock-cycle" type="button">CPU : 100% Natif</button>
+                    <button class="btn mono" id="btn-pgxp-toggle" type="button">PGXP 3D : ON</button>
+                  </div>
+                </div>
+
+                <div class="setting-row">
+                  <div class="setting-copy">
+                    <div class="setting-name">Archives &amp; Patchs .IPS</div>
+                    <div class="setting-desc">Importez un patch .IPS non destructif ou sauvegardez/restaurez un pack portable.</div>
+                  </div>
+                  <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+                    <button class="btn" id="btn-import-ips" type="button">Patch .IPS</button>
+                    <button class="btn" id="btn-export-pack" type="button">Exporter Pack</button>
+                    <button class="btn" id="btn-import-pack" type="button">Importer Pack</button>
+                  </div>
+                </div>
+              </div>
+
+              <div id="settings-bios-container" style="margin-top: 20px;"></div>
+
+              <details class="advanced-section-box" style="margin-top: 20px;">
+                <summary class="advanced-section-summary">
+                  <span>Multijoueur Réseau (LAN UDP &amp; Salons P2P)</span>
+                  <span class="mono" style="font-size:11px; color:var(--text-muted);" id="udp-port-badge">UDP inactif</span>
+                </summary>
+                <div class="advanced-section-body">
+                  <div class="netplay-controls-row">
+                    <span class="pill-badge mono" id="udp-packets-badge">Aucun pair</span>
+                    <input
+                      type="text"
+                      id="netplay-peer-input"
+                      class="field-inline mono"
+                      placeholder="IP:PORT (ex: 192.168.1.20:54920)"
+                      style="flex:1; min-width:200px;"
+                    />
+                    <button class="btn" id="btn-connect-peer" type="button">Connecter</button>
+                    <button class="btn btn-ghost" id="btn-disconnect-peer" type="button" style="display:none;">Déconnecter</button>
+                  </div>
+
+                  <div class="netplay-controls-row" style="margin-top:10px;">
+                    <input
+                      type="text"
+                      id="deeplink-input"
+                      class="field-inline mono"
+                      placeholder="zaimule://room/CODE?crc=..."
+                      style="flex:1; min-width:200px;"
+                    />
+                    <button class="btn" id="btn-join-deeplink" type="button">Rejoindre</button>
+                    <button class="btn btn-primary" id="btn-create-room" type="button">Créer un salon</button>
+                  </div>
+
+                  <div class="netplay-controls-row" style="margin-top:10px;">
+                    <input
+                      type="text"
+                      id="netplay-chat-input"
+                      class="field-inline"
+                      placeholder="Message dans le salon..."
+                      style="flex:1;"
+                    />
+                    <button class="btn" id="btn-send-chat" type="button">Envoyer</button>
+                    <button class="btn btn-ghost" id="btn-share-state-chat" type="button">Partager Slot #1</button>
+                  </div>
+
+                  <div id="netplay-chat-list" style="margin-top:10px; max-height:96px; overflow-y:auto;"></div>
+                  <div id="netplay-grid" style="margin-top:10px; display:grid; gap:10px;"></div>
+                </div>
+              </details>
+
+              <details class="advanced-section-box" style="margin-top: 12px;">
+                <summary class="advanced-section-summary">
+                  <span>Cœurs natifs intégrés</span>
+                  <span class="mono" style="font-size:11px; color:var(--text-muted);">GB · GBC · GBA · NDS</span>
+                </summary>
+                <div class="advanced-section-body" id="settings-native-cores-container"></div>
+              </details>
+            </div>
+          </div>
         </section>
       </main>
 
-      <!-- BARRE CONTEXTUELLE HYBRIDE (MANETTE + TÉLÉMÉTRIE) -->
+      <!-- PIED DE PAGE SOBRE -->
       <footer class="telemetry-bar mono">
-        <div class="controller-prompts" aria-label="Commandes contextuelles">
+        <div class="controller-prompts" aria-label="Raccourcis">
           <button class="prompt-item" id="prompt-launch" title="Lancer le jeu sélectionné">
-            <span class="prompt-key primary">A</span>
-            <span>Lancer</span>
-          </button>
-          <button class="prompt-item" id="prompt-options" title="Afficher ou masquer la fiche technique">
-            <span class="prompt-key">Y</span>
-            <span>Options</span>
-          </button>
-          <button class="prompt-item" id="prompt-console-cycle" title="Parcourir les systèmes">
-            <span class="prompt-key">L/R</span>
-            <span>Console</span>
+            <span class="prompt-key primary">Entrée</span>
+            <span>Jouer</span>
           </button>
           <button class="prompt-item" id="prompt-savestate" title="Sauvegarde rapide F5 / Chargement F8">
             <span class="prompt-key">F5</span>
-            <span>État</span>
+            <span>Sauver</span>
+          </button>
+          <button class="prompt-item" id="prompt-fullscreen" title="Plein écran F11">
+            <span class="prompt-key">F11</span>
+            <span>Plein écran</span>
           </button>
         </div>
 
         <div class="telemetry-group">
           <div class="telemetry-item">
-            <span class="dot-pulse" style="color:var(--status-ok);"></span>
-            <span class="telemetry-val" id="tel-core">En veille</span>
+            <span class="telemetry-val ok" id="tel-fps">Prêt</span>
           </div>
           <div class="telemetry-item">
-            <span class="telemetry-val ok" id="tel-fps">— FPS</span>
-          </div>
-          <div class="telemetry-item">
-            <span class="telemetry-val" id="tel-ft">— ms</span>
-          </div>
-          <div class="telemetry-item">
-            <span class="telemetry-val" id="tel-link">Solo</span>
-          </div>
-          <div class="telemetry-item">
-            <span class="telemetry-val" id="tel-rewind">0 clichés</span>
-          </div>
-          <div class="telemetry-item">
-            <span class="telemetry-val" id="tel-pad">Clavier + Gamepad</span>
+            <span class="telemetry-val" id="tel-pad">Clavier</span>
           </div>
         </div>
       </footer>
 
       <div id="drop-overlay" class="drop-overlay" aria-hidden="true">
         <div class="drop-overlay-box">
-          <strong>Déposer des jeux, archives, BIOS NDS ou clés Switch</strong>
-          <span class="mono">.gb · .gbc · .gba · .nds · .zip · .7z · bios7.bin · bios9.bin · firmware.bin · .nsp · .nx · prod.keys · .ips</span>
+          <strong>Déposer des jeux, BIOS DS ou clés Switch</strong>
+          <span class="mono">.gb · .gbc · .gba · .nds · .zip · .7z · .nsp · .xci · .nx · bios7/9.bin · prod.keys · .ips</span>
         </div>
       </div>
 

@@ -704,30 +704,133 @@ impl<'de> de::Deserializer<'de> for &mut BinaryDeserializer<'de> {
     }
 }
 
+/// Wire-identical fast `Vec<u8>` serializer/deserializer using bulk `serialize_bytes`
+/// (`u32 LE` length + raw slice memcpy) instead of per-byte `SerializeSeq` loops.
+pub mod raw_bytes {
+    use serde::de::{self, Deserializer, Visitor};
+    use serde::ser::Serializer;
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(v: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(v)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        struct BytesVisitor;
+        impl<'de> Visitor<'de> for BytesVisitor {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("byte slice")
+            }
+            fn visit_borrowed_bytes<E: de::Error>(self, v: &'de [u8]) -> Result<Self::Value, E> {
+                Ok(v.to_vec())
+            }
+            fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                Ok(v.to_vec())
+            }
+            fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(v)
+            }
+        }
+        deserializer.deserialize_bytes(BytesVisitor)
+    }
+}
+
+/// Wire-identical fast `[Vec<u8>; N]` serializer/deserializer (fixed tuple of bulk byte slices).
+pub mod raw_bytes_array {
+    use serde::de::{self, Deserializer, SeqAccess, Visitor};
+    use serde::ser::{Serialize, SerializeTuple, Serializer};
+    use std::fmt;
+
+    struct SliceRef<'a>(&'a [u8]);
+    impl Serialize for SliceRef<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_bytes(self.0)
+        }
+    }
+
+    struct OwnedBytes(Vec<u8>);
+    impl<'de> de::Deserialize<'de> for OwnedBytes {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            super::raw_bytes::deserialize(deserializer).map(OwnedBytes)
+        }
+    }
+
+    pub fn serialize<S: Serializer, const N: usize>(
+        arr: &[Vec<u8>; N],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut tup = serializer.serialize_tuple(N)?;
+        for v in arr {
+            tup.serialize_element(&SliceRef(v))?;
+        }
+        tup.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>, const N: usize>(
+        deserializer: D,
+    ) -> Result<[Vec<u8>; N], D::Error> {
+        struct ArrVisitor<const N: usize>;
+        impl<'de, const N: usize> Visitor<'de> for ArrVisitor<N> {
+            type Value = [Vec<u8>; N];
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "an array of {N} byte buffers")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out: Vec<Vec<u8>> = Vec::with_capacity(N);
+                for idx in 0..N {
+                    let elem: OwnedBytes = seq
+                        .next_element()?
+                        .ok_or_else(|| de::Error::invalid_length(idx, &self))?;
+                    out.push(elem.0);
+                }
+                out.try_into()
+                    .map_err(|_| de::Error::custom("array length mismatch"))
+            }
+        }
+        deserializer.deserialize_tuple(N, ArrVisitor::<N>)
+    }
+}
+
 fn crc32_ieee(bytes: &[u8]) -> u32 {
     zaimule_core::catalog::compute_crc32(bytes)
 }
 
-/// PackBits-style RLE encoding:
+/// PackBits-style RLE encoding with 8-byte word acceleration for repeated runs:
 /// - `0..=127`: literal run of `(ctrl + 1)` bytes (`1..=128`)
 /// - `128..=255`: repeated run of `(257 - ctrl)` copies (`2..=129`)
 fn rle_compress(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len() / 2);
+    let len = input.len();
+    let mut out = Vec::with_capacity(len / 4 + 64);
     let mut i = 0;
-    while i < input.len() {
-        let mut run = 1usize;
-        while i + run < input.len() && run < 129 && input[i + run] == input[i] {
-            run += 1;
-        }
-        if run >= 3 {
+    while i < len {
+        let b = input[i];
+        if i + 2 < len && input[i + 1] == b && input[i + 2] == b {
+            let max_end = (i + 129).min(len);
+            let mut end = i + 3;
+            let splat = u64::from_ne_bytes([b; 8]);
+            while end + 8 <= max_end {
+                let word = u64::from_ne_bytes(input[end..end + 8].try_into().unwrap());
+                if word != splat {
+                    break;
+                }
+                end += 8;
+            }
+            while end < max_end && input[end] == b {
+                end += 1;
+            }
+            let run = end - i;
             out.push((257 - run) as u8);
-            out.push(input[i]);
-            i += run;
+            out.push(b);
+            i = end;
             continue;
         }
         let lit_start = i;
-        while i < input.len() && (i - lit_start) < 128 {
-            if i + 2 < input.len() && input[i] == input[i + 1] && input[i] == input[i + 2] {
+        let lit_limit = (lit_start + 128).min(len);
+        i += 1;
+        while i < lit_limit {
+            let cur = input[i];
+            if i + 2 < len && input[i + 1] == cur && input[i + 2] == cur {
                 break;
             }
             i += 1;
@@ -862,6 +965,7 @@ pub fn restore_snapshot<B: Bus>(
         *mm = restored_machine;
         mm.rom = rom.to_vec();
         mm.io_log = io_log;
+        mm.debug_hooks = super::bus::watch_active() || mm.io_log.is_some();
         mm.bios7 = bios7;
         mm.bios9 = bios9;
         mm.custom_firmware = custom_firmware;

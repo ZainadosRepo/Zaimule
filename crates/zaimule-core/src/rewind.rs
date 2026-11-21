@@ -68,6 +68,29 @@ impl RewindBuffer {
         });
     }
 
+    /// Owned counterpart of [`Self::push_snapshot`] that moves already-compressed `"ZMND"`
+    /// containers without an extra allocation or copy.
+    pub fn push_snapshot_owned(&mut self, frame: u64, raw_state: Vec<u8>) {
+        if self.entries.len() >= self.max_entries {
+            self.entries.pop_front();
+        }
+        let already_compressed = raw_state.starts_with(b"ZMND");
+        let uncompressed_len = raw_state.len();
+        let crc = compute_crc32(&raw_state);
+        let compressed = if already_compressed {
+            raw_state
+        } else {
+            rle_compress(&raw_state)
+        };
+        self.entries.push_back(RewindFrameEntry {
+            frame,
+            uncompressed_len,
+            crc32: crc,
+            already_compressed,
+            compressed_payload: compressed,
+        });
+    }
+
     /// Pops and decompresses the state `steps_back` snapshots in the past, verifying its CRC32.
     pub fn rewind_steps(&mut self, steps_back: usize) -> Result<Option<(u64, Vec<u8>)>, String> {
         if self.entries.is_empty() {
@@ -120,19 +143,37 @@ impl RewindBuffer {
 
 /// Fast byte-aligned Run-Length Encoding tuned for sparse emulator RAM/VRAM buffers.
 pub fn rle_compress(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len() / 2 + 16);
+    let len = input.len();
+    let mut out = Vec::with_capacity(len / 2 + 16);
     let mut i = 0;
-    while i < input.len() {
+    while i < len {
         let byte = input[i];
-        let mut run = 1usize;
-        while i + run < input.len() && input[i + run] == byte && run < 255 {
-            run += 1;
+        let max_end = (i + 255).min(len);
+        let mut end = i + 1;
+        if end + 2 < max_end && input[end] == byte && input[end + 1] == byte {
+            end += 2;
+            let splat = u64::from_ne_bytes([byte; 8]);
+            while end + 8 <= max_end {
+                let word = u64::from_ne_bytes(input[end..end + 8].try_into().unwrap());
+                if word != splat {
+                    break;
+                }
+                end += 8;
+            }
+            while end < max_end && input[end] == byte {
+                end += 1;
+            }
+        } else if byte == RLE_MARKER {
+            while end < max_end && input[end] == byte {
+                end += 1;
+            }
         }
+        let run = end - i;
         if run >= 4 || byte == RLE_MARKER {
             out.push(RLE_MARKER);
             out.push(run as u8);
             out.push(byte);
-            i += run;
+            i = end;
         } else {
             out.push(byte);
             i += 1;

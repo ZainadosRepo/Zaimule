@@ -46,6 +46,24 @@ impl Pulse {
             self.duty_pos = (self.duty_pos + 1) & 7;
         }
     }
+    #[inline(always)]
+    fn advance(&mut self, tcycles: i32) {
+        if self.timer > tcycles {
+            self.timer -= tcycles;
+            return;
+        }
+        let p = (2048 - self.freq as i32) * 4;
+        if self.timer <= 0 {
+            for _ in 0..tcycles {
+                self.tick();
+            }
+            return;
+        }
+        let past = tcycles - self.timer;
+        let steps = 1 + past / p;
+        self.timer = p - (past % p);
+        self.duty_pos = self.duty_pos.wrapping_add(steps as u8) & 7;
+    }
     fn output(&self) -> u8 {
         if !self.enabled || !self.dac_on() {
             return 0;
@@ -190,6 +208,24 @@ impl WaveCh {
             self.pos = (self.pos + 1) & 31;
         }
     }
+    #[inline(always)]
+    fn advance(&mut self, tcycles: i32) {
+        if self.timer > tcycles {
+            self.timer -= tcycles;
+            return;
+        }
+        let p = (2048 - self.freq as i32) * 2;
+        if self.timer <= 0 {
+            for _ in 0..tcycles {
+                self.tick();
+            }
+            return;
+        }
+        let past = tcycles - self.timer;
+        let steps = 1 + past / p;
+        self.timer = p - (past % p);
+        self.pos = self.pos.wrapping_add(steps as u8) & 31;
+    }
     fn output(&self, wave_ram: &[u8; 32]) -> u8 {
         if !self.enabled || !self.dac {
             return 0;
@@ -280,6 +316,33 @@ impl Noise {
                 self.lfsr = (self.lfsr & !(1 << 6)) | (bit << 6);
             }
         }
+    }
+    #[inline(always)]
+    fn advance(&mut self, tcycles: i32) {
+        if self.timer > tcycles {
+            self.timer -= tcycles;
+            return;
+        }
+        let p = self.period();
+        if self.timer <= 0 {
+            for _ in 0..tcycles {
+                self.tick();
+            }
+            return;
+        }
+        let past = tcycles - self.timer;
+        let steps = 1 + past / p;
+        self.timer = p - (past % p);
+        let width7 = self.nr43 & 8 != 0;
+        let mut lfsr = self.lfsr;
+        for _ in 0..steps {
+            let bit = (lfsr ^ (lfsr >> 1)) & 1;
+            lfsr = (lfsr >> 1) | (bit << 14);
+            if width7 {
+                lfsr = (lfsr & !(1 << 6)) | (bit << 6);
+            }
+        }
+        self.lfsr = lfsr;
     }
     fn output(&self) -> u8 {
         if !self.enabled || !self.dac_on() {
@@ -437,49 +500,89 @@ impl Apu {
     }
 
     /// Advance by `cycles` GBA cycles: PSG at GB rate (÷4), host-rate sampling.
-    pub fn tick(&mut self, cycles: u32) {
-        for _ in 0..cycles {
-            self.prescale += 1;
-            if self.prescale == 4 {
-                self.prescale = 0;
-                self.tick_psg();
+    pub fn tick(&mut self, mut cycles: u32) {
+        if cycles == 0 {
+            return;
+        }
+        // Fast path for small batches that cross neither a sample boundary nor a 512 Hz sequencer tick.
+        let c_f = cycles as f64;
+        if self.sample_timer + c_f < self.sample_period {
+            let total_pre = self.prescale + cycles;
+            let psg_ticks = total_pre >> 2;
+            if !self.on || self.seq_timer + psg_ticks < 8192 {
+                self.prescale = total_pre & 3;
+                if psg_ticks > 0 && self.on {
+                    let t = psg_ticks as i32;
+                    self.ch1.advance(t);
+                    self.ch2.advance(t);
+                    self.ch3.advance(t);
+                    self.ch4.advance(t);
+                    self.seq_timer += psg_ticks;
+                }
+                self.sample_timer += c_f;
+                return;
             }
-            self.sample_timer += 1.0;
+        }
+        while cycles > 0 {
+            let rem_sample = self.sample_period - self.sample_timer;
+            let mut to_sample = if rem_sample <= 1.0 {
+                1
+            } else {
+                rem_sample.ceil() as u32
+            };
+            if to_sample > 1 && self.sample_timer + (to_sample - 1) as f64 >= self.sample_period {
+                to_sample -= 1;
+            }
+            let chunk = if self.on {
+                let psg_until_seq = 8192u32.saturating_sub(self.seq_timer).max(1);
+                let gba_until_seq = psg_until_seq
+                    .saturating_mul(4)
+                    .saturating_sub(self.prescale)
+                    .max(1);
+                cycles.min(to_sample).min(gba_until_seq)
+            } else {
+                cycles.min(to_sample)
+            };
+            let total_pre = self.prescale + chunk;
+            let psg_ticks = total_pre >> 2;
+            self.prescale = total_pre & 3;
+            if psg_ticks > 0 && self.on {
+                let t = psg_ticks as i32;
+                self.ch1.advance(t);
+                self.ch2.advance(t);
+                self.ch3.advance(t);
+                self.ch4.advance(t);
+                self.seq_timer += psg_ticks;
+                if self.seq_timer >= 8192 {
+                    self.seq_timer -= 8192;
+                    self.step_sequencer();
+                }
+            }
+            self.sample_timer += chunk as f64;
             if self.sample_timer >= self.sample_period {
                 self.sample_timer -= self.sample_period;
                 let s = self.mix();
                 self.samples.push(s);
             }
+            cycles -= chunk;
         }
     }
 
-    /// One GB T-cycle of PSG (channel timers + the 512 Hz frame sequencer).
-    fn tick_psg(&mut self) {
-        if !self.on {
-            return;
-        }
-        self.ch1.tick();
-        self.ch2.tick();
-        self.ch3.tick();
-        self.ch4.tick();
-        self.seq_timer += 1;
-        if self.seq_timer == 8192 {
-            self.seq_timer = 0;
-            match self.seq_step {
-                0 | 4 => self.tick_lengths(),
-                2 | 6 => {
-                    self.tick_lengths();
-                    self.ch1.tick_sweep();
-                }
-                7 => {
-                    self.ch1.tick_envelope();
-                    self.ch2.tick_envelope();
-                    self.ch4.tick_envelope();
-                }
-                _ => {}
+    fn step_sequencer(&mut self) {
+        match self.seq_step {
+            0 | 4 => self.tick_lengths(),
+            2 | 6 => {
+                self.tick_lengths();
+                self.ch1.tick_sweep();
             }
-            self.seq_step = (self.seq_step + 1) & 7;
+            7 => {
+                self.ch1.tick_envelope();
+                self.ch2.tick_envelope();
+                self.ch4.tick_envelope();
+            }
+            _ => {}
         }
+        self.seq_step = (self.seq_step + 1) & 7;
     }
 
     fn tick_lengths(&mut self) {

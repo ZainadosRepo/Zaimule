@@ -176,6 +176,10 @@ impl EmulatorBackend for NdsCore {
         self.refresh_sram_cache(false);
     }
 
+    fn sram_maybe_dirty(&self) -> bool {
+        self.inner.as_ref().is_some_and(|nds| nds.is_sram_dirty())
+    }
+
     fn sync_debug_caches(&mut self) {
         self.refresh_debug_caches();
     }

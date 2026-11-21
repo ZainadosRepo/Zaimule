@@ -1,7 +1,7 @@
 mod update;
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -28,8 +28,17 @@ const LIVE_PLAYTIME_FLUSH_INTERVAL_MS: u64 = 30_000;
 
 struct AppState {
     session: Arc<Mutex<EmulatorSession>>,
-    last_sram_flush_ms: AtomicU64,
-    last_playtime_flush_ms: AtomicU64,
+    last_sram_flush_ms: Arc<AtomicU64>,
+    last_playtime_flush_ms: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StepViewportOptions {
+    stylus_x: Option<u8>,
+    stylus_y: Option<u8>,
+    stylus_pressed: Option<bool>,
+    include_debug_meta: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -152,17 +161,19 @@ fn persist_active_pack_assets(app: &AppHandle, session: &mut EmulatorSession) {
 }
 
 fn maybe_collect_live_sram(
-    state: &AppState,
+    last_sram_flush_ms: &AtomicU64,
     session: &mut EmulatorSession,
     now_ms: u64,
 ) -> Option<(String, Vec<u8>)> {
-    let last_flush = state.last_sram_flush_ms.load(Ordering::Relaxed);
+    let last_flush = last_sram_flush_ms.load(Ordering::Relaxed);
     if now_ms.saturating_sub(last_flush) < LIVE_SRAM_FLUSH_INTERVAL_MS {
         return None;
     }
+    // Always advance the check timestamp once the interval elapses so clean SRAM
+    // is never copied and CRC32-hashed on every single video frame.
+    last_sram_flush_ms.store(now_ms, Ordering::Relaxed);
     if session.refresh_sram_dirty_flag() {
         session.mark_sram_flushed();
-        state.last_sram_flush_ms.store(now_ms, Ordering::Relaxed);
         Some((
             session.active_game_id.clone(),
             session.active_sram_bytes().to_vec(),
@@ -173,22 +184,42 @@ fn maybe_collect_live_sram(
 }
 
 fn maybe_collect_live_library(
-    state: &AppState,
+    last_playtime_flush_ms: &AtomicU64,
     session: &mut EmulatorSession,
     now_ms: u64,
 ) -> Option<PersistedLibrary> {
-    let last_flush = state.last_playtime_flush_ms.load(Ordering::Relaxed);
+    let last_flush = last_playtime_flush_ms.load(Ordering::Relaxed);
     if now_ms.saturating_sub(last_flush) < LIVE_PLAYTIME_FLUSH_INTERVAL_MS {
         return None;
     }
+    last_playtime_flush_ms.store(now_ms, Ordering::Relaxed);
     if session.take_playtime_dirty() {
-        state
-            .last_playtime_flush_ms
-            .store(now_ms, Ordering::Relaxed);
         Some(session.to_persisted_library())
     } else {
         None
     }
+}
+
+fn spawn_live_disk_flushes(
+    app: AppHandle,
+    sram_to_flush: Option<(String, Vec<u8>)>,
+    lib_to_flush: Option<PersistedLibrary>,
+) {
+    if sram_to_flush.is_none() && lib_to_flush.is_none() {
+        return;
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some((game_id, bytes)) = sram_to_flush {
+            if let Ok(path) = sram_path(&app, &game_id) {
+                let _ = save_sram_with_rotation(&path, &bytes);
+            }
+        }
+        if let Some(lib) = lib_to_flush {
+            if let Ok(path) = library_path(&app) {
+                let _ = save_library_atomic(&path, &lib);
+            }
+        }
+    });
 }
 
 fn preload_disk_assets_for_game(app: &AppHandle, session: &mut EmulatorSession, game_id: &str) {
@@ -417,82 +448,84 @@ fn save_keymapper_layout(
 }
 
 #[tauri::command]
-fn step_viewport(
+async fn step_viewport(
     app: AppHandle,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
     buttons_p1: u16,
     buttons_p2: u16,
     turbo_active: bool,
     speed_mult: Option<u8>,
 ) -> Result<ViewportStepResponse, String> {
-    let now = now_unix_ms();
-    let (resp, sram_to_flush, lib_to_flush) = {
-        let mut session = state
-            .session
-            .lock()
-            .map_err(|_| "verrou session indisponible".to_string())?;
-        let out = session.step_viewport_with_speed(
-            buttons_p1,
-            buttons_p2,
-            turbo_active,
-            speed_mult.unwrap_or(1),
-        );
-        let flush_sram = maybe_collect_live_sram(&state, &mut session, now);
-        let flush_lib = maybe_collect_live_library(&state, &mut session, now);
-        (out, flush_sram, flush_lib)
-    };
+    let session_arc = Arc::clone(&state.session);
+    let last_sram_flush = Arc::clone(&state.last_sram_flush_ms);
+    let last_playtime_flush = Arc::clone(&state.last_playtime_flush_ms);
+    let speed = speed_mult.unwrap_or(1);
 
-    if let Some((game_id, bytes)) = sram_to_flush {
-        if let Ok(path) = sram_path(&app, &game_id) {
-            let _ = save_sram_with_rotation(&path, &bytes);
-        }
-    }
-    if let Some(lib) = lib_to_flush {
-        if let Ok(path) = library_path(&app) {
-            let _ = save_library_atomic(&path, &lib);
-        }
-    }
+    let (resp, sram_to_flush, lib_to_flush) =
+        tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+            let now = now_unix_ms();
+            let mut session = session_arc
+                .lock()
+                .map_err(|_| "verrou session indisponible".to_string())?;
+            let out = session.step_viewport_with_speed(buttons_p1, buttons_p2, turbo_active, speed);
+            let flush_sram = maybe_collect_live_sram(&last_sram_flush, &mut session, now);
+            let flush_lib = maybe_collect_live_library(&last_playtime_flush, &mut session, now);
+            Ok((out, flush_sram, flush_lib))
+        })
+        .await
+        .map_err(|e| format!("tâche émulation interrompue : {e}"))??;
 
+    spawn_live_disk_flushes(app, sram_to_flush, lib_to_flush);
     Ok(resp)
 }
 
 #[tauri::command]
-fn step_viewport_binary(
+async fn step_viewport_binary(
     app: AppHandle,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
     buttons_p1: u16,
     buttons_p2: u16,
     turbo_active: bool,
     speed_mult: Option<u8>,
+    options: Option<StepViewportOptions>,
 ) -> Result<tauri::ipc::Response, String> {
-    let now = now_unix_ms();
-    let (pkt, sram_to_flush, lib_to_flush) = {
-        let mut session = state
-            .session
-            .lock()
-            .map_err(|_| "verrou session indisponible".to_string())?;
-        let out = session.step_viewport_binary_bytes(
-            buttons_p1,
-            buttons_p2,
-            turbo_active,
-            speed_mult.unwrap_or(1),
-        );
-        let flush_sram = maybe_collect_live_sram(&state, &mut session, now);
-        let flush_lib = maybe_collect_live_library(&state, &mut session, now);
-        (out, flush_sram, flush_lib)
-    };
+    let session_arc = Arc::clone(&state.session);
+    let last_sram_flush = Arc::clone(&state.last_sram_flush_ms);
+    let last_playtime_flush = Arc::clone(&state.last_playtime_flush_ms);
+    let speed = speed_mult.unwrap_or(1);
 
-    if let Some((game_id, bytes)) = sram_to_flush {
-        if let Ok(path) = sram_path(&app, &game_id) {
-            let _ = save_sram_with_rotation(&path, &bytes);
-        }
-    }
-    if let Some(lib) = lib_to_flush {
-        if let Ok(path) = library_path(&app) {
-            let _ = save_library_atomic(&path, &lib);
-        }
-    }
+    let (pkt, sram_to_flush, lib_to_flush) =
+        tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+            let now = now_unix_ms();
+            let mut session = session_arc
+                .lock()
+                .map_err(|_| "verrou session indisponible".to_string())?;
+            let mut emit_meta = true;
+            if let Some(opts) = options {
+                if let (Some(x), Some(y), Some(pressed)) =
+                    (opts.stylus_x, opts.stylus_y, opts.stylus_pressed)
+                {
+                    session.set_nds_stylus(x, y, pressed);
+                }
+                if let Some(flag) = opts.include_debug_meta {
+                    emit_meta = flag;
+                }
+            }
+            let out = session.step_viewport_binary_bytes_ex(
+                buttons_p1,
+                buttons_p2,
+                turbo_active,
+                speed,
+                emit_meta,
+            );
+            let flush_sram = maybe_collect_live_sram(&last_sram_flush, &mut session, now);
+            let flush_lib = maybe_collect_live_library(&last_playtime_flush, &mut session, now);
+            Ok((out, flush_sram, flush_lib))
+        })
+        .await
+        .map_err(|e| format!("tâche émulation interrompue : {e}"))??;
 
+    spawn_live_disk_flushes(app, sram_to_flush, lib_to_flush);
     Ok(tauri::ipc::Response::new(pkt))
 }
 
@@ -521,12 +554,18 @@ fn set_quad_link_enabled(
 }
 
 #[tauri::command]
-fn get_vram_and_disassembly(state: tauri::State<AppState>) -> Result<DebuggerPayload, String> {
-    let mut session = state
-        .session
-        .lock()
-        .map_err(|_| "verrou session indisponible".to_string())?;
-    Ok(session.inspect_vram_and_disassembly())
+async fn get_vram_and_disassembly(
+    state: tauri::State<'_, AppState>,
+) -> Result<DebuggerPayload, String> {
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || -> Result<DebuggerPayload, String> {
+        let mut session = session_arc
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        Ok(session.inspect_vram_and_disassembly())
+    })
+    .await
+    .map_err(|e| format!("tâche débogueur interrompue : {e}"))?
 }
 
 #[tauri::command]
@@ -539,43 +578,51 @@ fn toggle_breakpoint(state: tauri::State<AppState>, addr: u32) -> Result<Debugge
 }
 
 #[tauri::command]
-fn create_save_state(
+async fn create_save_state(
     app: AppHandle,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
     slot: u8,
     label: String,
 ) -> Result<SaveStateSlotInfo, String> {
-    let mut session = state
-        .session
-        .lock()
-        .map_err(|_| "verrou session indisponible".to_string())?;
-    let info = session.create_save_state(slot, label, now_unix_ms())?;
-    if let Some(persisted) = session.export_save_state_envelope(slot) {
-        if let Ok(path) = state_slot_path(&app, &session.active_game_id, persisted.info.slot) {
-            let _ = save_state_slot_atomic(&path, &persisted);
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || -> Result<SaveStateSlotInfo, String> {
+        let mut session = session_arc
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        let info = session.create_save_state(slot, label, now_unix_ms())?;
+        if let Some(persisted) = session.export_save_state_envelope(slot) {
+            if let Ok(path) = state_slot_path(&app, &session.active_game_id, persisted.info.slot) {
+                let _ = save_state_slot_atomic(&path, &persisted);
+            }
         }
-    }
-    flush_sram_best_effort(&app, &mut session);
-    Ok(info)
+        flush_sram_best_effort(&app, &mut session);
+        Ok(info)
+    })
+    .await
+    .map_err(|e| format!("tâche save state interrompue : {e}"))?
 }
 
 #[tauri::command]
-fn restore_save_state(
+async fn restore_save_state(
     app: AppHandle,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
     slot: u8,
 ) -> Result<SaveStateSlotInfo, String> {
-    let mut session = state
-        .session
-        .lock()
-        .map_err(|_| "verrou session indisponible".to_string())?;
-    let game_id = session.active_game_id.clone();
-    if let Ok(path) = state_slot_path(&app, &game_id, slot.clamp(1, 9)) {
-        if let Ok(Some(persisted)) = load_state_slot_atomic(&path) {
-            session.import_save_state_envelope(game_id, persisted);
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || -> Result<SaveStateSlotInfo, String> {
+        let mut session = session_arc
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        let game_id = session.active_game_id.clone();
+        if let Ok(path) = state_slot_path(&app, &game_id, slot.clamp(1, 9)) {
+            if let Ok(Some(persisted)) = load_state_slot_atomic(&path) {
+                session.import_save_state_envelope(game_id, persisted);
+            }
         }
-    }
-    session.restore_save_state(slot)
+        session.restore_save_state(slot)
+    })
+    .await
+    .map_err(|e| format!("tâche restauration save state interrompue : {e}"))?
 }
 
 #[tauri::command]
@@ -599,12 +646,19 @@ fn delete_save_state(
 }
 
 #[tauri::command]
-fn rewind_frames(state: tauri::State<AppState>, steps_back: usize) -> Result<u64, String> {
-    let mut session = state
-        .session
-        .lock()
-        .map_err(|_| "verrou session indisponible".to_string())?;
-    session.rewind(steps_back.max(1))
+async fn rewind_frames(
+    state: tauri::State<'_, AppState>,
+    steps_back: usize,
+) -> Result<u64, String> {
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || -> Result<u64, String> {
+        let mut session = session_arc
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        session.rewind(steps_back.max(1))
+    })
+    .await
+    .map_err(|e| format!("tâche rembobinage interrompue : {e}"))?
 }
 
 #[tauri::command]
@@ -712,18 +766,22 @@ fn import_portable_pack_archive(
 }
 
 #[tauri::command]
-fn set_nds_stylus(
-    state: tauri::State<AppState>,
+async fn set_nds_stylus(
+    state: tauri::State<'_, AppState>,
     x: u8,
     y: u8,
     pressed: bool,
 ) -> Result<(), String> {
-    let mut session = state
-        .session
-        .lock()
-        .map_err(|_| "verrou session indisponible".to_string())?;
-    session.set_nds_stylus(x, y, pressed);
-    Ok(())
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let mut session = session_arc
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        session.set_nds_stylus(x, y, pressed);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("tâche stylet interrompue : {e}"))?
 }
 
 #[tauri::command]
@@ -1656,8 +1714,8 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(AppState {
             session,
-            last_sram_flush_ms: AtomicU64::new(0),
-            last_playtime_flush_ms: AtomicU64::new(0),
+            last_sram_flush_ms: Arc::new(AtomicU64::new(0)),
+            last_playtime_flush_ms: Arc::new(AtomicU64::new(0)),
         })
         .setup(move |app| {
             let handle = app.handle().clone();
