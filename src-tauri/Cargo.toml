@@ -1,6 +1,6 @@
 [package]
 name = "zaimule"
-version = "1.5.0"
+version = "1.6.0"
 description = "Station d'émulation multi-consoles en Rust pur (GB, GBC, GBA, NDS), rembobinage 60s, keymapper, TAS Link Cable et Coffre Switch (Torzu / Fritchii)"
 authors = ["ZainadosRepo"]
 edition = "2021"
