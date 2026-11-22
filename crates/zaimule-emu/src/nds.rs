@@ -8,8 +8,8 @@
 
 use crate::nds_core::{NdsBiosAssets, NdsMachine, NDS_HEIGHT, NDS_WIDTH};
 use crate::traits::{
-    pcm_rms_level, solid_obsidian_rgba, CpuDebugSnapshot, EmulatorBackend, FrameStepResult,
-    DEFAULT_SAMPLE_RATE_HZ,
+    pcm_rms_level, solid_obsidian_rgba, CpuDebugSnapshot, EmulatorBackend, FastFrameMeta,
+    FrameStepResult, DEFAULT_SAMPLE_RATE_HZ,
 };
 use zaimule_core::catalog::ConsoleKind;
 
@@ -23,6 +23,7 @@ pub struct NdsCore {
     stylus_y: u8,
     stylus_down: bool,
     cpu_overclock_pct: u16,
+    scale_3d: u8,
     sram_cache: Vec<u8>,
     ram_cache: Vec<u8>,
     vram_cache: Vec<u8>,
@@ -48,6 +49,7 @@ impl NdsCore {
             stylus_y: 96,
             stylus_down: false,
             cpu_overclock_pct: 100,
+            scale_3d: 1,
             sram_cache: Vec::new(),
             ram_cache: Vec::new(),
             vram_cache: Vec::new(),
@@ -64,6 +66,7 @@ impl NdsCore {
         let mut nds = NdsMachine::from_rom_with_bios(rom, bios)?;
         nds.set_audio_rate(DEFAULT_SAMPLE_RATE_HZ);
         nds.set_cpu_overclock_pct(self.cpu_overclock_pct);
+        nds.set_3d_scale(self.scale_3d);
         self.frame_number = 0;
         self.stylus_down = false;
         self.inner = Some(nds);
@@ -103,37 +106,79 @@ impl EmulatorBackend for NdsCore {
         self.load_rom_with_bios(rom, NdsBiosAssets::default())
     }
 
-    fn step_frame(&mut self, buttons_mask: u16) -> FrameStepResult {
+    fn step_frame_borrowed(
+        &mut self,
+        buttons_mask: u16,
+        skip_render: bool,
+        pcm_out: &mut Vec<f32>,
+    ) -> FastFrameMeta {
         self.frame_number = self.frame_number.saturating_add(1);
         let frame_number = self.frame_number;
 
-        let (rgba, audio_samples, audio_freq_hz) = if let Some(ref mut nds) = self.inner {
-            let touch = if self.stylus_down {
-                Some((u32::from(self.stylus_x), u32::from(self.stylus_y), true))
-            } else {
-                None
+        let Some(ref mut nds) = self.inner else {
+            return FastFrameMeta {
+                frame_number,
+                width: NDS_SCREEN_WIDTH as u16,
+                height: NDS_SCREEN_HEIGHT as u16,
+                audio_level: 0.0,
+                audio_freq_hz: 0,
+                sample_rate_hz: DEFAULT_SAMPLE_RATE_HZ,
+                serial_out_byte: None,
             };
-            let rgba = nds.step_frame(buttons_mask, touch).to_vec();
-            let mut pcm = Vec::with_capacity(1664);
-            let freq = nds.drain_audio(&mut pcm);
-            (rgba, pcm, freq)
-        } else {
-            (self.standby_rgba.clone(), Vec::new(), 0)
         };
-        let audio_level = pcm_rms_level(&audio_samples);
 
+        let touch = if self.stylus_down {
+            Some((u32::from(self.stylus_x), u32::from(self.stylus_y), true))
+        } else {
+            None
+        };
+        nds.step_frame_ex(buttons_mask, touch, skip_render);
+        let pcm_start = pcm_out.len();
+        let audio_freq_hz = nds.drain_audio(pcm_out);
+        let audio_level = pcm_rms_level(&pcm_out[pcm_start..]);
+        let (width, height) = nds.frame_dimensions();
+
+        FastFrameMeta {
+            frame_number,
+            width,
+            height,
+            audio_level,
+            audio_freq_hz,
+            sample_rate_hz: DEFAULT_SAMPLE_RATE_HZ,
+            serial_out_byte: None,
+        }
+    }
+
+    fn rgba_frame(&self) -> (u16, u16, &[u8]) {
+        if let Some(ref nds) = self.inner {
+            let (w, h) = nds.frame_dimensions();
+            (w, h, nds.framebuffer_rgba())
+        } else {
+            (
+                NDS_SCREEN_WIDTH as u16,
+                NDS_SCREEN_HEIGHT as u16,
+                &self.standby_rgba,
+            )
+        }
+    }
+
+    fn step_frame(&mut self, buttons_mask: u16) -> FrameStepResult {
+        let mut audio_samples = Vec::with_capacity(1664);
+        let meta = self.step_frame_borrowed(buttons_mask, false, &mut audio_samples);
+        let (_, _, rgba_slice) = self.rgba_frame();
+        let rgba = rgba_slice.to_vec();
         let cpu = self.debug_snapshot();
 
         FrameStepResult {
             console: ConsoleKind::Nds,
-            frame_number,
-            width: NDS_SCREEN_WIDTH as u16,
-            height: NDS_SCREEN_HEIGHT as u16,
+            frame_number: meta.frame_number,
+            width: meta.width,
+            height: meta.height,
             rgba,
-            audio_level,
-            audio_freq_hz,
+            audio_level: meta.audio_level,
+            audio_freq_hz: meta.audio_freq_hz,
             audio_samples,
-            sample_rate_hz: DEFAULT_SAMPLE_RATE_HZ,
+            sample_rate_hz: meta.sample_rate_hz,
             serial_out_byte: None,
             cpu,
         }
@@ -153,6 +198,7 @@ impl EmulatorBackend for NdsCore {
         nds.load_state_bytes(data)?;
         nds.set_audio_rate(DEFAULT_SAMPLE_RATE_HZ);
         nds.set_cpu_overclock_pct(self.cpu_overclock_pct);
+        nds.set_3d_scale(self.scale_3d);
         self.frame_number = u64::from(nds.frame_count());
         self.refresh_sram_cache(true);
         self.refresh_debug_caches();
@@ -188,6 +234,13 @@ impl EmulatorBackend for NdsCore {
         self.cpu_overclock_pct = pct.clamp(50, 400);
         if let Some(ref mut nds) = self.inner {
             nds.set_cpu_overclock_pct(self.cpu_overclock_pct);
+        }
+    }
+
+    fn set_3d_scale(&mut self, scale: u8) {
+        self.scale_3d = scale.clamp(1, 2);
+        if let Some(ref mut nds) = self.inner {
+            nds.set_3d_scale(self.scale_3d);
         }
     }
 

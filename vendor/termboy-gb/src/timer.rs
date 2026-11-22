@@ -14,6 +14,7 @@ pub struct Timer {
 
 impl Timer {
     /// Advance one T-cycle. Returns true when the timer interrupt fires.
+    #[inline]
     pub fn tick(&mut self) -> bool {
         let mut irq = false;
         if self.overflow_delay > 0 {
@@ -28,6 +29,41 @@ impl Timer {
         irq
     }
 
+    /// Fast 4-T-cycle (one M-cycle) step with cycle-identical falling-edge behavior.
+    #[inline(always)]
+    pub fn tick_4(&mut self) -> bool {
+        if self.overflow_delay == 0 {
+            if self.tac & 0x04 == 0 {
+                self.counter = self.counter.wrapping_add(4);
+                return false;
+            }
+            let bit = match self.tac & 0x03 {
+                0 => 9,
+                1 => 3,
+                2 => 5,
+                _ => 7,
+            };
+            let next_counter = self.counter.wrapping_add(4);
+            let cur = ((next_counter >> bit) & 1) == 1;
+            // Since bit >= 3 (half-period >= 8 T-cycles), advancing by 4 T-cycles can produce
+            // at most one transition; a falling edge occurs iff prev_bit was 1 and cur is 0.
+            self.counter = next_counter;
+            if !self.prev_bit || cur {
+                self.prev_bit = cur;
+                return false;
+            }
+            // Falling edge happened within these 4 T-cycles; rewind and step exact T-cycles so
+            // `overflow_delay` lands on the exact cycle.
+            self.counter = next_counter.wrapping_sub(4);
+        }
+        let mut irq = false;
+        for _ in 0..4 {
+            irq |= self.tick();
+        }
+        irq
+    }
+
+    #[inline(always)]
     fn update_edge(&mut self) {
         let bit = match self.tac & 0x03 {
             0 => 9, // 4096 Hz

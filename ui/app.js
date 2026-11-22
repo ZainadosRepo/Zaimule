@@ -32,6 +32,7 @@ import {
   arrangeNdsDualScreenFrame
 } from "./upscaler.js";
 import { decodeViewportBinaryPacket } from "./viewport_ipc.js";
+import { WebGlViewportRenderer } from "./gl_renderer.js";
 
 const tauriInvoke = window.__TAURI__?.core?.invoke;
 const appWindow = window.__TAURI__?.window?.getCurrentWindow?.();
@@ -39,23 +40,26 @@ const apuAudio = new ApuAudioEngine();
 const viewportRecorder = new ViewportRecorder();
 const framePacer = new FramePacer();
 const canvasImageCache = new Map();
+const glRendererCache = new Map();
 
 const SHADER_MODES = ["mode-clean", "mode-lcd", "mode-crt", "mode-trinitron", "mode-dmg"];
 const SHADER_LABELS = {
-  "mode-clean": "Pixel-Perfect",
-  "mode-lcd": "Matrice LCD",
-  "mode-crt": "CRT Scanlines",
-  "mode-trinitron": "Trinitron Courbé",
-  "mode-dmg": "Game Boy DMG Vert"
+  "mode-clean": "Cristal HD",
+  "mode-lcd": "Grille LCD Subpixel",
+  "mode-crt": "CRT Scanlines Pro",
+  "mode-trinitron": "Sony Trinitron PVM",
+  "mode-dmg": "Game Boy DMG Olive"
 };
 const UPSCALER_LABELS = {
-  XBRZ: "xBRZ 2x",
+  XBRZ: "xBRZ HD GPU",
+  SHARP: "Sharp-Bilinear",
   SCALE2X: "Scale2x EPX",
   BLOOM: "CRT Bloom",
   OFF: "Natif 1x"
 };
 const NDS_LAYOUT_LABELS = {
   vertical: "DS : Vertical",
+  hybrid: "DS : Hybride",
   horizontal: "DS : Côte à côte",
   "vertical-swapped": "DS : Inversé",
   "horizontal-swapped": "DS : Côte à côte inv."
@@ -64,6 +68,9 @@ const NDS_LAYOUT_LABELS = {
 let toastTimer = null;
 let lastSurfacedWarning = "";
 let stepInFlight = false;
+let rafLoopScheduled = false;
+let selectGameInFlightId = "";
+let selectGameInFlightPromise = null;
 let lastTelemetryDomUpdateMs = 0;
 let activePaneId = "view-library";
 let cachedKeyBindings = null;
@@ -103,6 +110,55 @@ function getCachedKeyBindings() {
 function invalidateKeyBindingsCache() {
   cachedKeyBindings = null;
   cachedKeyWidgetsRef = null;
+}
+
+function getGlRenderer(canvasId) {
+  let renderer = glRendererCache.get(canvasId);
+  if (renderer && renderer.canvas && renderer.canvas.isConnected) {
+    return renderer.isSupported() ? renderer : null;
+  }
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return null;
+  renderer = new WebGlViewportRenderer(canvas);
+  glRendererCache.set(canvasId, renderer);
+  const screenContainer = canvas.closest(".screen-container");
+  if (screenContainer) {
+    screenContainer.classList.toggle("gl-active", renderer.isSupported());
+  }
+  return renderer.isSupported() ? renderer : null;
+}
+
+function redrawAllGlViewports() {
+  const g = getSelectedGame();
+  const isNds = Boolean(g && String(g.console || "").toUpperCase() === "NDS");
+  const opts = {
+    upscalerMode: state.upscalerMode,
+    shaderCss: state.activeShaderCss,
+    isNds,
+    ndsLayout: state.ndsLayout,
+    integerScale: Boolean(state.viewportIntegerScale)
+  };
+  for (const id of ["canvas-p1", "canvas-p2", "canvas-p3", "canvas-p4"]) {
+    const renderer = glRendererCache.get(id);
+    if (renderer && renderer.isSupported()) {
+      renderer.redraw(opts);
+    }
+  }
+}
+
+function shouldKeepEmulationLoopAlive() {
+  if (typeof document !== "undefined" && document.hidden) return false;
+  if (state.bigPictureMode) return true;
+  if (!state.isEmulationRunning) return false;
+  if (activePaneId !== "view-emulator") return false;
+  if (state.debuggerPaused && !state.stepOnceRequested) return false;
+  return true;
+}
+
+function ensureEmulationLoopRunning() {
+  if (rafLoopScheduled || !shouldKeepEmulationLoopAlive()) return;
+  rafLoopScheduled = true;
+  requestAnimationFrame(tickEmulationLoop);
 }
 
 function getCanvasEntry(canvasId, opaque = false) {
@@ -374,6 +430,9 @@ let state = {
   upscalerMode: "XBRZ",
   speedMult: 1,
   ndsLayout: "vertical",
+  nds3dScale: 1,
+  viewportIntegerScale: false,
+  rewindEnabled: true,
   activeMacroId: null,
   recordingMacro: false,
   recordedFrames: []
@@ -746,6 +805,9 @@ function setEmulationPaused(paused) {
     if (state.isEmulationRunning) {
       scheduleDebuggerRefresh(performance.now(), true);
     }
+  } else {
+    framePacer.reset();
+    ensureEmulationLoopRunning();
   }
   const topBtn = document.getElementById("btn-emu-pause");
   if (topBtn) {
@@ -779,6 +841,7 @@ async function setViewportFullscreen(enabled) {
   } catch {
     // Keep CSS fullscreen mode even if OS/WebView fullscreen API declines
   }
+  requestAnimationFrame(() => redrawAllGlViewports());
 }
 
 function captureScreenshotPng() {
@@ -820,15 +883,22 @@ function captureScreenshotPng() {
 }
 
 function syncViewportScreenAspect(game) {
-  const consoleKey = String(game?.console || "").toUpperCase();
+  const consoleKey = String(game?.console || "GBC").toUpperCase();
   const isNds = consoleKey === "NDS";
+  const isGba = consoleKey === "GBA";
+  const isGb = !isNds && !isGba;
   const isSwitch = isSwitchGame(game);
-  const isHorizontal = isNds && String(state.ndsLayout || "vertical").startsWith("horizontal");
+  const layout = String(state.ndsLayout || "vertical").toLowerCase();
+  const isHorizontal = isNds && layout.startsWith("horizontal");
+  const isHybrid = isNds && layout === "hybrid";
   ["screen-1", "screen-2", "screen-3", "screen-4"].forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
+    el.classList.toggle("mode-gb", isGb);
+    el.classList.toggle("mode-gba", isGba);
     el.classList.toggle("mode-nds", isNds);
     el.classList.toggle("nds-horizontal", isHorizontal);
+    el.classList.toggle("nds-hybrid", isHybrid);
   });
   const layoutBtn = document.getElementById("btn-nds-layout");
   if (layoutBtn) {
@@ -837,6 +907,10 @@ function syncViewportScreenAspect(game) {
   const drawerNdsRow = document.getElementById("emu-nds-layout-row");
   if (drawerNdsRow) {
     drawerNdsRow.style.display = isNds ? "flex" : "none";
+  }
+  const drawerNds3dRow = document.getElementById("emu-nds-3d-row");
+  if (drawerNds3dRow) {
+    drawerNds3dRow.style.display = isNds ? "flex" : "none";
   }
   const linkSection = document.getElementById("emu-link-section");
   if (linkSection) {
@@ -882,7 +956,29 @@ function applyDisplayPreferencesToDom() {
     const sel = document.getElementById(id);
     if (sel) sel.value = ndsLayout;
   }
+
+  const nds3dScale = Number(state.nds3dScale) >= 2 ? 2 : 1;
+  state.nds3dScale = nds3dScale;
+  for (const id of ["emu-nds-3d-scale-select", "settings-nds-3d-scale-select"]) {
+    const sel = document.getElementById(id);
+    if (sel) sel.value = String(nds3dScale);
+  }
+
+  const intScale = Boolean(state.viewportIntegerScale);
+  setText(
+    "btn-emu-integer-scale",
+    intScale ? "Échelle entière : ON (Pixel-Exact)" : "Échelle entière : OFF (Plein cadre)"
+  );
+  setText(
+    "btn-settings-integer-scale",
+    intScale ? "Activé (Pixel-Exact)" : "Désactivé (Plein cadre)"
+  );
+
+  const rewindOn = state.rewindEnabled !== false;
+  setText("btn-rewind-toggle", `Rembobinage : ${rewindOn ? "ON" : "OFF"}`);
+
   syncViewportScreenAspect(getSelectedGame());
+  redrawAllGlViewports();
 }
 
 function releaseTransientInputs() {
@@ -910,6 +1006,13 @@ function stopEmulationPlayback() {
 }
 
 async function launchSelectedGame() {
+  if (selectGameInFlightPromise) {
+    try {
+      await selectGameInFlightPromise;
+    } catch {
+      // Handled by caller
+    }
+  }
   const game = getSelectedGame();
   if (!game) {
     await handleImportRomsTrigger();
@@ -944,8 +1047,10 @@ async function launchSelectedGame() {
   lastTelemetryDomUpdateMs = 0;
   state.isEmulationRunning = true;
   const targetFps = targetFpsForConsole(game.console);
-  setText("tel-fps", `${Math.round(targetFps * state.speedMult)} FPS`);
+  const hasGl = Boolean(getGlRenderer("canvas-p1"));
+  setText("tel-fps", `${Math.round(targetFps * state.speedMult)} FPS${hasGl ? " · GPU" : ""}`);
   switchTab("view-emulator");
+  ensureEmulationLoopRunning();
 }
 
 function getConnectedGamepad() {
@@ -1144,6 +1249,7 @@ function renderCatalogGrid() {
 
     const card = document.createElement("article");
     card.className = `game-card${game.id === state.activeGameId ? " selected" : ""}`;
+    card.dataset.gameId = game.id;
     card.dataset.console = consoleKey;
     card.setAttribute("role", "listitem");
     card.tabIndex = 0;
@@ -1211,16 +1317,42 @@ function renderCatalogGrid() {
       }
     });
 
-    card.addEventListener("click", async () => {
+    const selectCardGame = () => {
+      if (state.activeGameId === game.id && selectGameInFlightId === game.id && selectGameInFlightPromise) {
+        return selectGameInFlightPromise;
+      }
+      const alreadySelected = state.activeGameId === game.id;
       state.activeGameId = game.id;
-      const boot = await invokeBackend("select_game", { gameId: game.id });
-      if (boot) applyBootstrap(boot);
-      else updateAllViews();
+      // Fast O(N) class toggle without destroying/recreating DOM nodes
+      grid.querySelectorAll(".game-card").forEach((el) => {
+        el.classList.toggle("selected", el.dataset.gameId === game.id);
+      });
+      renderInspector();
+      if (alreadySelected && !selectGameInFlightPromise) {
+        return Promise.resolve();
+      }
+      selectGameInFlightId = game.id;
+      const p = invokeBackend("select_game", { gameId: game.id })
+        .then((boot) => {
+          if (boot) {
+            applyBootstrap(boot, { skipCatalogGridRebuild: true });
+          }
+        })
+        .finally(() => {
+          if (selectGameInFlightPromise === p) {
+            selectGameInFlightPromise = null;
+            selectGameInFlightId = "";
+          }
+        });
+      selectGameInFlightPromise = p;
+      return p;
+    };
+
+    card.addEventListener("click", () => {
+      selectCardGame();
     });
     card.addEventListener("dblclick", async () => {
-      state.activeGameId = game.id;
-      const boot = await invokeBackend("select_game", { gameId: game.id });
-      if (boot) applyBootstrap(boot);
+      await selectCardGame();
       await launchSelectedGame();
     });
     grid.appendChild(card);
@@ -2032,7 +2164,7 @@ function renderNetplayAndCores() {
   }
 }
 
-function applyBootstrap(boot) {
+function applyBootstrap(boot, options = {}) {
   state.activeGameId = boot.activeGameId ?? "";
   state.catalog = Array.isArray(boot.catalog) ? boot.catalog : state.catalog;
   state.modLayers = Array.isArray(boot.modLayers) ? boot.modLayers : state.modLayers;
@@ -2092,6 +2224,15 @@ function applyBootstrap(boot) {
   if (typeof boot.ndsLayout === "string" && boot.ndsLayout) {
     state.ndsLayout = boot.ndsLayout;
   }
+  if (boot.nds3dScale !== undefined) {
+    state.nds3dScale = Number(boot.nds3dScale) >= 2 ? 2 : 1;
+  }
+  if (boot.viewportIntegerScale !== undefined) {
+    state.viewportIntegerScale = Boolean(boot.viewportIntegerScale);
+  }
+  if (boot.rewindEnabled !== undefined) {
+    state.rewindEnabled = Boolean(boot.rewindEnabled);
+  }
   state.warning = boot.warning || null;
   if (state.warning && state.warning !== lastSurfacedWarning) {
     lastSurfacedWarning = state.warning;
@@ -2101,7 +2242,14 @@ function applyBootstrap(boot) {
     stopEmulationPlayback();
   }
   applyDisplayPreferencesToDom();
-  updateAllViews();
+  if (options.skipCatalogGridRebuild) {
+    renderSidebarCounts();
+    renderInspector();
+    renderKeymapperAndMacros();
+    renderNetplayAndCores();
+  } else {
+    updateAllViews();
+  }
 }
 
 function computeCrc32Hex(bytes) {
@@ -2145,7 +2293,11 @@ function switchTab(targetId) {
   document.querySelectorAll(".view-pane").forEach((pane) => {
     pane.classList.toggle("active", pane.id === targetId);
   });
-  if ((targetId === "view-library" || targetId === "view-settings") && tauriInvoke) {
+  if (targetId === "view-emulator") {
+    requestAnimationFrame(() => redrawAllGlViewports());
+    ensureEmulationLoopRunning();
+  } else if (prevPane === "view-emulator" && tauriInvoke) {
+    // Refresh playtime / save state metadata once when returning from an active emulation session
     invokeBackend("get_station_bootstrap", {}, { silent: true }).then((boot) => {
       if (boot) applyBootstrap(boot);
     });
@@ -2153,16 +2305,39 @@ function switchTab(targetId) {
 }
 
 function renderStandbyCanvas() {
-  const p1 = getCanvasEntry("canvas-p1", true);
-  if (p1) {
-    const { canvas, ctx } = p1;
-    const w = canvas.width || 160;
-    const h = canvas.height || 144;
-    ctx.fillStyle = "#110F0E";
-    ctx.fillRect(0, 0, w, h);
-    ctx.strokeStyle = "#282422";
-    ctx.lineWidth = 1;
-    ctx.strokeRect(8.5, 8.5, w - 17, h - 17);
+  const glP1 = getGlRenderer("canvas-p1");
+  if (glP1) {
+    const w = 160;
+    const h = 144;
+    const standby = new Uint8Array(w * h * 4);
+    for (let i = 0; i < standby.length; i += 4) {
+      standby[i] = 17;
+      standby[i + 1] = 15;
+      standby[i + 2] = 14;
+      standby[i + 3] = 255;
+    }
+    glP1.renderFrame(
+      { width: w, height: h, rgba: standby },
+      {
+        upscalerMode: "OFF",
+        shaderCss: "mode-clean",
+        isNds: false,
+        ndsLayout: "vertical",
+        integerScale: false
+      }
+    );
+  } else {
+    const p1 = getCanvasEntry("canvas-p1", true);
+    if (p1) {
+      const { canvas, ctx } = p1;
+      const w = canvas.width || 160;
+      const h = canvas.height || 144;
+      ctx.fillStyle = "#110F0E";
+      ctx.fillRect(0, 0, w, h);
+      ctx.strokeStyle = "#282422";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(8.5, 8.5, w - 17, h - 17);
+    }
   }
   const oscEntry = getCanvasEntry("audio-oscilloscope-canvas", true);
   if (oscEntry) {
@@ -2180,6 +2355,25 @@ function renderStandbyCanvas() {
 function paintRgbaFrame(canvasId, frame, activeGame = null) {
   if (!frame || !frame.rgba) return;
   const isPlayerCanvas = canvasId.startsWith("canvas-p");
+  if (isPlayerCanvas) {
+    const glRenderer = getGlRenderer(canvasId);
+    if (glRenderer) {
+      const g = activeGame || getSelectedGame();
+      const isNds = Boolean(g && String(g.console || "").toUpperCase() === "NDS");
+      if (
+        glRenderer.renderFrame(frame, {
+          upscalerMode: state.upscalerMode,
+          shaderCss: state.activeShaderCss,
+          isNds,
+          ndsLayout: state.ndsLayout,
+          integerScale: Boolean(state.viewportIntegerScale)
+        })
+      ) {
+        return;
+      }
+    }
+  }
+
   const entry = getCanvasEntry(canvasId, isPlayerCanvas);
   if (!entry) return;
   const { canvas, ctx } = entry;
@@ -2498,7 +2692,11 @@ function scheduleDebuggerRefresh(nowMs, force = false) {
 }
 
 async function tickEmulationLoop(nowMs) {
-  requestAnimationFrame(tickEmulationLoop);
+  rafLoopScheduled = false;
+  if (shouldKeepEmulationLoopAlive()) {
+    rafLoopScheduled = true;
+    requestAnimationFrame(tickEmulationLoop);
+  }
   if (stepInFlight) {
     return;
   }
@@ -2628,7 +2826,14 @@ async function tickEmulationLoop(nowMs) {
         if (wantTelemetry) {
           lastTelemetryDomUpdateMs = nowMs;
           const fpsEl = getCachedEl("tel-fps");
-          if (fpsEl) fpsEl.textContent = `${Math.round(pacing.measuredFps * state.speedMult)} FPS`;
+          if (fpsEl) {
+            const hasGl = Boolean(glRendererCache.get("canvas-p1")?.isSupported());
+            const hdTag =
+              String(activeGame.console || "").toUpperCase() === "NDS" && state.nds3dScale >= 2
+                ? " · 3D 2x"
+                : "";
+            fpsEl.textContent = `${Math.round(pacing.measuredFps * state.speedMult)} FPS${hasGl ? " · GPU" : ""}${hdTag}`;
+          }
 
           const cpu = meta.cpu || {};
           const pcSpEl = getCachedEl("dbg-pc-sp");
@@ -2649,6 +2854,9 @@ async function tickEmulationLoop(nowMs) {
     console.warn("[zaimule] Erreur boucle viewport:", err);
   } finally {
     stepInFlight = false;
+    if (shouldKeepEmulationLoopAlive()) {
+      ensureEmulationLoopRunning();
+    }
   }
 }
 
@@ -2842,6 +3050,8 @@ function bindEvents() {
     document.querySelector(".app-shell")?.classList.toggle("big-picture", state.bigPictureMode);
     e.currentTarget.textContent = state.bigPictureMode ? "Activé" : "Désactivé";
     triggerGamepadRumble(getConnectedGamepad(), 70, 0.4, 0.7);
+    redrawAllGlViewports();
+    ensureEmulationLoopRunning();
   });
 
   const colorLabels = ["#0 Fond", "#1 Basalte", "#2 Argile", "#3 Pigment"];
@@ -3375,10 +3585,70 @@ function bindEvents() {
     });
   }
 
+  const applyNds3dScale = (rawScale) => {
+    state.nds3dScale = Number(rawScale) >= 2 ? 2 : 1;
+    applyDisplayPreferencesToDom();
+    invokeBackend(
+      "update_ui_preferences",
+      {
+        shaderCss: null,
+        upscalerMode: null,
+        speedMultiplier: null,
+        ndsLayout: null,
+        extras: { ndsHdScale: state.nds3dScale }
+      },
+      { silent: true }
+    );
+  };
+
+  for (const id of ["emu-nds-3d-scale-select", "settings-nds-3d-scale-select"]) {
+    document.getElementById(id)?.addEventListener("change", (e) => {
+      applyNds3dScale(e.target.value);
+    });
+  }
+
+  const toggleIntegerScale = () => {
+    state.viewportIntegerScale = !state.viewportIntegerScale;
+    applyDisplayPreferencesToDom();
+    invokeBackend(
+      "update_ui_preferences",
+      {
+        shaderCss: null,
+        upscalerMode: null,
+        speedMultiplier: null,
+        ndsLayout: null,
+        extras: { viewportIntegerScale: state.viewportIntegerScale }
+      },
+      { silent: true }
+    );
+  };
+
+  document.getElementById("btn-emu-integer-scale")?.addEventListener("click", toggleIntegerScale);
+  document.getElementById("btn-settings-integer-scale")?.addEventListener("click", toggleIntegerScale);
+
+  document.getElementById("btn-rewind-toggle")?.addEventListener("click", () => {
+    state.rewindEnabled = state.rewindEnabled === false;
+    applyDisplayPreferencesToDom();
+    invokeBackend(
+      "update_ui_preferences",
+      {
+        shaderCss: null,
+        upscalerMode: null,
+        speedMultiplier: null,
+        ndsLayout: null,
+        extras: { rewindEnabled: state.rewindEnabled }
+      },
+      { silent: true }
+    );
+  });
+
   document.getElementById("btn-reset-optimal")?.addEventListener("click", async () => {
     state.upscalerMode = "XBRZ";
     state.activeShaderCss = "mode-clean";
     state.speedMult = 1;
+    state.nds3dScale = 1;
+    state.viewportIntegerScale = false;
+    state.rewindEnabled = true;
     state.cpuOverclockPct = 100;
     state.pgxpSubpixel = true;
     applyDisplayPreferencesToDom();
@@ -3389,7 +3659,12 @@ function bindEvents() {
         shaderCss: "mode-clean",
         upscalerMode: "XBRZ",
         speedMultiplier: 1,
-        ndsLayout: null
+        ndsLayout: null,
+        extras: {
+          ndsHdScale: 1,
+          viewportIntegerScale: false,
+          rewindEnabled: true
+        }
       },
       { silent: true }
     );
@@ -3400,7 +3675,7 @@ function bindEvents() {
     );
     if (boot) applyBootstrap(boot);
     else renderInspector();
-    showToast("Qualité optimale restaurée (xBRZ 2x · Pixel-Perfect).", "ok");
+    showToast("Qualité optimale restaurée (xBRZ HD GPU · Cristal HD).", "ok");
   });
 
   const toggleKm = () => {
@@ -3494,6 +3769,7 @@ function bindEvents() {
   document.getElementById("btn-dbg-step")?.addEventListener("click", () => {
     setEmulationPaused(true);
     state.stepOnceRequested = true;
+    ensureEmulationLoopRunning();
   });
 
   document.getElementById("btn-speed-cycle")?.addEventListener("click", () => {
@@ -3675,6 +3951,7 @@ function bindEvents() {
     } else {
       framePacer.reset();
       lastTelemetryDomUpdateMs = 0;
+      ensureEmulationLoopRunning();
     }
   });
 
@@ -3706,6 +3983,17 @@ async function init() {
     );
     if (vramEl) visObserver.observe(vramEl);
     if (oscEl) visObserver.observe(oscEl);
+  }
+  if (typeof ResizeObserver === "function") {
+    const resizeObs = new ResizeObserver(() => {
+      if (activePaneId === "view-emulator") {
+        redrawAllGlViewports();
+      }
+    });
+    for (const id of ["screen-1", "screen-2", "screen-3", "screen-4"]) {
+      const el = document.getElementById(id);
+      if (el) resizeObs.observe(el);
+    }
   }
   bindEvents();
   await setupDragAndDrop();
@@ -3740,7 +4028,7 @@ async function init() {
   if (boot) {
     applyBootstrap(boot);
   }
-  requestAnimationFrame(tickEmulationLoop);
+  ensureEmulationLoopRunning();
 }
 
 init();

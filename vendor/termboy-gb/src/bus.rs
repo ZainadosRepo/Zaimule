@@ -94,19 +94,16 @@ impl Bus {
 
     /// Advance one M-cycle of CPU time. The timer runs on the CPU clock; the
     /// PPU runs in real time, so it gets half the T-cycles in double speed.
+    #[inline]
     pub fn tick(&mut self) {
         self.cycles += 4;
-        for _ in 0..4 {
-            if self.timer.tick() {
-                self.intf |= IF_TIMER;
-            }
+        if self.timer.tick_4() {
+            self.intf |= IF_TIMER;
         }
-        let ppu_t = if self.double_speed { 2 } else { 4 };
-        for _ in 0..ppu_t {
-            self.intf |= self.ppu.tick();
-        }
-        self.apu.tick(ppu_t); // APU runs in real time, like the PPU
-        self.cart.tick(ppu_t);
+        let ppu_t = if self.double_speed { 2u16 } else { 4u16 };
+        self.intf |= self.ppu.tick_n(ppu_t);
+        self.apu.tick(u32::from(ppu_t)); // APU runs in real time, like the PPU
+        self.cart.tick(u32::from(ppu_t));
         // OAM DMA: one byte per M-cycle, 160 M-cycles total.
         if self.dma_idx < 0xA0 {
             let value = self.read(self.dma_src + self.dma_idx as u16);
@@ -259,12 +256,21 @@ impl Bus {
             0xFF07 => self.timer.write_tac(value),
             0xFF0F => self.intf = value & 0x1F,
             0xFF10..=0xFF3F => self.apu.write(addr, value),
-            0xFF40 => self.ppu.write_lcdc(value),
-            0xFF41 => self.ppu.write_stat(value),
+            0xFF40 => {
+                self.ppu.write_lcdc(value);
+                self.ppu.stat_dirty = true;
+            }
+            0xFF41 => {
+                self.ppu.write_stat(value);
+                self.ppu.stat_dirty = true;
+            }
             0xFF42 => self.ppu.scy = value,
             0xFF43 => self.ppu.scx = value,
             0xFF44 => {} // LY is read-only
-            0xFF45 => self.ppu.lyc = value,
+            0xFF45 => {
+                self.ppu.lyc = value;
+                self.ppu.stat_dirty = true;
+            }
             0xFF46 => {
                 self.dma_reg = value;
                 self.dma_src = (value as u16) << 8;

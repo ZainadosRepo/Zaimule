@@ -3,9 +3,6 @@
    Tinted Warm Dark Neutrals · Pigment Cobalt · Tactile Editorial Grid
    ========================================================================== */
 
-@import url("https://api.fontshare.com/v2/css?f[]=satoshi@400,500,600,700&display=swap");
-@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap");
-
 :root {
   /* 1. TINTED NEUTRALS (3 Depth Levels + Hover) */
   --bg-canvas: #151312;         /* Terre de Basalte — Fond principal */
@@ -1284,6 +1281,16 @@ canvas.game-canvas {
   opacity: 0.85;
 }
 
+/* When WebGL2 GPU shader is active, disable CSS overlay divs and CSS filters */
+.screen-container.gl-active .shader-scanlines,
+.screen-container.gl-active .shader-lcd {
+  display: none !important;
+}
+.screen-container.gl-active canvas.game-canvas {
+  filter: none !important;
+  image-rendering: auto;
+}
+
 /* Big Picture Mode (10-Foot Controller UI) */
 .app-shell.big-picture .games-grid {
   grid-template-columns: repeat(auto-fill, minmax(236px, 1fr));
@@ -1919,25 +1926,57 @@ canvas.game-canvas {
   gap: 4px;
 }
 
-/* Larger, distraction-free responsive game screen */
+/* True console aspect ratios & full-stage responsive game viewport */
 .screen-container {
-  width: min(640px, 72vw, calc((100vh - 185px) * 4 / 3));
-  height: min(480px, calc(72vw * 3 / 4), calc(100vh - 185px));
+  --screen-aspect-w: 10;
+  --screen-aspect-h: 9;
+  --stage-avail-w: 88vw;
+  --stage-avail-h: calc(100vh - 154px);
+  width: min(
+    1440px,
+    var(--stage-avail-w),
+    calc(var(--stage-avail-h) * var(--screen-aspect-w) / var(--screen-aspect-h))
+  );
+  height: min(
+    1080px,
+    calc(var(--stage-avail-w) * var(--screen-aspect-h) / var(--screen-aspect-w)),
+    var(--stage-avail-h)
+  );
+}
+
+.screen-container.mode-gb {
+  --screen-aspect-w: 10;
+  --screen-aspect-h: 9;
+}
+
+.screen-container.mode-gba {
+  --screen-aspect-w: 3;
+  --screen-aspect-h: 2;
 }
 
 .screen-container.mode-nds {
-  width: min(384px, 56vw, calc((100vh - 185px) * 2 / 3));
-  height: min(576px, calc(56vw * 3 / 2), calc(100vh - 185px));
+  --screen-aspect-w: 2;
+  --screen-aspect-h: 3;
 }
 
 .screen-container.mode-nds.nds-horizontal {
-  width: min(820px, 86vw, calc((100vh - 185px) * 8 / 3));
-  height: min(308px, calc(86vw * 3 / 8), calc(100vh - 185px));
+  --screen-aspect-w: 8;
+  --screen-aspect-h: 3;
 }
 
-.emu-screens-wrap.dual-mode .screen-container.mode-nds.nds-horizontal {
-  width: 440px;
-  height: 165px;
+.screen-container.mode-nds.nds-hybrid {
+  --screen-aspect-w: 2;
+  --screen-aspect-h: 1;
+}
+
+.emu-screens-wrap.dual-mode .screen-container {
+  --stage-avail-w: 44vw;
+  --stage-avail-h: calc(100vh - 180px);
+}
+
+.emu-screens-wrap.quad-mode .screen-container {
+  --stage-avail-w: 42vw;
+  --stage-avail-h: calc((100vh - 210px) * 0.48);
 }
 
 .emu-hints-bar {
@@ -2246,14 +2285,9 @@ canvas.game-canvas {
 }
 
 /* Big Picture & Fullscreen Overrides */
-.app-shell.big-picture .screen-container.mode-nds {
-  width: min(440px, 60vw, calc((100vh - 185px) * 2 / 3));
-  height: min(660px, calc(60vw * 3 / 2), calc(100vh - 185px));
-}
-
-.app-shell.big-picture .screen-container.mode-nds.nds-horizontal {
-  width: min(860px, 90vw, calc((100vh - 185px) * 8 / 3));
-  height: min(322px, calc(90vw * 3 / 8), calc(100vh - 185px));
+.app-shell.big-picture .screen-container {
+  --stage-avail-w: 92vw;
+  --stage-avail-h: calc(100vh - 148px);
 }
 
 .app-shell.viewport-fullscreen .titlebar,
@@ -2271,7 +2305,7 @@ canvas.game-canvas {
 }
 
 .app-shell.viewport-fullscreen .emu-screens-wrap {
-  padding: 10px;
+  padding: 8px;
 }
 
 .app-shell.viewport-fullscreen .crt-bezel {
@@ -2279,18 +2313,16 @@ canvas.game-canvas {
 }
 
 .app-shell.viewport-fullscreen .screen-container {
-  width: min(88vw, calc(84vh * 4 / 3));
-  height: min(84vh, calc(88vw * 3 / 4));
-}
-
-.app-shell.viewport-fullscreen .screen-container.mode-nds {
-  width: min(84vw, calc(86vh * 2 / 3));
-  height: min(86vh, calc(84vw * 3 / 2));
-}
-
-.app-shell.viewport-fullscreen .screen-container.mode-nds.nds-horizontal {
-  width: min(94vw, calc(84vh * 8 / 3));
-  height: min(84vh, calc(94vw * 3 / 8));
+  --stage-avail-w: 96vw;
+  --stage-avail-h: calc(100vh - 64px);
+  width: min(
+    var(--stage-avail-w),
+    calc(var(--stage-avail-h) * var(--screen-aspect-w) / var(--screen-aspect-h))
+  );
+  height: min(
+    var(--stage-avail-h),
+    calc(var(--stage-avail-w) * var(--screen-aspect-h) / var(--screen-aspect-w))
+  );
 }
 
 .btn.btn-paused {

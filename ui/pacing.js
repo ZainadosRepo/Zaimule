@@ -51,7 +51,9 @@ export class FramePacer {
 
     if (this.lastTimestampMs === null) {
       this.lastTimestampMs = ts;
-      this.accumulatorMs = 0;
+      // 1.0 ms initial phase cushion prevents an immediate frame-2 skip on 60 Hz displays
+      // (where 16.667 ms < 16.743 ms) without causing an early 8.33 ms step on 120/144/240 Hz displays.
+      this.accumulatorMs = Math.min(1.0, framePeriodMs * 0.1);
       this._recordStep(ts, fps, framePeriodMs);
       return {
         shouldStep: true,
@@ -87,7 +89,9 @@ export class FramePacer {
 
     this.accumulatorMs -= framePeriodMs;
     // Prevent catch-up burst / spiral of death after a long stall or tab switch.
-    if (spiked || this.accumulatorMs > framePeriodMs * 1.5) {
+    if (spiked) {
+      this.accumulatorMs = 0;
+    } else if (this.accumulatorMs > framePeriodMs * 1.5) {
       this.accumulatorMs = Math.min(this.accumulatorMs, framePeriodMs * 0.5);
     }
 

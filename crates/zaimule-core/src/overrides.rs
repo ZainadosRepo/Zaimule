@@ -43,6 +43,10 @@ fn default_nds_layout() -> String {
     "vertical".into()
 }
 
+fn default_nds_3d_scale() -> u8 {
+    1
+}
+
 /// Global user preferences across Zaimule.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -54,6 +58,10 @@ pub struct GlobalSettings {
     pub upscaler_mode: String,
     #[serde(default = "default_nds_layout")]
     pub nds_layout: String,
+    #[serde(default = "default_nds_3d_scale")]
+    pub nds_3d_scale: u8,
+    #[serde(default)]
+    pub viewport_integer_scale: bool,
     pub internal_scale: u8,
     pub speed_multiplier: u8,
     pub cpu_overclock_pct: u16,
@@ -86,6 +94,8 @@ impl Default for GlobalSettings {
             active_shader_css: default_shader_css(),
             upscaler_mode: default_upscaler_mode(),
             nds_layout: default_nds_layout(),
+            nds_3d_scale: default_nds_3d_scale(),
+            viewport_integer_scale: false,
             internal_scale: 4,
             speed_multiplier: 1,
             cpu_overclock_pct: 100,

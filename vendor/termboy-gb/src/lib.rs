@@ -116,6 +116,21 @@ impl GameBoy {
     pub fn apu_telemetry(&self) -> (u32, u8) {
         self.cpu.bus.apu.telemetry()
     }
+
+    /// Steps one full GB/GBC frame while skipping PPU scanline rasterization and RGB conversion,
+    /// used for intermediate frames during fast-forward.
+    pub fn run_frame_skip_render(&mut self, buttons: Buttons) {
+        if self.cpu.bus.joypad.set_buttons(buttons) {
+            self.cpu.bus.intf |= bus::IF_JOYPAD;
+        }
+        self.cpu.bus.ppu.frame_ready = false;
+        self.cpu.bus.ppu.skip_render = true;
+        let cap = self.cpu.bus.cycles + CYCLES_PER_FRAME;
+        while !self.cpu.bus.ppu.frame_ready && self.cpu.bus.cycles < cap {
+            self.cpu.step();
+        }
+        self.cpu.bus.ppu.skip_render = false;
+    }
 }
 
 impl Core for GameBoy {
@@ -124,6 +139,7 @@ impl Core for GameBoy {
             self.cpu.bus.intf |= bus::IF_JOYPAD;
         }
         self.cpu.bus.ppu.frame_ready = false;
+        self.cpu.bus.ppu.skip_render = false;
         let cap = self.cpu.bus.cycles + CYCLES_PER_FRAME;
         while !self.cpu.bus.ppu.frame_ready && self.cpu.bus.cycles < cap {
             self.cpu.step();

@@ -973,6 +973,7 @@ pub fn restore_snapshot<B: Bus>(
             .and_then(|us| super::bus::TouchCalibration::from_user_settings(&us))
             .or(touch_cal);
         mm.save_dirty = false;
+        mm.rebuild_vram_lut();
     }
     cpu9.restore(c9);
     cpu7.restore(c7);

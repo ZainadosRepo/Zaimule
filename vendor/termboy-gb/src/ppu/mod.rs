@@ -44,6 +44,10 @@ pub struct Ppu {
     pub frame_ready: bool,
     /// Set on mode-0 (hblank) entry; consumed by the bus for HBlank DMA.
     pub hblank_pulse: bool,
+    /// Skip pixel scanline rendering during intermediate fast-forward frames.
+    pub skip_render: bool,
+    /// Set when STAT/LYC/LCDC changes mid-scanline so tick_n evaluates STAT IRQ immediately.
+    pub stat_dirty: bool,
     // CGB palette RAM: 8 palettes x 4 colors x 2 bytes, BG and OBJ
     pub(crate) bg_pal: [u8; 64],
     pub(crate) obj_pal: [u8; 64],
@@ -77,6 +81,8 @@ impl Ppu {
             frame_rgb: vec![0; 160 * 144],
             frame_ready: false,
             hblank_pulse: false,
+            skip_render: false,
+            stat_dirty: false,
             bg_pal: [0xFF; 64],
             obj_pal: [0xFF; 64],
             bcps: 0,
@@ -108,10 +114,42 @@ impl Ppu {
             }
         }
         if self.dot == 252 && self.ly < 144 {
-            self.render_line(); // entering hblank: line is complete on real HW
+            if !self.skip_render {
+                self.render_line(); // entering hblank: line is complete on real HW
+            }
             self.hblank_pulse = true;
         }
+        self.stat_dirty = false;
         irq | self.update_stat()
+    }
+
+    /// Fast-batched advance for `n` T-cycles (`2` in CGB double-speed, `4` otherwise),
+    /// skipping redundant per-dot state checks when staying strictly inside a PPU mode span.
+    #[inline(always)]
+    pub fn tick_n(&mut self, n: u16) -> u8 {
+        if self.lcdc & LCDC_LCD_ON == 0 {
+            return 0;
+        }
+        let d = self.dot;
+        let next = d + n;
+        let in_span = if self.ly >= 144 {
+            next < 456
+        } else {
+            next < 80 || (d >= 80 && next < 252) || (d >= 252 && next < 456)
+        };
+        if in_span {
+            self.dot = next;
+            if self.stat_dirty {
+                self.stat_dirty = false;
+                return self.update_stat();
+            }
+            return 0;
+        }
+        let mut irq = 0;
+        for _ in 0..n {
+            irq |= self.tick();
+        }
+        irq
     }
 
     fn mode(&self) -> u8 {

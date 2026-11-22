@@ -41,6 +41,14 @@ struct StepViewportOptions {
     include_debug_meta: Option<bool>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UiPreferencesExtras {
+    nds_hd_scale: Option<u8>,
+    viewport_integer_scale: Option<bool>,
+    rewind_enabled: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SwitchSessionEndedEvent {
@@ -243,69 +251,87 @@ fn preload_disk_assets_for_game(app: &AppHandle, session: &mut EmulatorSession, 
 }
 
 #[tauri::command]
-fn get_station_bootstrap(state: tauri::State<AppState>) -> Result<StationBootstrap, String> {
-    let mut session = state
-        .session
-        .lock()
-        .map_err(|_| "verrou session indisponible".to_string())?;
-    session.sync_active_sram();
-    Ok(session.bootstrap_snapshot())
+async fn get_station_bootstrap(
+    state: tauri::State<'_, AppState>,
+) -> Result<StationBootstrap, String> {
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || -> Result<StationBootstrap, String> {
+        let mut session = session_arc
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        session.sync_active_sram();
+        Ok(session.bootstrap_snapshot())
+    })
+    .await
+    .map_err(|e| format!("tâche bootstrap interrompue : {e}"))?
 }
 
 #[tauri::command]
-fn select_game(
+async fn select_game(
     app: AppHandle,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
     game_id: String,
 ) -> Result<StationBootstrap, String> {
-    let mut session = state
-        .session
-        .lock()
-        .map_err(|_| "verrou session indisponible".to_string())?;
-    flush_sram_best_effort(&app, &mut session);
-    session.select_game(&game_id)?;
-    preload_disk_assets_for_game(&app, &mut session, &game_id);
-    let _ = session.take_playtime_dirty();
-    persist_library_best_effort(&app, &session);
-    Ok(session.bootstrap_snapshot())
-}
-
-#[tauri::command]
-fn reset_active_game(
-    app: AppHandle,
-    state: tauri::State<AppState>,
-) -> Result<StationBootstrap, String> {
-    let mut session = state
-        .session
-        .lock()
-        .map_err(|_| "verrou session indisponible".to_string())?;
-    flush_sram_best_effort(&app, &mut session);
-    let snap = session.reset_active_game()?;
-    if session.take_playtime_dirty() {
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || -> Result<StationBootstrap, String> {
+        let mut session = session_arc
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        flush_sram_best_effort(&app, &mut session);
+        session.select_game(&game_id)?;
+        preload_disk_assets_for_game(&app, &mut session, &game_id);
+        let _ = session.take_playtime_dirty();
         persist_library_best_effort(&app, &session);
-    }
-    Ok(snap)
+        Ok(session.bootstrap_snapshot())
+    })
+    .await
+    .map_err(|e| format!("tâche sélection jeu interrompue : {e}"))?
 }
 
 #[tauri::command]
-fn import_rom_file(
+async fn reset_active_game(
     app: AppHandle,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
+) -> Result<StationBootstrap, String> {
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || -> Result<StationBootstrap, String> {
+        let mut session = session_arc
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        flush_sram_best_effort(&app, &mut session);
+        let snap = session.reset_active_game()?;
+        if session.take_playtime_dirty() {
+            persist_library_best_effort(&app, &session);
+        }
+        Ok(snap)
+    })
+    .await
+    .map_err(|e| format!("tâche réinitialisation interrompue : {e}"))?
+}
+
+#[tauri::command]
+async fn import_rom_file(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
     file_name: String,
     bytes: Vec<u8>,
 ) -> Result<StationBootstrap, String> {
-    let mut session = state
-        .session
-        .lock()
-        .map_err(|_| "verrou session indisponible".to_string())?;
-    flush_sram_best_effort(&app, &mut session);
-    let snap = session.import_custom_rom(&file_name, &bytes)?;
-    if let Ok(rom_path) = rom_archive_path(&app, &snap.active_game_id) {
-        let _ = save_rom_binary_atomic(&rom_path, &bytes);
-    }
-    preload_disk_assets_for_game(&app, &mut session, &snap.active_game_id);
-    persist_library_best_effort(&app, &session);
-    Ok(session.bootstrap_snapshot())
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || -> Result<StationBootstrap, String> {
+        let mut session = session_arc
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        flush_sram_best_effort(&app, &mut session);
+        let snap = session.import_custom_rom(&file_name, &bytes)?;
+        if let Ok(rom_path) = rom_archive_path(&app, &snap.active_game_id) {
+            let _ = save_rom_binary_atomic(&rom_path, &bytes);
+        }
+        preload_disk_assets_for_game(&app, &mut session, &snap.active_game_id);
+        persist_library_best_effort(&app, &session);
+        Ok(session.bootstrap_snapshot())
+    })
+    .await
+    .map_err(|e| format!("tâche importation ROM interrompue : {e}"))?
 }
 
 #[tauri::command]
@@ -696,22 +722,42 @@ fn update_game_override(
 }
 
 #[tauri::command]
-fn update_ui_preferences(
+async fn update_ui_preferences(
     app: AppHandle,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
     shader_css: Option<String>,
     upscaler_mode: Option<String>,
     speed_multiplier: Option<u8>,
     nds_layout: Option<String>,
+    extras: Option<UiPreferencesExtras>,
 ) -> Result<StationBootstrap, String> {
-    let mut session = state
-        .session
-        .lock()
-        .map_err(|_| "verrou session indisponible".to_string())?;
-    let snap =
-        session.update_ui_preferences(shader_css, upscaler_mode, speed_multiplier, nds_layout);
-    persist_settings_best_effort(&app, &mut session);
-    Ok(snap)
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || -> Result<StationBootstrap, String> {
+        let mut session = session_arc
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        let (nds_3d_scale, viewport_integer_scale, rewind_enabled) = match extras {
+            Some(ex) => (
+                ex.nds_hd_scale,
+                ex.viewport_integer_scale,
+                ex.rewind_enabled,
+            ),
+            None => (None, None, None),
+        };
+        let snap = session.update_ui_preferences_extended(
+            shader_css,
+            upscaler_mode,
+            speed_multiplier,
+            nds_layout,
+            nds_3d_scale,
+            viewport_integer_scale,
+            rewind_enabled,
+        );
+        persist_settings_best_effort(&app, &mut session);
+        Ok(snap)
+    })
+    .await
+    .map_err(|e| format!("tâche préférences interrompue : {e}"))?
 }
 
 #[tauri::command]
@@ -1016,11 +1062,10 @@ fn save_settings(
 
 fn import_paths_impl(
     app: &AppHandle,
-    state: &AppState,
+    session_arc: &Arc<Mutex<EmulatorSession>>,
     paths: Vec<PathBuf>,
 ) -> Result<StationBootstrap, String> {
-    let mut session = state
-        .session
+    let mut session = session_arc
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
     flush_sram_best_effort(app, &mut session);
@@ -1113,11 +1158,10 @@ fn import_paths_impl(
 
 fn scan_directory_impl(
     app: &AppHandle,
-    state: &AppState,
+    session_arc: &Arc<Mutex<EmulatorSession>>,
     dir: PathBuf,
 ) -> Result<StationBootstrap, String> {
-    let mut session = state
-        .session
+    let mut session = session_arc
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
     flush_sram_best_effort(app, &mut session);
@@ -1179,7 +1223,10 @@ async fn pick_and_import_roms(
     if paths.is_empty() {
         return Err("aucun chemin de fichier valide sélectionné".into());
     }
-    import_paths_impl(&app, &state, paths)
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || import_paths_impl(&app, &session_arc, paths))
+        .await
+        .map_err(|e| format!("tâche importation interrompue : {e}"))?
 }
 
 #[tauri::command]
@@ -1208,29 +1255,40 @@ async fn pick_and_scan_folder(
     let dir = folder
         .into_path()
         .map_err(|e| format!("dossier sélectionné invalide : {e}"))?;
-    scan_directory_impl(&app, &state, dir)
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || scan_directory_impl(&app, &session_arc, dir))
+        .await
+        .map_err(|e| format!("tâche scan dossier interrompue : {e}"))?
 }
 
 #[tauri::command]
-fn import_rom_paths(
+async fn import_rom_paths(
     app: AppHandle,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<StationBootstrap, String> {
     if paths.is_empty() {
         return Err("aucun fichier ou dossier reçu".into());
     }
     let path_bufs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-    import_paths_impl(&app, &state, path_bufs)
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || import_paths_impl(&app, &session_arc, path_bufs))
+        .await
+        .map_err(|e| format!("tâche importation chemins interrompue : {e}"))?
 }
 
 #[tauri::command]
-fn scan_rom_directory(
+async fn scan_rom_directory(
     app: AppHandle,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
     dir_path: String,
 ) -> Result<StationBootstrap, String> {
-    scan_directory_impl(&app, &state, PathBuf::from(dir_path))
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || {
+        scan_directory_impl(&app, &session_arc, PathBuf::from(dir_path))
+    })
+    .await
+    .map_err(|e| format!("tâche scan dossier interrompue : {e}"))?
 }
 
 #[tauri::command]
@@ -1250,80 +1308,96 @@ fn remove_rom_directory(
 }
 
 #[tauri::command]
-fn rescan_all_rom_directories(
+async fn rescan_all_rom_directories(
     app: AppHandle,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
 ) -> Result<StationBootstrap, String> {
-    let mut session = state
-        .session
-        .lock()
-        .map_err(|_| "verrou session indisponible".to_string())?;
-    flush_sram_best_effort(&app, &mut session);
-    let prev_active = session.active_game_id.clone();
-    let report = session.rescan_all_rom_directories();
-    if session.active_game_id != prev_active {
-        let active_id = session.active_game_id.clone();
-        preload_disk_assets_for_game(&app, &mut session, &active_id);
-    }
-    let _ = session.take_playtime_dirty();
-    persist_library_best_effort(&app, &session);
-    persist_settings_best_effort(&app, &mut session);
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || -> Result<StationBootstrap, String> {
+        let mut session = session_arc
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        flush_sram_best_effort(&app, &mut session);
+        let prev_active = session.active_game_id.clone();
+        let report = session.rescan_all_rom_directories();
+        if session.active_game_id != prev_active {
+            let active_id = session.active_game_id.clone();
+            preload_disk_assets_for_game(&app, &mut session, &active_id);
+        }
+        let _ = session.take_playtime_dirty();
+        persist_library_best_effort(&app, &session);
+        persist_settings_best_effort(&app, &mut session);
 
-    if report.imported_entries.is_empty() && !report.errors.is_empty() {
-        return Err(report.errors.join(" · "));
-    }
-    Ok(session.bootstrap_snapshot())
+        if report.imported_entries.is_empty() && !report.errors.is_empty() {
+            return Err(report.errors.join(" · "));
+        }
+        Ok(session.bootstrap_snapshot())
+    })
+    .await
+    .map_err(|e| format!("tâche rescan dossiers interrompue : {e}"))?
 }
 
 #[tauri::command]
-fn remove_game_from_library(
+async fn remove_game_from_library(
     app: AppHandle,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
     game_id: String,
 ) -> Result<StationBootstrap, String> {
-    let mut session = state
-        .session
-        .lock()
-        .map_err(|_| "verrou session indisponible".to_string())?;
-    flush_sram_best_effort(&app, &mut session);
-    let snap = session.remove_game(&game_id)?;
-    if let Ok(rp) = rom_archive_path(&app, &game_id) {
-        let _ = fs::remove_file(rp);
-    }
-    persist_library_best_effort(&app, &session);
-    Ok(snap)
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || -> Result<StationBootstrap, String> {
+        let mut session = session_arc
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        flush_sram_best_effort(&app, &mut session);
+        let snap = session.remove_game(&game_id)?;
+        if let Ok(rp) = rom_archive_path(&app, &game_id) {
+            let _ = fs::remove_file(rp);
+        }
+        persist_library_best_effort(&app, &session);
+        Ok(snap)
+    })
+    .await
+    .map_err(|e| format!("tâche suppression jeu interrompue : {e}"))?
 }
 
 #[tauri::command]
-fn toggle_game_favorite(
+async fn toggle_game_favorite(
     app: AppHandle,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
     game_id: String,
 ) -> Result<StationBootstrap, String> {
-    let mut session = state
-        .session
-        .lock()
-        .map_err(|_| "verrou session indisponible".to_string())?;
-    let snap = session.toggle_game_favorite(&game_id)?;
-    persist_library_best_effort(&app, &session);
-    Ok(snap)
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || -> Result<StationBootstrap, String> {
+        let mut session = session_arc
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        let snap = session.toggle_game_favorite(&game_id)?;
+        persist_library_best_effort(&app, &session);
+        Ok(snap)
+    })
+    .await
+    .map_err(|e| format!("tâche favori interrompue : {e}"))?
 }
 
 #[tauri::command]
-fn import_bios_paths(
-    state: tauri::State<AppState>,
+async fn import_bios_paths(
+    state: tauri::State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<BiosImportResponse, String> {
     if paths.is_empty() {
         return Err("aucun fichier BIOS ou firmware sélectionné".into());
     }
     let path_bufs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-    let mut session = state
-        .session
-        .lock()
-        .map_err(|_| "verrou session indisponible".to_string())?;
-    let (report, bootstrap) = session.import_bios_paths(&path_bufs)?;
-    Ok(BiosImportResponse { report, bootstrap })
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || -> Result<BiosImportResponse, String> {
+        let mut session = session_arc
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        let (report, bootstrap) = session.import_bios_paths(&path_bufs)?;
+        Ok(BiosImportResponse { report, bootstrap })
+    })
+    .await
+    .map_err(|e| format!("tâche importation BIOS interrompue : {e}"))?
 }
 
 #[tauri::command]
@@ -1377,10 +1451,11 @@ async fn pick_and_import_bios(
     .await
     .map_err(|e| format!("échec importation BIOS : {e}"))??;
 
-    let session = state
+    let mut session = state
         .session
         .lock()
         .map_err(|_| "verrou session indisponible".to_string())?;
+    session.refresh_bios_cache();
     Ok(BiosImportResponse {
         report,
         bootstrap: session.bootstrap_snapshot(),

@@ -63,3 +63,13 @@ test("FramePacer reset clears accumulated state and handles backward timestamps 
   pacer.reset();
   assert.equal(pacer.advance(500, 60).shouldStep, true);
 });
+
+test("FramePacer does not stutter on frame 2 on a 60 Hz display against 59.7275 Hz GBA refresh", () => {
+  const pacer = new FramePacer();
+  const gbaFps = targetFpsForConsole("GBA");
+  const tick60Hz = 1000 / 60;
+  for (let i = 0; i < 10; i++) {
+    const res = pacer.advance(i * tick60Hz, gbaFps);
+    assert.equal(res.shouldStep, true, `60Hz tick #${i} should step smoothly without early drop`);
+  }
+});

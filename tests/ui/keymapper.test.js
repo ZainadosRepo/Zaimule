@@ -119,6 +119,11 @@ test("mapCanvasToNdsStylus rejects top screen and maps touchscreen accurately ac
   assert.deepEqual(mapCanvasToNdsStylus(0.5, 0.5, "horizontal-swapped"), { onBottomScreen: false, x: 0, y: 0 });
   assert.deepEqual(mapCanvasToNdsStylus(0.75, 0.5, "horizontal-swapped"), { onBottomScreen: false, x: 0, y: 0 });
   assert.deepEqual(mapCanvasToNdsStylus(0.25, 0.5, "horizontal-swapped"), { onBottomScreen: true, x: 128, y: 96 });
+
+  // Hybrid (main = 0..2/3 X, touch = 2/3..1.0 X & 0.25..0.75 Y)
+  assert.deepEqual(mapCanvasToNdsStylus(0.4, 0.5, "hybrid"), { onBottomScreen: false, x: 0, y: 0 });
+  assert.deepEqual(mapCanvasToNdsStylus(0.8, 0.1, "hybrid"), { onBottomScreen: false, x: 0, y: 0 });
+  assert.deepEqual(mapCanvasToNdsStylus(5 / 6, 0.5, "hybrid"), { onBottomScreen: true, x: 128, y: 96 });
 });
 
 test("sanitizeApuFrequency validates audible chiptune frequencies", () => {

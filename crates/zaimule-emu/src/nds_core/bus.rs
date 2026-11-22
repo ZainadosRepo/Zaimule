@@ -171,6 +171,14 @@ pub trait Bus {
     fn has_debug_hooks(&self) -> bool {
         true
     }
+    #[inline(always)]
+    fn fetch16(&mut self, pc: u32) -> u16 {
+        self.read16(pc)
+    }
+    #[inline(always)]
+    fn fetch32(&mut self, pc: u32) -> u32 {
+        self.read32(pc)
+    }
     /// Address of the BIOS interrupt-flag mirror word games' IRQ handlers
     /// update (top of DTCM on the ARM9, top of ARM7 WRAM on the ARM7).
     fn bios_flag_addr(&mut self) -> u32;
@@ -497,6 +505,12 @@ pub struct Machine {
     /// Active touchscreen calibration extracted from loaded firmware user settings (skipped in savestates).
     #[serde(skip)]
     pub touch_cal: Option<TouchCalibration>,
+    /// Cached 16 KiB-page ARM9 VRAM lookup table covering `0x0600_0000..0x068B_FFFF` (`(bank, base_off)` or `(0xFF, 0)`).
+    #[serde(skip)]
+    vram_arm9_lut: Vec<(u8, u32)>,
+    /// Snapshot of `vramcnt` used to build `vram_arm9_lut` (for safe cache coherence).
+    #[serde(skip)]
+    vram_lut_sig: [u8; 9],
 }
 
 /// Two-point touchscreen ADC calibration derived from firmware user settings (`0x58..0x64`).
@@ -815,6 +829,8 @@ impl Machine {
             bios9: None,
             custom_firmware: false,
             touch_cal: None,
+            vram_arm9_lut: vec![(0xFF, 0); 560],
+            vram_lut_sig: [0; 9],
             wifi: vec![0; 0x1_0000],
             rtc_reg: 0,
             rtc_bit_n: 0,
@@ -861,9 +877,13 @@ impl Machine {
     /// Advance all timers by `cycles` bus clocks (33MHz domain, both CPUs).
     pub fn tick_timers(&mut self, cycles: u32) {
         for cpu in 0..2 {
+            let cnts = self.timer_cnt[cpu];
+            if (cnts[0] | cnts[1] | cnts[2] | cnts[3]) & 0x80 == 0 {
+                continue;
+            }
             let mut overflows = 0u32;
             for n in 0..4 {
-                let cnt = self.timer_cnt[cpu][n];
+                let cnt = cnts[n];
                 if cnt & 0x80 == 0 {
                     overflows = 0;
                     continue;
@@ -1445,8 +1465,49 @@ impl Machine {
         self.if_[cpu] |= bit;
     }
 
-    /// Resolve a 0x06xxxxxx address to (bank, offset) per VRAMCNT.
-    pub fn vram_slot(&self, addr: u32) -> Option<(usize, usize)> {
+    /// Rebuild the O(1) 16 KiB-page ARM9 VRAM lookup table whenever `vramcnt` changes.
+    pub fn rebuild_vram_lut(&mut self) {
+        if self.vram_arm9_lut.len() != 560 {
+            self.vram_arm9_lut.resize(560, (0xFF, 0));
+        } else {
+            self.vram_arm9_lut.fill((0xFF, 0));
+        }
+        // Scan in reverse bank order so lower bank indices win (matching `vram_slot_slow`).
+        for i in (0..9).rev() {
+            let cnt = self.vramcnt[i];
+            if cnt & 0x80 == 0 {
+                continue;
+            }
+            let mst = (cnt & 7) as u32;
+            let ofs = (cnt >> 3 & 3) as u32;
+            let base = match (i, mst) {
+                (_, 0) => LCDC_BASE[i],
+                (0..=3, 1) => 0x0600_0000 + ofs * 0x20000,
+                (0..=1, 2) => 0x0640_0000 + (ofs & 1) * 0x20000,
+                (2, 4) => 0x0620_0000,
+                (3, 4) => 0x0660_0000,
+                (4, 1) => 0x0600_0000,
+                (4, 2) => 0x0640_0000,
+                (5 | 6, 1) => 0x0600_0000 + (ofs & 1) * 0x4000 + (ofs >> 1) * 0x10000,
+                (5 | 6, 2) => 0x0640_0000 + (ofs & 1) * 0x4000 + (ofs >> 1) * 0x10000,
+                (7, 1) => 0x0620_0000,
+                (8, 1) => 0x0620_8000,
+                (8, 2) => 0x0660_0000,
+                _ => continue,
+            };
+            let pages = BANK_SIZE[i] >> 14;
+            let start_page = ((base - 0x0600_0000) >> 14) as usize;
+            for p in 0..pages {
+                if let Some(slot) = self.vram_arm9_lut.get_mut(start_page + p) {
+                    *slot = (i as u8, (p as u32) << 14);
+                }
+            }
+        }
+        self.vram_lut_sig = self.vramcnt;
+    }
+
+    #[cold]
+    fn vram_slot_slow(&self, addr: u32) -> Option<(usize, usize)> {
         for i in 0..9 {
             let cnt = self.vramcnt[i];
             if cnt & 0x80 == 0 {
@@ -1457,8 +1518,6 @@ impl Machine {
             let base = match (i, mst) {
                 (_, 0) => LCDC_BASE[i],
                 (0..=3, 1) => 0x0600_0000 + ofs * 0x20000,
-                // MST 2 = engine-A OBJ only for banks A/B; for C/D it hands
-                // the bank to the ARM7 (vram_arm7_slot), not the ARM9.
                 (0..=1, 2) => 0x0640_0000 + (ofs & 1) * 0x20000,
                 (2, 4) => 0x0620_0000,
                 (3, 4) => 0x0660_0000,
@@ -1477,6 +1536,22 @@ impl Machine {
             }
         }
         None
+    }
+
+    /// Resolve a 0x06xxxxxx address to (bank, offset) per VRAMCNT in O(1) via the cached page table.
+    #[inline(always)]
+    pub fn vram_slot(&self, addr: u32) -> Option<(usize, usize)> {
+        if self.vram_lut_sig == self.vramcnt && self.vram_arm9_lut.len() == 560 {
+            let page = (addr.wrapping_sub(0x0600_0000) >> 14) as usize;
+            if page < 560 {
+                let (bank, base) = self.vram_arm9_lut[page];
+                if bank < 9 {
+                    return Some((bank as usize, base as usize + (addr as usize & 0x3FFF)));
+                }
+            }
+            return None;
+        }
+        self.vram_slot_slow(addr)
     }
 
     /// Banks C and D with MST=2 are handed to the ARM7 as work RAM at
@@ -2241,22 +2316,27 @@ impl View {
             0x0240 if cpu == 0 => {
                 m.vramcnt[0] = v as u8;
                 m.vramcnt[1] = (v >> 8) as u8;
+                m.rebuild_vram_lut();
             }
             0x0242 if cpu == 0 => {
                 m.vramcnt[2] = v as u8;
                 m.vramcnt[3] = (v >> 8) as u8;
+                m.rebuild_vram_lut();
             }
             0x0244 if cpu == 0 => {
                 m.vramcnt[4] = v as u8;
                 m.vramcnt[5] = (v >> 8) as u8;
+                m.rebuild_vram_lut();
             }
             0x0246 if cpu == 0 => {
                 m.vramcnt[6] = v as u8;
                 m.wramcnt = (v >> 8) as u8;
+                m.rebuild_vram_lut();
             }
             0x0248 if cpu == 0 => {
                 m.vramcnt[7] = v as u8;
                 m.vramcnt[8] = (v >> 8) as u8;
+                m.rebuild_vram_lut();
             }
             0x0280 if cpu == 0 => {
                 m.divcnt = v & 3;
@@ -3020,6 +3100,67 @@ impl Bus for View {
             return;
         }
         self.write32_slow(a, v);
+    }
+
+    #[inline(always)]
+    fn fetch16(&mut self, a: u32) -> u16 {
+        let a = a & !1;
+        {
+            let m = self.m.borrow();
+            if !m.debug_hooks {
+                if a >> 24 == 0x02 && (self.cpu == 1 || a.wrapping_sub(m.dtcm_base) >= 0x4000) {
+                    let off = (a & 0x3F_FFFF) as usize;
+                    return u16::from_le_bytes([m.main_ram[off], m.main_ram[off + 1]]);
+                }
+                if self.cpu == 0 && a < 0x0200_0000 && a.wrapping_sub(m.dtcm_base) >= 0x4000 {
+                    let off = (a & 0x7FFF) as usize;
+                    return u16::from_le_bytes([m.itcm[off], m.itcm[off + 1]]);
+                }
+                if self.cpu == 1 && a >= 0x0380_0000 && a < 0x0400_0000 {
+                    let off = (a & 0xFFFF) as usize;
+                    return u16::from_le_bytes([m.wram7[off], m.wram7[off + 1]]);
+                }
+            }
+        }
+        self.read16(a)
+    }
+
+    #[inline(always)]
+    fn fetch32(&mut self, a: u32) -> u32 {
+        let a = a & !3;
+        {
+            let m = self.m.borrow();
+            if !m.debug_hooks {
+                if a >> 24 == 0x02 && (self.cpu == 1 || a.wrapping_sub(m.dtcm_base) >= 0x4000) {
+                    let off = (a & 0x3F_FFFF) as usize;
+                    return u32::from_le_bytes([
+                        m.main_ram[off],
+                        m.main_ram[off + 1],
+                        m.main_ram[off + 2],
+                        m.main_ram[off + 3],
+                    ]);
+                }
+                if self.cpu == 0 && a < 0x0200_0000 && a.wrapping_sub(m.dtcm_base) >= 0x4000 {
+                    let off = (a & 0x7FFF) as usize;
+                    return u32::from_le_bytes([
+                        m.itcm[off],
+                        m.itcm[off + 1],
+                        m.itcm[off + 2],
+                        m.itcm[off + 3],
+                    ]);
+                }
+                if self.cpu == 1 && a >= 0x0380_0000 && a < 0x0400_0000 {
+                    let off = (a & 0xFFFF) as usize;
+                    return u32::from_le_bytes([
+                        m.wram7[off],
+                        m.wram7[off + 1],
+                        m.wram7[off + 2],
+                        m.wram7[off + 3],
+                    ]);
+                }
+            }
+        }
+        self.read32(a)
     }
 
     #[inline(always)]

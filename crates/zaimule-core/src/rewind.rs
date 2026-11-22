@@ -30,65 +30,83 @@ pub struct RewindFrameEntry {
     pub compressed_payload: Vec<u8>,
 }
 
+/// Default RAM ceiling for the circular rewind ring-buffer (48 MiB).
+pub const DEFAULT_REWIND_MAX_BYTES: usize = 48 * 1024 * 1024;
+
 /// Circular rewind buffer holding compressed emulator snapshots over a configurable time horizon.
 #[derive(Debug, Clone)]
 pub struct RewindBuffer {
     max_entries: usize,
+    max_memory_bytes: usize,
+    total_bytes: usize,
     entries: VecDeque<RewindFrameEntry>,
 }
 
 impl RewindBuffer {
     pub fn new(max_entries: usize) -> Self {
+        Self::with_budget(max_entries, DEFAULT_REWIND_MAX_BYTES)
+    }
+
+    pub fn with_budget(max_entries: usize, max_memory_bytes: usize) -> Self {
+        let cap = max_entries.max(4);
         Self {
-            max_entries: max_entries.max(4),
-            entries: VecDeque::with_capacity(max_entries.max(4)),
+            max_entries: cap,
+            max_memory_bytes: max_memory_bytes.max(64),
+            total_bytes: 0,
+            entries: VecDeque::with_capacity(cap),
+        }
+    }
+
+    #[inline]
+    fn entry_footprint(entry: &RewindFrameEntry) -> usize {
+        entry.compressed_payload.len() + 32
+    }
+
+    fn evict_to_budget(&mut self, incoming_bytes: usize) {
+        while self.entries.len() >= self.max_entries {
+            if let Some(old) = self.entries.pop_front() {
+                self.total_bytes = self.total_bytes.saturating_sub(Self::entry_footprint(&old));
+            }
+        }
+        while !self.entries.is_empty()
+            && self.total_bytes.saturating_add(incoming_bytes) > self.max_memory_bytes
+        {
+            if let Some(old) = self.entries.pop_front() {
+                self.total_bytes = self.total_bytes.saturating_sub(Self::entry_footprint(&old));
+            }
         }
     }
 
     /// Captures and compresses a raw emulator state snapshot at `frame`.
     /// Payloads already carrying their own RLE+CRC32 container (`"ZMND"`) are stored directly
-    /// to avoid double-compressing multi-megabyte NDS savestates.
+    /// to avoid double-compressing and double-hashing multi-megabyte NDS savestates.
     pub fn push_snapshot(&mut self, frame: u64, raw_state: &[u8]) {
-        if self.entries.len() >= self.max_entries {
-            self.entries.pop_front();
-        }
-        let already_compressed = raw_state.starts_with(b"ZMND");
-        let compressed = if already_compressed {
-            raw_state.to_vec()
-        } else {
-            rle_compress(raw_state)
-        };
-        let crc = compute_crc32(raw_state);
-        self.entries.push_back(RewindFrameEntry {
-            frame,
-            uncompressed_len: raw_state.len(),
-            crc32: crc,
-            already_compressed,
-            compressed_payload: compressed,
-        });
+        self.push_snapshot_owned(frame, raw_state.to_vec());
     }
 
     /// Owned counterpart of [`Self::push_snapshot`] that moves already-compressed `"ZMND"`
-    /// containers without an extra allocation or copy.
+    /// containers without an extra allocation, copy, or redundant CRC32 pass.
     pub fn push_snapshot_owned(&mut self, frame: u64, raw_state: Vec<u8>) {
-        if self.entries.len() >= self.max_entries {
-            self.entries.pop_front();
-        }
-        let already_compressed = raw_state.starts_with(b"ZMND");
+        let already_compressed = raw_state.len() >= 13 && raw_state.starts_with(b"ZMND");
         let uncompressed_len = raw_state.len();
-        let crc = compute_crc32(&raw_state);
-        let compressed = if already_compressed {
-            raw_state
+        let (crc, compressed) = if already_compressed {
+            let embedded_crc = u32::from_le_bytes(raw_state[9..13].try_into().unwrap());
+            (embedded_crc, raw_state)
         } else {
-            rle_compress(&raw_state)
+            let crc = compute_crc32(&raw_state);
+            (crc, rle_compress(&raw_state))
         };
-        self.entries.push_back(RewindFrameEntry {
+        let entry = RewindFrameEntry {
             frame,
             uncompressed_len,
             crc32: crc,
             already_compressed,
             compressed_payload: compressed,
-        });
+        };
+        let foot = Self::entry_footprint(&entry);
+        self.evict_to_budget(foot);
+        self.total_bytes = self.total_bytes.saturating_add(foot);
+        self.entries.push_back(entry);
     }
 
     /// Pops and decompresses the state `steps_back` snapshots in the past, verifying its CRC32.
@@ -98,16 +116,24 @@ impl RewindBuffer {
         }
         let drop_count = steps_back.min(self.entries.len().saturating_sub(1));
         for _ in 0..drop_count {
-            self.entries.pop_back();
+            if let Some(old) = self.entries.pop_back() {
+                self.total_bytes = self.total_bytes.saturating_sub(Self::entry_footprint(&old));
+            }
         }
         let Some(target) = self.entries.back() else {
             return Ok(None);
         };
-        let raw = if target.already_compressed {
-            target.compressed_payload.clone()
-        } else {
-            rle_decompress(&target.compressed_payload, target.uncompressed_len)?
-        };
+        if target.already_compressed {
+            if target.compressed_payload.len() < 13
+                || !target.compressed_payload.starts_with(b"ZMND")
+                || u32::from_le_bytes(target.compressed_payload[9..13].try_into().unwrap())
+                    != target.crc32
+            {
+                return Err("intégrité du snapshot de rewind compromise (CRC32 invalide)".into());
+            }
+            return Ok(Some((target.frame, target.compressed_payload.clone())));
+        }
+        let raw = rle_decompress(&target.compressed_payload, target.uncompressed_len)?;
         if compute_crc32(&raw) != target.crc32 {
             return Err("intégrité du snapshot de rewind compromise (CRC32 invalide)".into());
         }
@@ -124,14 +150,12 @@ impl RewindBuffer {
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.total_bytes = 0;
     }
 
-    /// Total RAM footprint used by all compressed snapshots in bytes.
+    /// Total RAM footprint used by all compressed snapshots in bytes (O(1)).
     pub fn memory_usage_bytes(&self) -> usize {
-        self.entries
-            .iter()
-            .map(|e| e.compressed_payload.len() + 32)
-            .sum()
+        self.total_bytes
     }
 
     pub fn oldest_and_newest_frame(&self) -> Option<(u64, u64)> {
@@ -274,5 +298,32 @@ mod tests {
         let (frame, state) = buf.rewind_steps(1).unwrap().unwrap();
         assert_eq!(frame, 120);
         assert_eq!(state, vec![2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn rewind_buffer_enforces_memory_budget_and_handles_zmnd_packets_zero_copy() {
+        let mut buf = RewindBuffer::with_budget(10, 120);
+        let mut zmnd1 = b"ZMND\x01\x10\x00\x00\x00\xAA\xBB\xCC\xDD".to_vec();
+        zmnd1.extend_from_slice(&[0x11; 7]); // 20 bytes payload + 32 bytes struct = 52 bytes
+        let mut zmnd2 = b"ZMND\x01\x10\x00\x00\x00\x12\x34\x56\x78".to_vec();
+        zmnd2.extend_from_slice(&[0x22; 7]);
+        let mut zmnd3 = b"ZMND\x01\x10\x00\x00\x00\x99\x88\x77\x66".to_vec();
+        zmnd3.extend_from_slice(&[0x33; 7]);
+
+        buf.push_snapshot_owned(60, zmnd1);
+        buf.push_snapshot_owned(120, zmnd2.clone());
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf.memory_usage_bytes(), 104);
+
+        // Pushing a 3rd 52-byte snapshot exceeds the 120-byte budget and evicts frame 60
+        buf.push_snapshot_owned(180, zmnd3);
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf.memory_usage_bytes(), 104);
+        assert_eq!(buf.oldest_and_newest_frame(), Some((120, 180)));
+
+        let (frame, restored) = buf.rewind_steps(1).unwrap().unwrap();
+        assert_eq!(frame, 120);
+        assert_eq!(restored, zmnd2);
+        assert_eq!(buf.memory_usage_bytes(), 52);
     }
 }

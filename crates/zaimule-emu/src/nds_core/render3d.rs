@@ -149,11 +149,19 @@ fn clip_plane_into(src: &[V], dst: &mut Vec<V>, dist: impl Fn(&V) -> f32) -> boo
     true
 }
 
+#[inline(always)]
+fn fast_floor(x: f32) -> i32 {
+    let i = x as i32;
+    i - i32::from(x < i as f32)
+}
+
 #[derive(Clone, Copy)]
 struct TexInfo {
     format: u32,
     tw: i32,
     th: i32,
+    tw_mask: i32,
+    th_mask: i32,
     repeat_s: bool,
     repeat_t: bool,
     flip_s: bool,
@@ -167,10 +175,14 @@ struct TexInfo {
 impl TexInfo {
     #[inline(always)]
     fn from_poly(tp: u32, pltt: u32, bias: f32) -> Self {
+        let tw = 8i32 << ((tp >> 20) & 7);
+        let th = 8i32 << ((tp >> 23) & 7);
         Self {
             format: (tp >> 26) & 7,
-            tw: 8i32 << ((tp >> 20) & 7),
-            th: 8i32 << ((tp >> 23) & 7),
+            tw,
+            th,
+            tw_mask: tw - 1,
+            th_mask: th - 1,
             repeat_s: tp & (1 << 16) != 0,
             repeat_t: tp & (1 << 17) != 0,
             flip_s: tp & (1 << 18) != 0,
@@ -185,7 +197,7 @@ impl TexInfo {
 
 /// Fast power-of-two texel coordinate wrap (`size` is always `8..=1024`).
 #[inline(always)]
-fn wrap_texcoord(c: i32, size: i32, repeat: bool, flip: bool) -> i32 {
+fn wrap_texcoord(c: i32, size: i32, mask: i32, repeat: bool, flip: bool) -> i32 {
     if repeat {
         if flip {
             let two = size << 1;
@@ -196,10 +208,10 @@ fn wrap_texcoord(c: i32, size: i32, repeat: bool, flip: bool) -> i32 {
                 m
             }
         } else {
-            c & (size - 1)
+            c & mask
         }
     } else {
-        c.clamp(0, size - 1)
+        c.clamp(0, mask)
     }
 }
 
@@ -277,14 +289,16 @@ fn sample_tex_cached(
     t: f32,
 ) -> Option<(u16, u32)> {
     let x = wrap_texcoord(
-        (s + tex.bias).floor() as i32,
+        fast_floor(s + tex.bias),
         tex.tw,
+        tex.tw_mask,
         tex.repeat_s,
         tex.flip_s,
     );
     let y = wrap_texcoord(
-        (t + tex.bias).floor() as i32,
+        fast_floor(t + tex.bias),
         tex.th,
+        tex.th_mask,
         tex.repeat_t,
         tex.flip_t,
     );
@@ -423,6 +437,16 @@ pub fn render(m: &Machine) -> Vec<u32> {
 /// Render the latched 3D frame into reusable `scratch.fb` (`WIDTH * HEIGHT` `0xRRGGBB` pixels,
 /// `TRANSPARENT` where nothing was drawn and clear alpha is 0).
 pub fn render_into(m: &Machine, scratch: &mut Render3dScratch) {
+    render_into_scaled(m, scratch, 1);
+}
+
+/// Render the latched 3D frame at `scale`× internal resolution (`1` = `256×192`, `2` = `512×384` HD)
+/// into reusable `scratch.fb` without per-frame heap allocations.
+pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usize) {
+    let scale = scale.clamp(1, 2);
+    let out_w = WIDTH * scale;
+    let out_h = HEIGHT * scale;
+    let sf = scale as f32;
     let gx = &m.gx;
     let tex_cache = TexVramCache::new(m);
     let wbuffer = gx.swap_param & 2 != 0;
@@ -433,7 +457,7 @@ pub fn render_into(m: &Machine, scratch: &mut Render3dScratch) {
     } else {
         rgb555_to_rgb(clear_rgb)
     };
-    let len = WIDTH * HEIGHT;
+    let len = out_w * out_h;
     if scratch.fb.len() != len {
         scratch.fb.resize(len, clear_px);
         scratch.depth.resize(len, 1.0);
@@ -518,11 +542,11 @@ pub fn render_into(m: &Machine, scratch: &mut Render3dScratch) {
             continue;
         }
 
-        // Project.
+        // Project (multiply by `sf` before snapping so 2x HD mode gets true sub-pixel geometry edges).
         for v in pv.iter_mut() {
             v.rw = 1.0 / v.w;
-            v.sx = (vx0 + (v.x * v.rw * 0.5 + 0.5) * vw).floor();
-            v.sy = ((HEIGHT as f32) - (vy0 + (v.y * v.rw * 0.5 + 0.5) * vh)).floor();
+            v.sx = ((vx0 + (v.x * v.rw * 0.5 + 0.5) * vw) * sf).floor();
+            v.sy = (((HEIGHT as f32) - (vy0 + (v.y * v.rw * 0.5 + 0.5) * vh)) * sf).floor();
             v.d = if wbuffer { v.w } else { v.z * v.rw * 0.5 + 0.5 };
         }
 
@@ -699,6 +723,8 @@ pub fn render_into(m: &Machine, scratch: &mut Render3dScratch) {
                 highlight_mode,
                 tex_bias,
                 pixdbg,
+                out_w,
+                out_h,
                 &mut scratch.fb,
                 &mut scratch.depth,
                 &mut scratch.poly_id,
@@ -710,17 +736,17 @@ pub fn render_into(m: &Machine, scratch: &mut Render3dScratch) {
     // Close single-pixel pinholes between adjacent fixed-point tile edges.
     if clear_px == TRANSPARENT {
         let fb = &mut scratch.fb;
-        for y in 1..HEIGHT - 1 {
-            let row = y * WIDTH;
-            for x in 1..WIDTH - 1 {
+        for y in 1..out_h - 1 {
+            let row = y * out_w;
+            for x in 1..out_w - 1 {
                 let i = row + x;
                 if fb[i] != TRANSPARENT {
                     continue;
                 }
                 let (a, b) = if fb[i - 1] != TRANSPARENT && fb[i + 1] != TRANSPARENT {
                     (fb[i - 1], fb[i + 1])
-                } else if fb[i - WIDTH] != TRANSPARENT && fb[i + WIDTH] != TRANSPARENT {
-                    (fb[i - WIDTH], fb[i + WIDTH])
+                } else if fb[i - out_w] != TRANSPARENT && fb[i + out_w] != TRANSPARENT {
+                    (fb[i - out_w], fb[i + out_w])
                 } else {
                     continue;
                 };
@@ -733,7 +759,7 @@ pub fn render_into(m: &Machine, scratch: &mut Render3dScratch) {
     }
 
     if let Some(ref p) = *DUMP3D {
-        let mut out = format!("P6\n{WIDTH} {HEIGHT}\n255\n").into_bytes();
+        let mut out = format!("P6\n{out_w} {out_h}\n255\n").into_bytes();
         for px in scratch.fb.iter() {
             let (r, g, b) = if *px == TRANSPARENT {
                 (255, 0, 255)
@@ -808,6 +834,8 @@ fn raster_poly(
     highlight_mode: bool,
     tex_bias: f32,
     pixdbg: Option<(usize, usize)>,
+    out_w: usize,
+    out_h: usize,
     fb: &mut [u32],
     depth: &mut [f32],
     poly_id: &mut [u8],
@@ -852,9 +880,9 @@ fn raster_poly(
         let ymin = p0.1.min(p1.1).min(p2.1);
         let ymax = p0.1.max(p1.1).max(p2.1);
         let px0 = (((xmin - 8) + 15).div_euclid(16)).max(0) as usize;
-        let px1 = (((xmax - 8).div_euclid(16)) + 1).clamp(0, WIDTH as i64) as usize;
+        let px1 = (((xmax - 8).div_euclid(16)) + 1).clamp(0, out_w as i64) as usize;
         let py0 = (((ymin - 8) + 15).div_euclid(16)).max(0) as usize;
-        let py1 = (((ymax - 8).div_euclid(16)) + 1).clamp(0, HEIGHT as i64) as usize;
+        let py1 = (((ymax - 8).div_euclid(16)) + 1).clamp(0, out_h as i64) as usize;
         if px0 >= px1 || py0 >= py1 {
             continue;
         }
@@ -917,7 +945,7 @@ fn raster_poly(
                     let l1 = (w1_row + k_lo * dx1) as f32 * inv;
                     let l2 = (w2_row + k_lo * dx2) as f32 * inv;
                     let mut d = l0 * d0 + l1 * d1 + l2 * d2;
-                    let row_base = py * WIDTH + px0;
+                    let row_base = py * out_w + px0;
                     let x_start = k_lo as usize;
                     let x_end = k_hi as usize;
                     if depth_equal {
@@ -952,6 +980,49 @@ fn raster_poly(
         // Fast path 2: opaque textured modulation triangle (covers the vast majority of 3D DS geometry).
         if fast_opaque_mod && textured {
             let has_tex_alpha = tex.format == 1 || tex.format == 6;
+            if flat_white && !has_tex_alpha && !depth_equal {
+                // Hottest DS 3D path: opaque unlit/white-vertex textured triangle with `<` depth test.
+                for py in py0..py1 {
+                    if let Some((k_lo, k_hi)) =
+                        row_span_k(w0_row + b0, dx0, w1_row + b1, dx1, w2_row + b2, dx2, max_k)
+                    {
+                        let l0 = (w0_row + k_lo * dx0) as f32 * inv;
+                        let l1 = (w1_row + k_lo * dx1) as f32 * inv;
+                        let l2 = (w2_row + k_lo * dx2) as f32 * inv;
+                        let mut d = l0 * d0 + l1 * d1 + l2 * d2;
+                        let mut rw = l0 * rw0 + l1 * rw1 + l2 * rw2;
+                        let mut s_acc = l0 * s0 + l1 * s1 + l2 * s2;
+                        let mut t_acc = l0 * t0 + l1 * t1 + l2 * t2;
+                        let row_base = py * out_w + px0;
+                        let x_start = k_lo as usize;
+                        let x_end = k_hi as usize;
+                        for k_px in x_start..=x_end {
+                            let i = row_base + k_px;
+                            if d < depth[i] {
+                                let inv_rw = 1.0 / rw;
+                                if let Some((tc, _)) = sample_tex_cached(
+                                    tex_cache,
+                                    &tex,
+                                    s_acc * inv_rw,
+                                    t_acc * inv_rw,
+                                ) {
+                                    depth[i] = d;
+                                    fb[i] = rgb555_to_rgb(tc);
+                                    poly_id[i] = pid;
+                                }
+                            }
+                            d += dd_dx;
+                            rw += drw_dx;
+                            s_acc += ds_dx;
+                            t_acc += dt_dx;
+                        }
+                    }
+                    w0_row += dy0;
+                    w1_row += dy1;
+                    w2_row += dy2;
+                }
+                continue;
+            }
             for py in py0..py1 {
                 if let Some((k_lo, k_hi)) =
                     row_span_k(w0_row + b0, dx0, w1_row + b1, dx1, w2_row + b2, dx2, max_k)
@@ -967,7 +1038,7 @@ fn raster_poly(
                     let mut g_acc = l0 * g0 + l1 * g1 + l2 * g2;
                     let mut b_acc = l0 * b0c + l1 * b1c + l2 * b2c;
 
-                    let row_base = py * WIDTH + px0;
+                    let row_base = py * out_w + px0;
                     let x_start = k_lo as usize;
                     let x_end = k_hi as usize;
                     for k_px in x_start..=x_end {
@@ -1051,7 +1122,7 @@ fn raster_poly(
                 let mut s_acc = l0 * s0 + l1 * s1 + l2 * s2;
                 let mut t_acc = l0 * t0 + l1 * t1 + l2 * t2;
 
-                let row_base = py * WIDTH;
+                let row_base = py * out_w;
                 let x_start = px0 + k_lo as usize;
                 let x_end = px0 + k_hi as usize;
 
@@ -1393,5 +1464,30 @@ mod tests {
         let hi_center = fb_hi[96 * WIDTH + 128];
         assert!(hi_center >> 16 & 0xFF > 60);
         assert_eq!(hi_center & 0xFF, 0xFF);
+    }
+
+    #[test]
+    fn renders_2x_hd_512x384_3d_and_composites_with_2d_ppu() {
+        let mut m = Machine::new();
+        m.rebuild_vram_lut();
+        let mod_attr = (3 << 6) | (31 << 16); // opaque modulation
+        setup_fullscreen_tri(&mut m, mod_attr, 0, 0, 31); // pure red
+
+        let mut scratch = Render3dScratch::new();
+        render_into_scaled(&m, &mut scratch, 2);
+        assert_eq!(scratch.fb.len(), (WIDTH * 2) * (HEIGHT * 2));
+        let hd_center = scratch.fb[192 * (WIDTH * 2) + 256];
+        assert_eq!(hd_center >> 16 & 0xFF, 0xFF);
+        assert_eq!(hd_center & 0xFFFF, 0);
+
+        // Enable Engine A Graphics + BG0 3D (bit 3 + bit 8) and run PPU in 2x HD mode
+        let dispcnt: u32 = 0x0001_0108;
+        m.io2d[0][0..4].copy_from_slice(&dispcnt.to_le_bytes());
+        let mut ppu = super::super::ppu::Ppu::new();
+        ppu.render_frame_scaled(&mut m, 2);
+        assert!(ppu.hd_active);
+        assert_eq!(ppu.fb_a_hd.len(), (WIDTH * 2) * (HEIGHT * 2));
+        assert_eq!(ppu.fb_a_hd[192 * (WIDTH * 2) + 256], hd_center);
+        assert_eq!(ppu.fb_a[96 * WIDTH + 128], hd_center);
     }
 }

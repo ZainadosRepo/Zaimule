@@ -5,7 +5,7 @@
 use crate::bus::Bus;
 use termboy_core::state::{Reader, StateError, Writer};
 
-const PRESCALE: [u64; 4] = [1, 64, 256, 1024];
+const PRESCALE_SHIFT: [u32; 4] = [0, 6, 8, 10];
 
 #[derive(Default, Clone, Copy)]
 pub struct Timer {
@@ -49,11 +49,10 @@ impl Bus {
             let ticks = if t > 0 && ctrl & 4 != 0 {
                 overflows
             } else {
-                self.timers[t].rem += elapsed;
-                let p = PRESCALE[(ctrl & 3) as usize];
-                let n = self.timers[t].rem / p;
-                self.timers[t].rem %= p;
-                n
+                let sh = PRESCALE_SHIFT[(ctrl & 3) as usize];
+                let total = self.timers[t].rem + elapsed;
+                self.timers[t].rem = total & ((1u64 << sh) - 1);
+                total >> sh
             };
             overflows = self.timer_advance(t, ticks);
             // Timers 0/1 clock the Direct Sound FIFOs.
@@ -78,10 +77,12 @@ impl Bus {
             if t > 0 && ctrl & 4 != 0 {
                 continue; // cascade timers only overflow when timer t-1 overflows
             }
-            let p = PRESCALE[(ctrl & 3) as usize];
+            let sh = PRESCALE_SHIFT[(ctrl & 3) as usize];
             let ticks_to_ovf = 0x1_0000u64 - self.timers[t].counter as u64;
-            let cycles_to_ovf = (ticks_to_ovf * p).saturating_sub(self.timers[t].rem).max(1);
-            earliest = earliest.min(self.cycles.saturating_add(cycles_to_ovf));
+            let cycles_to_ovf = (ticks_to_ovf << sh)
+                .saturating_sub(self.timers[t].rem)
+                .max(1);
+            earliest = earliest.min(self.timers_synced.saturating_add(cycles_to_ovf));
         }
         earliest
     }

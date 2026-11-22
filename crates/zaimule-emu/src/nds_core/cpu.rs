@@ -495,13 +495,13 @@ impl<B: Bus> Cpu<B> {
 
             let pc = self.st.regs[15];
             if self.thumb() {
-                let op = self.bus.read16(pc);
+                let op = self.bus.fetch16(pc);
                 self.exec_thumb(op);
                 if self.st.regs[15] == pc {
                     self.st.regs[15] = pc.wrapping_add(2);
                 }
             } else {
-                let op = self.bus.read32(pc);
+                let op = self.bus.fetch32(pc);
                 let c = op >> 28;
                 if c == 0xE {
                     self.exec_arm(op);

@@ -8,6 +8,20 @@
       content="Zaimule — Émulateur multi-consoles simple, rapide et haute qualité."
     />
     <title>Zaimule</title>
+    <link rel="preconnect" href="https://api.fontshare.com" crossorigin />
+    <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,600,700&display=swap"
+      media="print"
+      onload="this.media='all'"
+    />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+      media="print"
+      onload="this.media='all'"
+    />
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
@@ -408,26 +422,27 @@
               </div>
 
               <div class="dock-card">
-                <div class="section-title"><span>Qualité d'image</span></div>
+                <div class="section-title"><span>Qualité d'image (GPU WebGL2)</span></div>
 
                 <div class="setting-field">
-                  <label class="setting-field-label" for="emu-upscaler-select">Amélioration (Upscaler)</label>
+                  <label class="setting-field-label" for="emu-upscaler-select">Amélioration (Upscaler GPU)</label>
                   <select id="emu-upscaler-select" class="field-inline field-full">
-                    <option value="XBRZ">xBRZ 2x (Recommandé)</option>
+                    <option value="XBRZ">xBRZ HD GPU (Recommandé)</option>
+                    <option value="SHARP">Sharp-Bilinear (Anti-scintillement)</option>
                     <option value="SCALE2X">Scale2x EPX (Pixel-art)</option>
-                    <option value="BLOOM">CRT Bloom</option>
-                    <option value="OFF">Natif 1x</option>
+                    <option value="BLOOM">CRT Halation &amp; Bloom</option>
+                    <option value="OFF">Natif 1x (Pixels bruts)</option>
                   </select>
                 </div>
 
                 <div class="setting-field">
                   <label class="setting-field-label" for="emu-shader-select">Filtre d'écran</label>
                   <select id="emu-shader-select" class="field-inline field-full">
-                    <option value="mode-clean">Pixel-Perfect (Recommandé)</option>
-                    <option value="mode-lcd">Matrice LCD</option>
-                    <option value="mode-crt">CRT Scanlines</option>
-                    <option value="mode-trinitron">Trinitron Courbé</option>
-                    <option value="mode-dmg">Game Boy DMG Vert</option>
+                    <option value="mode-clean">Cristal HD (Recommandé)</option>
+                    <option value="mode-lcd">Grille LCD Subpixel RGB</option>
+                    <option value="mode-crt">CRT Scanlines Pro</option>
+                    <option value="mode-trinitron">Sony Trinitron PVM</option>
+                    <option value="mode-dmg">Game Boy DMG Olive</option>
                   </select>
                 </div>
 
@@ -435,10 +450,26 @@
                   <label class="setting-field-label" for="emu-nds-layout-select">Écrans Nintendo DS</label>
                   <select id="emu-nds-layout-select" class="field-inline field-full">
                     <option value="vertical">Vertical (Classique)</option>
+                    <option value="hybrid">Hybride Focus (Grand + Tactile)</option>
                     <option value="horizontal">Côte à côte</option>
                     <option value="vertical-swapped">Vertical inversé</option>
                     <option value="horizontal-swapped">Côte à côte inversé</option>
                   </select>
+                </div>
+
+                <div class="setting-field" id="emu-nds-3d-row" style="display:none;">
+                  <label class="setting-field-label" for="emu-nds-3d-scale-select">Résolution 3D Nintendo DS</label>
+                  <select id="emu-nds-3d-scale-select" class="field-inline field-full">
+                    <option value="1">Natif 1x (256×192)</option>
+                    <option value="2">Haute Définition 2x (512×384)</option>
+                  </select>
+                </div>
+
+                <div class="setting-field">
+                  <label class="setting-field-label" for="btn-emu-integer-scale">Mise à l'échelle</label>
+                  <button class="btn" id="btn-emu-integer-scale" type="button" style="width:100%; justify-content:center;">
+                    Échelle entière : OFF (Plein cadre)
+                  </button>
                 </div>
               </div>
 
@@ -569,42 +600,63 @@
               <div class="settings-group">
                 <div class="setting-row">
                   <div class="setting-copy">
-                    <div class="setting-name">Amélioration d'image (Upscaler)</div>
-                    <div class="setting-desc">Lisse les contours en haute définition (xBRZ 2x recommandé) ou conserve les pixels bruts.</div>
+                    <div class="setting-name">Amélioration d'image (Upscaler GPU)</div>
+                    <div class="setting-desc">Lisse les contours par shader GPU WebGL2 (xBRZ HD ou Sharp-Bilinear anti-scintillement) sans surcharge CPU.</div>
                   </div>
                   <select id="settings-upscaler-select" class="field-inline setting-select">
-                    <option value="XBRZ">xBRZ 2x (Recommandé)</option>
+                    <option value="XBRZ">xBRZ HD GPU (Recommandé)</option>
+                    <option value="SHARP">Sharp-Bilinear (Anti-scintillement)</option>
                     <option value="SCALE2X">Scale2x EPX (Pixel-art)</option>
-                    <option value="BLOOM">CRT Bloom</option>
-                    <option value="OFF">Natif 1x</option>
+                    <option value="BLOOM">CRT Halation &amp; Bloom</option>
+                    <option value="OFF">Natif 1x (Pixels bruts)</option>
                   </select>
                 </div>
 
                 <div class="setting-row">
                   <div class="setting-copy">
                     <div class="setting-name">Filtre d'écran</div>
-                    <div class="setting-desc">Pixel-Perfect offre les couleurs les plus fidèles et une netteté maximale.</div>
+                    <div class="setting-desc">Cristal HD offre une netteté maximale ; les filtres LCD, CRT et Trinitron simulent les écrans d'origine sur GPU.</div>
                   </div>
                   <select id="settings-shader-select" class="field-inline setting-select">
-                    <option value="mode-clean">Pixel-Perfect (Recommandé)</option>
-                    <option value="mode-lcd">Matrice LCD</option>
-                    <option value="mode-crt">CRT Scanlines</option>
-                    <option value="mode-trinitron">Trinitron Courbé</option>
-                    <option value="mode-dmg">Game Boy DMG Vert</option>
+                    <option value="mode-clean">Cristal HD (Recommandé)</option>
+                    <option value="mode-lcd">Grille LCD Subpixel RGB</option>
+                    <option value="mode-crt">CRT Scanlines Pro</option>
+                    <option value="mode-trinitron">Sony Trinitron PVM</option>
+                    <option value="mode-dmg">Game Boy DMG Olive</option>
                   </select>
                 </div>
 
                 <div class="setting-row">
                   <div class="setting-copy">
                     <div class="setting-name">Disposition Nintendo DS</div>
-                    <div class="setting-desc">Choisissez comment placer les deux écrans de la Nintendo DS.</div>
+                    <div class="setting-desc">Choisissez comment placer les deux écrans DS (Hybride affiche un grand écran principal + écran tactile à droite).</div>
                   </div>
                   <select id="settings-nds-layout-select" class="field-inline setting-select">
                     <option value="vertical">Vertical (Classique)</option>
+                    <option value="hybrid">Hybride Focus (Grand + Tactile)</option>
                     <option value="horizontal">Côte à côte</option>
                     <option value="vertical-swapped">Vertical inversé</option>
                     <option value="horizontal-swapped">Côte à côte inversé</option>
                   </select>
+                </div>
+
+                <div class="setting-row">
+                  <div class="setting-copy">
+                    <div class="setting-name">Résolution 3D interne Nintendo DS</div>
+                    <div class="setting-desc">Rastérise la géométrie 3D DS en haute définition 2x (512×384) tout en gardant les sprites 2D nets.</div>
+                  </div>
+                  <select id="settings-nds-3d-scale-select" class="field-inline setting-select">
+                    <option value="1">Natif 1x (256×192)</option>
+                    <option value="2">Haute Définition 2x (512×384)</option>
+                  </select>
+                </div>
+
+                <div class="setting-row">
+                  <div class="setting-copy">
+                    <div class="setting-name">Mise à l'échelle entière (Integer Scaling)</div>
+                    <div class="setting-desc">Force un multiple entier exact de la résolution native (désactivé par défaut pour occuper tout l'espace).</div>
+                  </div>
+                  <button class="btn" id="btn-settings-integer-scale" type="button">Désactivé (Plein cadre)</button>
                 </div>
 
                 <div class="setting-row">
@@ -676,6 +728,14 @@
                     <button class="btn mono" id="btn-overclock-cycle" type="button">CPU : 100% Natif</button>
                     <button class="btn mono" id="btn-pgxp-toggle" type="button">PGXP 3D : ON</button>
                   </div>
+                </div>
+
+                <div class="setting-row">
+                  <div class="setting-copy">
+                    <div class="setting-name">Rembobinage temps réel (Rewind)</div>
+                    <div class="setting-desc">Capture des instantanés RLE compressés en RAM (budget 48 Mo). Désactivez sur les configurations très modestes.</div>
+                  </div>
+                  <button class="btn mono" id="btn-rewind-toggle" type="button">Rembobinage : ON</button>
                 </div>
 
                 <div class="setting-row">

@@ -78,8 +78,8 @@ test("applyCrtPhosphorBloomRgba boosts bright phosphor pixels while keeping dime
   assert.ok(bloomed.rgba[4] > 10); // Neighbor glow bleed received from bright left pixel
 });
 
-test("upscaleFrameIfEnabled dispatches OFF, SCALE2X, XBRZ, and BLOOM modes cleanly", () => {
-  assert.deepEqual(UPSCALER_MODES, ["OFF", "SCALE2X", "XBRZ", "BLOOM"]);
+test("upscaleFrameIfEnabled dispatches OFF, SHARP, SCALE2X, XBRZ, and BLOOM modes cleanly", () => {
+  assert.deepEqual(UPSCALER_MODES, ["OFF", "SHARP", "SCALE2X", "XBRZ", "BLOOM"]);
   const baseFrame = {
     width: 2,
     height: 2,
@@ -88,6 +88,10 @@ test("upscaleFrameIfEnabled dispatches OFF, SCALE2X, XBRZ, and BLOOM modes clean
 
   const off = upscaleFrameIfEnabled(baseFrame, "OFF");
   assert.equal(off.width, 2);
+
+  const sharp = upscaleFrameIfEnabled(baseFrame, "SHARP");
+  assert.equal(sharp.width, 2);
+  assert.equal(sharp.height, 2);
 
   const scale2x = upscaleFrameIfEnabled(baseFrame, "SCALE2X");
   assert.equal(scale2x.width, 4);
@@ -102,9 +106,10 @@ test("upscaleFrameIfEnabled dispatches OFF, SCALE2X, XBRZ, and BLOOM modes clean
   assert.equal(bloom.height, 2);
 });
 
-test("arrangeNdsDualScreenFrame rearranges top/touch halves across all 4 layouts", () => {
+test("arrangeNdsDualScreenFrame rearranges top/touch halves across all 5 layouts including hybrid", () => {
   assert.deepEqual(NDS_LAYOUT_MODES, [
     "vertical",
+    "hybrid",
     "horizontal",
     "vertical-swapped",
     "horizontal-swapped",
@@ -148,4 +153,12 @@ test("arrangeNdsDualScreenFrame rearranges top/touch halves across all 4 layouts
   assert.equal(hSwap.height, 2);
   assert.equal(hSwap.rgba[2], 240);
   assert.equal(hSwap.rgba[2 * 4], 220);
+
+  // Hybrid -> 6x4 (3*W x H): left 4x4 = 2x top screen (red), right 2x2 centered at y=1..2 = touch screen (blue)
+  const hybrid = arrangeNdsDualScreenFrame(frame, "hybrid");
+  assert.equal(hybrid.width, 6);
+  assert.equal(hybrid.height, 4);
+  assert.equal(hybrid.rgba[0], 220); // top-left main screen red
+  const touchIdx = (1 * 6 + 4) * 4;
+  assert.equal(hybrid.rgba[touchIdx + 2], 240); // right centered touch screen blue
 });

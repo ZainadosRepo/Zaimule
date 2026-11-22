@@ -40,6 +40,12 @@ pub struct Bus {
     pub(crate) timers: [crate::timers::Timer; 4],
     /// Bitmask of enabled timers (`bit t` set iff timer `t` control bit 7 is set).
     pub(crate) timers_active_mask: u8,
+    /// Cached cycle timestamp of the earliest upcoming timer overflow (`u64::MAX` if none).
+    pub(crate) next_timer_event_at: u64,
+    /// Precomputed waitstate cycle table `[region 0..16][width 0..3][seq 0..2]`, rebuilt on WAITCNT write.
+    wait_lut: [[[u8; 2]; 3]; 16],
+    /// Skip PPU scanline rasterization during intermediate fast-forward frames.
+    pub(crate) skip_render: bool,
     /// True when DMA channel 1 or 2 is enabled in Direct Sound FIFO special-timing mode.
     fifo_dma_active: bool,
     /// Cycle count the timers were last advanced to.
@@ -54,7 +60,7 @@ pub struct Bus {
 impl Bus {
     pub fn new(rom: Vec<u8>) -> Self {
         let save = crate::save::Save::detect(&rom);
-        Self {
+        let mut bus = Self {
             rom,
             ewram: Box::new([0; 0x4_0000]),
             iwram: Box::new([0; 0x8000]),
@@ -73,17 +79,34 @@ impl Bus {
             dma: [crate::dma::Dma::default(); 4],
             timers: [crate::timers::Timer::default(); 4],
             timers_active_mask: 0,
+            next_timer_event_at: u64::MAX,
+            wait_lut: [[[1; 2]; 3]; 16],
+            skip_render: false,
             fifo_dma_active: false,
             timers_synced: 0,
             apu: crate::apu::Apu::new(),
             apu_synced: 0,
             halted: false,
-        }
+        };
+        bus.rebuild_wait_lut();
+        bus
     }
 
     #[inline(always)]
     fn event_cycle(k: u64) -> u64 {
         (k / 2) * CYCLES_PER_LINE + (k % 2) * HBLANK_AT
+    }
+
+    fn rebuild_wait_lut(&mut self) {
+        let waitcnt = self.io16(0x204);
+        let widths = [Width::Bits8, Width::Bits16, Width::Bits32];
+        for r in 0..16u32 {
+            for (wi, &w) in widths.iter().enumerate() {
+                self.wait_lut[r as usize][wi][0] =
+                    timing::access_cycles(r, waitcnt, w, false) as u8;
+                self.wait_lut[r as usize][wi][1] = timing::access_cycles(r, waitcnt, w, true) as u8;
+            }
+        }
     }
 
     fn rebuild_caches(&mut self) {
@@ -95,6 +118,8 @@ impl Bus {
             }
         }
         self.timers_active_mask = tmask;
+        self.next_timer_event_at = self.next_timer_overflow_cycle();
+        self.rebuild_wait_lut();
         self.refresh_fifo_dma_active();
     }
 
@@ -125,18 +150,18 @@ impl Bus {
     pub(crate) fn skip_halt_until(&mut self, limit: u64) {
         self.timers_catch_up();
         let next_timer = self.next_timer_overflow_cycle();
+        self.next_timer_event_at = next_timer;
         let target = self.next_event_at.min(next_timer).min(limit);
         self.cycles = target.max(self.cycles + 1);
     }
 
-    /// Fast per-step catch-up: skips disabled timers/FIFO DMA and batches APU work
+    /// Fast per-step catch-up: skips disabled/non-overflowing timers and batches APU work
     /// at scanline/timer/I/O boundaries instead of ticking on every single instruction.
     #[inline(always)]
     pub(crate) fn catch_up_fast(&mut self) {
-        if self.timers_active_mask != 0 {
+        if self.cycles >= self.next_timer_event_at {
             self.timers_catch_up();
-        } else {
-            self.timers_synced = self.cycles;
+            self.next_timer_event_at = self.next_timer_overflow_cycle();
         }
         if self.cycles >= self.next_event_at {
             self.catch_up_events();
@@ -152,6 +177,7 @@ impl Bus {
     /// and timer ticks. Two events per line: line start and hblank.
     pub fn catch_up(&mut self) {
         self.timers_catch_up();
+        self.next_timer_event_at = self.next_timer_overflow_cycle();
         self.apu_catch_up();
         if self.cycles >= self.next_event_at {
             self.catch_up_events();
@@ -183,7 +209,9 @@ impl Bus {
                     self.raise_irq(1 << 1); // hblank fires on every line
                 }
                 if line < VBLANK_START {
-                    self.render_scanline(line as usize);
+                    if !self.skip_render {
+                        self.render_scanline(line as usize);
+                    }
                     if line == VBLANK_START - 1 {
                         self.ppu.frame_ready = true;
                     }
@@ -244,10 +272,22 @@ impl Bus {
 
     /// Charge one memory access (region waitstates, width, sequential or not)
     /// and advance the sequential-access tracker.
+    #[inline(always)]
     fn tick_access(&mut self, addr: u32, width: Width) {
         let seq = addr == self.seq_next && !self.nonseq;
         self.nonseq = false;
-        self.cycles += timing::access_cycles(addr >> 24, self.io16(0x204), width, seq) as u64;
+        let region = (addr >> 24) as usize;
+        let wi = match width {
+            Width::Bits8 => 0,
+            Width::Bits16 => 1,
+            Width::Bits32 => 2,
+        };
+        let cost = if region < 16 {
+            self.wait_lut[region][wi][seq as usize] as u64
+        } else {
+            1
+        };
+        self.cycles += cost;
         self.seq_next = addr.wrapping_add(width.bytes());
     }
 
@@ -302,6 +342,15 @@ impl Bus {
             let reg = (addr as usize) & 0x3FF;
             if (0x060..=0x09F).contains(&reg) {
                 self.apu_catch_up();
+            } else if (0x100..=0x10F).contains(&reg) && self.timers_active_mask != 0 {
+                let target = self.cycles.saturating_sub(1);
+                if target > self.timers_synced {
+                    let saved = self.cycles;
+                    self.cycles = target;
+                    self.timers_catch_up();
+                    self.next_timer_event_at = self.next_timer_overflow_cycle();
+                    self.cycles = saved;
+                }
             }
         }
     }
@@ -684,6 +733,11 @@ impl Bus {
                     self.timers[t].counter = self.io16(0x100 + t * 4);
                     self.timers[t].rem = 0;
                 }
+                self.next_timer_event_at = self.next_timer_overflow_cycle();
+            }
+            0x204 | 0x205 => {
+                self.io[reg] = value;
+                self.rebuild_wait_lut();
             }
             // DMA control bytes: latch on the enable rising edge
             0x0BA | 0x0BB | 0x0C6 | 0x0C7 | 0x0D2 | 0x0D3 | 0x0DE | 0x0DF => {

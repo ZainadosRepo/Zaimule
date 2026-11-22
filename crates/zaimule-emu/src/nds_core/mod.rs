@@ -73,6 +73,9 @@ pub struct NdsMachine {
     frame_count: u32,
     pen_up_frames: u32,
     cpu_overclock_pct: u16,
+    scale_3d: u8,
+    frame_width: usize,
+    frame_height: usize,
     framebuffer_rgba: Vec<u8>,
     // Keep `MachineHandle` LAST so `cpu9` and `cpu7` (holding `MachinePtr`) drop first.
     machine: MachineHandle,
@@ -188,6 +191,9 @@ impl NdsMachine {
             frame_count: 0,
             pen_up_frames: u32::MAX,
             cpu_overclock_pct: 100,
+            scale_3d: 1,
+            frame_width: NDS_WIDTH,
+            frame_height: NDS_HEIGHT,
             framebuffer_rgba: vec![0; NDS_WIDTH * NDS_HEIGHT * 4],
             machine,
         })
@@ -199,6 +205,18 @@ impl NdsMachine {
 
     pub fn cpu_overclock_pct(&self) -> u16 {
         self.cpu_overclock_pct
+    }
+
+    pub fn set_3d_scale(&mut self, scale: u8) {
+        self.scale_3d = scale.clamp(1, 2);
+    }
+
+    pub fn scale_3d(&self) -> u8 {
+        self.scale_3d
+    }
+
+    pub fn frame_dimensions(&self) -> (u16, u16) {
+        (self.frame_width as u16, self.frame_height as u16)
     }
 
     pub fn has_custom_bios(&self) -> (bool, bool) {
@@ -233,6 +251,18 @@ impl NdsMachine {
     }
 
     pub fn step_frame(&mut self, buttons_p1: u16, touch: Option<(u32, u32, bool)>) -> &[u8] {
+        self.step_frame_ex(buttons_p1, touch, false)
+    }
+
+    /// Steps one full Nintendo DS frame. When `skip_render` is `true` (used during
+    /// fast-forward intermediate frames), skips PPU/3D/RGBA output unless Display
+    /// Capture (`DISPCAPCNT` bit 31) is armed so VRAM feedback effects remain exact.
+    pub fn step_frame_ex(
+        &mut self,
+        buttons_p1: u16,
+        touch: Option<(u32, u32, bool)>,
+        skip_render: bool,
+    ) -> &[u8] {
         {
             let mut mm = self.machine.borrow_mut();
             mm.keyinput = map_keyinput(buttons_p1);
@@ -329,23 +359,84 @@ impl NdsMachine {
                 .tick_spu_scanline(SPU_CYCLES_PER_LINE);
         }
 
-        self.ppu.render_frame(&mut self.machine.borrow_mut());
         self.frame_count = self.frame_count.wrapping_add(1);
 
-        let powcnt1 = self.machine.borrow().powcnt1;
-        let [upper, lower] = if powcnt1 & 0x8000 != 0 {
-            [&self.ppu.fb_a, &self.ppu.fb_b]
-        } else {
-            [&self.ppu.fb_b, &self.ppu.fb_a]
-        };
-
-        let half_bytes = ppu::WIDTH * ppu::HEIGHT * 4;
-        let (top_dst, bot_dst) = self.framebuffer_rgba.split_at_mut(half_bytes);
-        for (dst, &px) in top_dst.as_chunks_mut::<4>().0.iter_mut().zip(upper.iter()) {
-            *dst = [(px >> 16) as u8, (px >> 8) as u8, px as u8, 0xFF];
+        if skip_render {
+            let cap_armed = self.machine.borrow().io2d[0][0x67] & 0x80 != 0;
+            if cap_armed {
+                self.ppu
+                    .render_frame_scaled(&mut self.machine.borrow_mut(), 1);
+            }
+            return &self.framebuffer_rgba;
         }
-        for (dst, &px) in bot_dst.as_chunks_mut::<4>().0.iter_mut().zip(lower.iter()) {
-            *dst = [(px >> 16) as u8, (px >> 8) as u8, px as u8, 0xFF];
+
+        self.ppu
+            .render_frame_scaled(&mut self.machine.borrow_mut(), self.scale_3d);
+
+        let powcnt1 = self.machine.borrow().powcnt1;
+        let a_on_top = powcnt1 & 0x8000 != 0;
+
+        if self.ppu.hd_active {
+            const HD_W: usize = ppu::WIDTH * 2;
+            const HD_H_SINGLE: usize = ppu::HEIGHT * 2;
+            self.frame_width = HD_W;
+            self.frame_height = HD_H_SINGLE * 2;
+            let total_bytes = HD_W * (HD_H_SINGLE * 2) * 4;
+            if self.framebuffer_rgba.len() != total_bytes {
+                self.framebuffer_rgba.resize(total_bytes, 0xFF);
+            }
+            let half_bytes = HD_W * HD_H_SINGLE * 4;
+            let (top_dst, bot_dst) = self.framebuffer_rgba.split_at_mut(half_bytes);
+            let (a_dst, b_dst) = if a_on_top {
+                (top_dst, bot_dst)
+            } else {
+                (bot_dst, top_dst)
+            };
+            // Engine A: true 512×384 HD 3D + 2D overlay
+            for (dst, &px) in a_dst
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(self.ppu.fb_a_hd.iter())
+            {
+                *dst = [(px >> 16) as u8, (px >> 8) as u8, px as u8, 0xFF];
+            }
+            // Engine B: crisp 2× nearest-neighbor expansion to match 512×384 half-frame
+            let b_chunks = b_dst.as_chunks_mut::<4>().0;
+            for y in 0..ppu::HEIGHT {
+                let src_row = &self.ppu.fb_b[y * ppu::WIDTH..(y + 1) * ppu::WIDTH];
+                let dst_row0 = (y * 2) * HD_W;
+                let dst_row1 = (y * 2 + 1) * HD_W;
+                for (x, &px) in src_row.iter().enumerate() {
+                    let rgba = [(px >> 16) as u8, (px >> 8) as u8, px as u8, 0xFF];
+                    let x2 = x * 2;
+                    b_chunks[dst_row0 + x2] = rgba;
+                    b_chunks[dst_row0 + x2 + 1] = rgba;
+                    b_chunks[dst_row1 + x2] = rgba;
+                    b_chunks[dst_row1 + x2 + 1] = rgba;
+                }
+            }
+        } else {
+            self.frame_width = NDS_WIDTH;
+            self.frame_height = NDS_HEIGHT;
+            let total_bytes = NDS_WIDTH * NDS_HEIGHT * 4;
+            if self.framebuffer_rgba.len() != total_bytes {
+                self.framebuffer_rgba.resize(total_bytes, 0xFF);
+            }
+            let [upper, lower] = if a_on_top {
+                [&self.ppu.fb_a, &self.ppu.fb_b]
+            } else {
+                [&self.ppu.fb_b, &self.ppu.fb_a]
+            };
+
+            let half_bytes = ppu::WIDTH * ppu::HEIGHT * 4;
+            let (top_dst, bot_dst) = self.framebuffer_rgba.split_at_mut(half_bytes);
+            for (dst, &px) in top_dst.as_chunks_mut::<4>().0.iter_mut().zip(upper.iter()) {
+                *dst = [(px >> 16) as u8, (px >> 8) as u8, px as u8, 0xFF];
+            }
+            for (dst, &px) in bot_dst.as_chunks_mut::<4>().0.iter_mut().zip(lower.iter()) {
+                *dst = [(px >> 16) as u8, (px >> 8) as u8, px as u8, 0xFF];
+            }
         }
 
         &self.framebuffer_rgba

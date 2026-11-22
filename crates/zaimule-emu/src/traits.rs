@@ -111,11 +111,49 @@ pub fn solid_obsidian_rgba(width: usize, height: usize) -> Vec<u8> {
     rgba
 }
 
+/// Lightweight per-frame metadata returned by [`EmulatorBackend::step_frame_borrowed`]
+/// without cloning the RGBA framebuffer or allocating CPU debug register strings.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FastFrameMeta {
+    pub frame_number: u64,
+    pub width: u16,
+    pub height: u16,
+    pub audio_level: f32,
+    pub audio_freq_hz: u16,
+    pub sample_rate_hz: u32,
+    pub serial_out_byte: Option<u8>,
+}
+
 /// Unified interface implemented by Zaimule's pure-Rust emulator cores (`Gb`/`Gbc`, `Gba`, `Nds`).
 pub trait EmulatorBackend: Send {
     fn console(&self) -> ConsoleKind;
     fn load_rom(&mut self, rom: &[u8]) -> Result<(), String>;
     fn step_frame(&mut self, buttons_mask: u16) -> FrameStepResult;
+    /// Steps one frame in-place, writing RGBA into the core's internal framebuffer (unless
+    /// `skip_render` is `true` during fast-forward intermediate frames) and appending stereo
+    /// PCM samples to `pcm_out`, without allocating CPU debug strings or cloning RGBA.
+    fn step_frame_borrowed(
+        &mut self,
+        buttons_mask: u16,
+        _skip_render: bool,
+        pcm_out: &mut Vec<f32>,
+    ) -> FastFrameMeta {
+        let res = self.step_frame(buttons_mask);
+        pcm_out.extend_from_slice(&res.audio_samples);
+        FastFrameMeta {
+            frame_number: res.frame_number,
+            width: res.width,
+            height: res.height,
+            audio_level: res.audio_level,
+            audio_freq_hz: res.audio_freq_hz,
+            sample_rate_hz: res.sample_rate_hz,
+            serial_out_byte: res.serial_out_byte,
+        }
+    }
+    /// Borrows the most recently rendered RGBA8888 framebuffer and its dimensions.
+    fn rgba_frame(&self) -> (u16, u16, &[u8]) {
+        (0, 0, &[])
+    }
     fn save_state(&self) -> Result<Vec<u8>, String>;
     fn load_state(&mut self, data: &[u8]) -> Result<(), String>;
     fn sram(&self) -> &[u8];
@@ -132,6 +170,8 @@ pub trait EmulatorBackend: Send {
     fn write_vram_byte(&mut self, _offset: usize, _val: u8) {}
     fn set_touch_stylus(&mut self, _x: u8, _y: u8, _pressed: bool) {}
     fn set_color_correction(&mut self, _enabled: bool) {}
+    /// Sets the internal 3D rasterization scale (`1` = native, `2` = 2× HD) on cores with 3D hardware.
+    fn set_3d_scale(&mut self, _scale: u8) {}
     /// Refreshes internal SRAM cache on demand (avoids copying SRAM on every video frame).
     fn sync_sram_cache(&mut self) {}
     /// Returns `false` when the core tracks SRAM writes precisely and knows no write occurred since last sync.

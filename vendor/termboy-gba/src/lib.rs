@@ -97,12 +97,27 @@ impl GbaCore {
             self.cpu.bus.run_dma(ch);
         }
     }
+
+    /// Steps one full GBA frame (CPU, DMA, timers, IRQs, APU) while skipping PPU scanline
+    /// rendering and RGB conversion, used for intermediate frames during fast-forward.
+    pub fn run_frame_skip_render(&mut self, buttons: Buttons) {
+        self.cpu.bus.set_buttons(buttons);
+        self.cpu.bus.ppu.frame_ready = false;
+        self.cpu.bus.skip_render = true;
+        let cap = self.cpu.bus.cycles + CYCLES_PER_FRAME;
+        while !self.cpu.bus.ppu.frame_ready && self.cpu.bus.cycles < cap {
+            self.cpu.step_system_until(cap);
+        }
+        self.cpu.bus.skip_render = false;
+        self.cpu.bus.apu_catch_up();
+    }
 }
 
 impl Core for GbaCore {
     fn run_frame(&mut self, buttons: Buttons) -> &FrameBuffer {
         self.cpu.bus.set_buttons(buttons);
         self.cpu.bus.ppu.frame_ready = false;
+        self.cpu.bus.skip_render = false;
         // The cap mirrors GameBoy::run_frame: never hang the frontend even if
         // the PPU somehow never signals (e.g. a ROM that stops the clock).
         let cap = self.cpu.bus.cycles + CYCLES_PER_FRAME;

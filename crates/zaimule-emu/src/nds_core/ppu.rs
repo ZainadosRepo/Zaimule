@@ -40,6 +40,10 @@ pub struct Ppu {
     pub fb_a: Vec<u32>,
     pub fb_b: Vec<u32>,
     #[serde(skip)]
+    pub fb_a_hd: Vec<u32>,
+    #[serde(skip)]
+    pub hd_active: bool,
+    #[serde(skip)]
     obj_col: Vec<u16>,
     #[serde(skip)]
     obj_prio: Vec<u8>,
@@ -58,6 +62,8 @@ impl Ppu {
         Self {
             fb_a: vec![0; WIDTH * HEIGHT],
             fb_b: vec![0; WIDTH * HEIGHT],
+            fb_a_hd: Vec::new(),
+            hd_active: false,
             obj_col: vec![0; WIDTH * HEIGHT],
             obj_prio: vec![0xFF; WIDTH * HEIGHT],
             obj_win: vec![false; WIDTH * HEIGHT],
@@ -79,16 +85,52 @@ impl Ppu {
     }
 
     pub fn render_frame(&mut self, m: &mut Machine) {
+        self.render_frame_scaled(m, 1);
+    }
+
+    /// Renders both DS 2D engines and 3D BG0. When `scale_3d >= 2` and Engine A
+    /// has active 3D geometry, rasterizes 3D at 2× (`512×384`) and composites
+    /// crisp 2× 2D layers into `self.fb_a_hd` while maintaining `self.fb_a` for
+    /// Display Capture and savestate consistency.
+    pub fn render_frame_scaled(&mut self, m: &mut Machine, scale_3d: u8) {
         self.ensure_scratch();
+        self.hd_active = false;
         for eng in 0..2 {
             let io = &m.io2d[eng];
             let dispcnt = u32::from_le_bytes([io[0], io[1], io[2], io[3]]);
+            let disp_mode = dispcnt >> 16 & 3;
+            let use_hd = eng == 0
+                && scale_3d >= 2
+                && (disp_mode == 1 || disp_mode == 3)
+                && dispcnt & 8 != 0
+                && dispcnt & 0x100 != 0
+                && !m.gx.disp_polys.is_empty();
+            if use_hd {
+                let hd_len = (WIDTH * 2) * (HEIGHT * 2);
+                if self.fb_a_hd.len() != hd_len {
+                    self.fb_a_hd.resize(hd_len, 0);
+                }
+                Self::render_graphics_hd(
+                    m,
+                    dispcnt,
+                    &mut self.fb_a,
+                    &mut self.fb_a_hd,
+                    &mut self.obj_col,
+                    &mut self.obj_prio,
+                    &mut self.obj_win,
+                    &mut self.obj_semi,
+                    &mut self.obj_bmp_alpha,
+                    &mut self.render3d,
+                );
+                self.hd_active = true;
+                continue;
+            }
             let fb = if eng == 0 {
                 &mut self.fb_a
             } else {
                 &mut self.fb_b
             };
-            match dispcnt >> 16 & 3 {
+            match disp_mode {
                 0 => fb.fill(0xFFFFFF), // display off: white
                 2 => {
                     // LCDC: show the selected 128KB VRAM bank directly.
@@ -129,21 +171,26 @@ impl Ppu {
             if factor == 0 || mode == 0 || mode == 3 {
                 continue;
             }
-            let fb = if eng == 0 {
-                &mut self.fb_a
-            } else {
-                &mut self.fb_b
+            let apply_brt = |buf: &mut [u32]| {
+                for px in buf.iter_mut() {
+                    let (r, g, b) = (*px >> 16 & 0xFF, *px >> 8 & 0xFF, *px & 0xFF);
+                    let f = |c: u32| -> u32 {
+                        if mode == 1 {
+                            c + (((255 - c) * factor) >> 4) // brighten toward white
+                        } else {
+                            c - ((c * factor) >> 4) // darken toward black
+                        }
+                    };
+                    *px = f(r) << 16 | f(g) << 8 | f(b);
+                }
             };
-            for px in fb.iter_mut() {
-                let (r, g, b) = (*px >> 16 & 0xFF, *px >> 8 & 0xFF, *px & 0xFF);
-                let f = |c: u32| -> u32 {
-                    if mode == 1 {
-                        c + (255 - c) * factor / 16 // brighten toward white
-                    } else {
-                        c - c * factor / 16 // darken toward black
-                    }
-                };
-                *px = f(r) << 16 | f(g) << 8 | f(b);
+            if eng == 0 {
+                apply_brt(&mut self.fb_a);
+                if self.hd_active {
+                    apply_brt(&mut self.fb_a_hd);
+                }
+            } else {
+                apply_brt(&mut self.fb_b);
             }
         }
     }
@@ -761,6 +808,534 @@ impl Ppu {
         }
     }
 
+    /// Engine A 2× HD 3D compositor: rasterizes 3D BG0 at `512×384` while evaluating
+    /// 2D backgrounds and sprites at native `256×192`, then composites every 2×2
+    /// subpixel with exact BG0 priority, windows, and color effects.
+    #[allow(clippy::too_many_arguments)]
+    fn render_graphics_hd(
+        m: &Machine,
+        dispcnt: u32,
+        fb_1x: &mut [u32],
+        fb_hd: &mut [u32],
+        obj_col: &mut [u16],
+        obj_prio: &mut [u8],
+        obj_win: &mut [bool],
+        obj_semi: &mut [bool],
+        obj_bmp_alpha: &mut [u8],
+        render3d: &mut super::render3d::Render3dScratch,
+    ) {
+        const HD_W: usize = WIDTH * 2;
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum BgKind {
+            None,
+            Text,
+            Affine,
+            Extended,
+            LargeBitmap,
+        }
+
+        let io = &m.io2d[0];
+        let r16 = |off: usize| u16::from_le_bytes([io[off], io[off + 1]]) as u32;
+        let ri16 = |off: usize| i16::from_le_bytes([io[off], io[off + 1]]) as i64;
+        let r28s = |off: usize| {
+            let raw = u32::from_le_bytes([io[off], io[off + 1], io[off + 2], io[off + 3]]);
+            (((raw as i32) << 4) >> 4) as i64
+        };
+        let mut bg_pal_rgb = [0u32; 256];
+        for (idx, dst) in bg_pal_rgb.iter_mut().enumerate() {
+            let p = idx * 2;
+            *dst = rgb555(u16::from_le_bytes([m.pal[p], m.pal[p + 1]]));
+        }
+        let backdrop_rgb = bg_pal_rgb[0];
+
+        let mut bg_pages: [Option<&[u8]>; 32] = [None; 32];
+        for (p, slot) in bg_pages.iter_mut().enumerate() {
+            if let Some((bank, bank_off)) = m.vram_slot(0x0600_0000 + ((p as u32) << 14)) {
+                if bank_off + 0x4000 <= m.vram[bank].len() {
+                    *slot = Some(&m.vram[bank][bank_off..bank_off + 0x4000]);
+                }
+            }
+        }
+        let vram8 = |off: u32| vram_page_read8(&bg_pages, off);
+        let vram16 = |off: u32| vram_page_read16(&bg_pages, off);
+        let char_bank_off = (dispcnt >> 24 & 7) * 0x10000;
+        let screen_bank_off = (dispcnt >> 27 & 7) * 0x10000;
+
+        super::render3d::render_into_scaled(m, render3d, 2);
+
+        let objs_enabled = dispcnt & (1 << 12) != 0;
+        let (any_obj_drawn, any_semi_obj) = if objs_enabled {
+            obj_prio.fill(0xFF);
+            obj_win.fill(false);
+            Self::render_objs(
+                m,
+                0,
+                dispcnt,
+                obj_col,
+                obj_prio,
+                obj_win,
+                obj_semi,
+                obj_bmp_alpha,
+            )
+        } else {
+            (false, false)
+        };
+
+        let bldcnt = r16(0x50);
+        let bld_mode = bldcnt >> 6 & 3;
+        let eva = (r16(0x52) & 0x1F).min(16);
+        let evb = (r16(0x52) >> 8 & 0x1F).min(16);
+        let evy = (r16(0x54) & 0x1F).min(16);
+        let bg_extpal_on = dispcnt & 1 << 30 != 0;
+        let win0_on = dispcnt & 1 << 13 != 0;
+        let win1_on = dispcnt & 1 << 14 != 0;
+        let objwin_on = objs_enabled && (dispcnt & (1 << 15) != 0);
+        let windows_on = dispcnt & 0xE000 != 0;
+        let winin = r16(0x48);
+        let winout = r16(0x4A);
+        let span = |reg: u32, max: u32| {
+            let (a, b) = (reg >> 8 & 0xFF, reg & 0xFF);
+            (a, if b < a || b > max { max } else { b })
+        };
+        let (w0x1, w0x2) = span(r16(0x40), WIDTH as u32);
+        let (w0y1, w0y2) = span(r16(0x44), HEIGHT as u32);
+        let (w1x1, w1x2) = span(r16(0x42), WIDTH as u32);
+        let (w1y1, w1y2) = span(r16(0x46), HEIGHT as u32);
+
+        let mut order = [0u32, 1, 2, 3];
+        order.sort_by_key(|&bg| std::cmp::Reverse((r16(0x8 + bg as usize * 2) & 3, bg)));
+        let mode = dispcnt & 7;
+        let bg0_prio = (r16(0x8) & 3) as u8;
+
+        for y in 0..HEIGHT as u32 {
+            let w0_row = win0_on && y >= w0y1 && y < w0y2;
+            let w1_row = win1_on && y >= w1y1 && y < w1y2;
+            let row_off = y as usize * WIDTH;
+            let layers_at = |x: u32| -> u32 {
+                if w0_row && x >= w0x1 && x < w0x2 {
+                    winin
+                } else if w1_row && x >= w1x1 && x < w1x2 {
+                    winin >> 8
+                } else if objwin_on && obj_win[row_off + x as usize] {
+                    winout >> 8
+                } else {
+                    winout
+                }
+            };
+
+            let mut under_prio = [4u8; WIDTH];
+            let mut under_col = [backdrop_rgb; WIDTH];
+            let mut under_layer = [5u8; WIDTH];
+            let mut under_sec_col = [backdrop_rgb; WIDTH];
+            let mut under_sec_layer = [5u8; WIDTH];
+
+            let mut over_has = [false; WIDTH];
+            let mut over_prio = [4u8; WIDTH];
+            let mut over_col = [0u32; WIDTH];
+            let mut over_layer = [5u8; WIDTH];
+            let mut over_sec_has = [false; WIDTH];
+            let mut over_sec_col = [0u32; WIDTH];
+            let mut over_sec_layer = [5u8; WIDTH];
+
+            let mut seen_bg0 = false;
+            for bg in order {
+                if dispcnt & (1 << (8 + bg)) == 0 {
+                    continue;
+                }
+                if bg == 0 {
+                    seen_bg0 = true;
+                    continue;
+                }
+                let kind = match (mode, bg) {
+                    (0, 0..=3) => BgKind::Text,
+                    (1, 0..=2) => BgKind::Text,
+                    (1, 3) => BgKind::Affine,
+                    (2, 0..=1) => BgKind::Text,
+                    (2, 2..=3) => BgKind::Affine,
+                    (3, 0..=2) => BgKind::Text,
+                    (3, 3) => BgKind::Extended,
+                    (4, 0..=1) => BgKind::Text,
+                    (4, 2) => BgKind::Affine,
+                    (4, 3) => BgKind::Extended,
+                    (5, 0..=1) => BgKind::Text,
+                    (5, 2..=3) => BgKind::Extended,
+                    (6, 2) => BgKind::LargeBitmap,
+                    _ => BgKind::None,
+                };
+                if kind == BgKind::None {
+                    continue;
+                }
+                let bgcnt = r16(0x8 + bg as usize * 2);
+                let prio = (bgcnt & 3) as u8;
+                let bg_u8 = bg as u8;
+                let mut push_bg = |xi: usize, rgb: u32| {
+                    if !seen_bg0 {
+                        under_sec_col[xi] = under_col[xi];
+                        under_sec_layer[xi] = under_layer[xi];
+                        under_col[xi] = rgb;
+                        under_layer[xi] = bg_u8;
+                        under_prio[xi] = prio;
+                    } else {
+                        if over_has[xi] {
+                            over_sec_has[xi] = true;
+                            over_sec_col[xi] = over_col[xi];
+                            over_sec_layer[xi] = over_layer[xi];
+                        }
+                        over_has[xi] = true;
+                        over_col[xi] = rgb;
+                        over_layer[xi] = bg_u8;
+                        over_prio[xi] = prio;
+                    }
+                };
+
+                if kind == BgKind::Text {
+                    let char_base = (char_bank_off + (bgcnt >> 2 & 0xF) * 0x4000) as u32;
+                    let screen_base = (screen_bank_off + (bgcnt >> 8 & 0x1F) * 0x800) as u32;
+                    let eight_bpp = bgcnt & 0x80 != 0;
+                    let size = bgcnt >> 14 & 3;
+                    let hofs = r16(0x10 + bg as usize * 4) & 0x1FF;
+                    let vofs = r16(0x12 + bg as usize * 4) & 0x1FF;
+                    let w_mask = if size & 1 != 0 { 511u32 } else { 255u32 };
+                    let h_mask = if size & 2 != 0 { 511u32 } else { 255u32 };
+                    let py = (y + vofs) & h_mask;
+                    let ty = (py >> 3) & 31;
+                    let fy_raw = py & 7;
+                    let sbb_y = match size {
+                        2 => (py >> 8) * 0x800,
+                        3 => (py >> 8) * 0x1000,
+                        _ => 0,
+                    };
+                    let row_screen_base = screen_base + sbb_y + ty * 64;
+                    let extpal_slot = if bg < 2 && bgcnt & 0x2000 != 0 {
+                        bg as usize + 2
+                    } else {
+                        bg as usize
+                    };
+                    let bg_bit = 1u32 << bg;
+                    let mut x = 0u32;
+                    while x < WIDTH as u32 {
+                        let px = (x + hofs) & w_mask;
+                        let fx_start = px & 7;
+                        let run = (8 - fx_start).min(WIDTH as u32 - x);
+                        let sbb_x = if size & 1 != 0 { (px >> 8) * 0x800 } else { 0 };
+                        let tx = (px >> 3) & 31;
+                        let entry = vram16(row_screen_base + sbb_x + tx * 2) as u32;
+                        let tile = entry & 0x3FF;
+                        let hflip = entry & 0x400 != 0;
+                        let fy = if entry & 0x800 != 0 {
+                            7 - fy_raw
+                        } else {
+                            fy_raw
+                        };
+                        let pal_hi = entry >> 12;
+                        if eight_bpp {
+                            let tile_row = char_base + tile * 64 + fy * 8;
+                            for step in 0..run {
+                                let cx = x + step;
+                                if windows_on && layers_at(cx) & bg_bit == 0 {
+                                    continue;
+                                }
+                                let fx = if hflip {
+                                    7 - (fx_start + step)
+                                } else {
+                                    fx_start + step
+                                };
+                                let color = vram8(tile_row + fx) as u32;
+                                if color != 0 {
+                                    let rgb = if bg_extpal_on {
+                                        rgb555(m.bg_extpal(0, extpal_slot, pal_hi, color))
+                                    } else {
+                                        bg_pal_rgb[color as usize]
+                                    };
+                                    push_bg(cx as usize, rgb);
+                                }
+                            }
+                        } else {
+                            let tile_row = char_base + tile * 32 + fy * 4;
+                            let pal_off = (pal_hi as usize) * 16;
+                            for step in 0..run {
+                                let cx = x + step;
+                                if windows_on && layers_at(cx) & bg_bit == 0 {
+                                    continue;
+                                }
+                                let fx = if hflip {
+                                    7 - (fx_start + step)
+                                } else {
+                                    fx_start + step
+                                };
+                                let b = vram8(tile_row + (fx >> 1)) as u32;
+                                let color = if fx & 1 == 0 { b & 0xF } else { b >> 4 };
+                                if color != 0 {
+                                    push_bg(cx as usize, bg_pal_rgb[pal_off + color as usize]);
+                                }
+                            }
+                        }
+                        x += run;
+                    }
+                    continue;
+                }
+
+                // Affine / Extended / LargeBitmap BG on Engine A while 3D is active.
+                let mat_base = if bg == 2 { 0x20usize } else { 0x30usize };
+                let (pa, pb, pc, pd) = (
+                    ri16(mat_base),
+                    ri16(mat_base + 2),
+                    ri16(mat_base + 4),
+                    ri16(mat_base + 6),
+                );
+                let mut sx = r28s(mat_base + 8) + pb * (y as i64);
+                let mut sy = r28s(mat_base + 12) + pd * (y as i64);
+                let size = bgcnt >> 14 & 3;
+                let overflow_wrap = bgcnt & (1 << 13) != 0;
+                let (map_w, map_h): (i64, i64) = match kind {
+                    BgKind::Affine => {
+                        let s = 128i64 << size;
+                        (s, s)
+                    }
+                    BgKind::Extended if bgcnt & 0x80 == 0 => {
+                        let s = 128i64 << size;
+                        (s, s)
+                    }
+                    BgKind::Extended => match size {
+                        0 => (128, 128),
+                        1 => (256, 256),
+                        2 => (512, 256),
+                        _ => (512, 512),
+                    },
+                    BgKind::LargeBitmap => match size {
+                        0 => (512, 1024),
+                        1 => (1024, 512),
+                        _ => (0, 0),
+                    },
+                    _ => (0, 0),
+                };
+                if map_w == 0 || map_h == 0 {
+                    continue;
+                }
+                let (mask_w, mask_h) = (map_w - 1, map_h - 1);
+                let char_base = (char_bank_off + (bgcnt >> 2 & 0xF) * 0x4000) as u32;
+                let screen_base_tile = (screen_bank_off + (bgcnt >> 8 & 0x1F) * 0x800) as u32;
+                let bmp_base = if kind == BgKind::LargeBitmap {
+                    0
+                } else {
+                    ((bgcnt >> 8) & 0x1F) * 0x4000
+                };
+                let tiles_w = (map_w >> 3) as u32;
+                for x in 0..WIDTH as u32 {
+                    let cur_x = sx >> 8;
+                    let cur_y = sy >> 8;
+                    sx += pa;
+                    sy += pc;
+                    if windows_on && layers_at(x) & (1 << bg) == 0 {
+                        continue;
+                    }
+                    let (px, py) = if cur_x < 0 || cur_x >= map_w || cur_y < 0 || cur_y >= map_h {
+                        if overflow_wrap {
+                            ((cur_x & mask_w) as u32, (cur_y & mask_h) as u32)
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        (cur_x as u32, cur_y as u32)
+                    };
+                    let rgb_opt = match kind {
+                        BgKind::Affine => {
+                            let tile =
+                                vram8(screen_base_tile + (py >> 3) * tiles_w + (px >> 3)) as u32;
+                            let c = vram8(char_base + tile * 64 + (py & 7) * 8 + (px & 7)) as usize;
+                            if c == 0 {
+                                None
+                            } else {
+                                Some(bg_pal_rgb[c])
+                            }
+                        }
+                        BgKind::Extended if bgcnt & 0x80 == 0 => {
+                            let e = vram16(screen_base_tile + ((py >> 3) * tiles_w + (px >> 3)) * 2)
+                                as u32;
+                            let mut fx = px & 7;
+                            let mut fy = py & 7;
+                            if e & 0x400 != 0 {
+                                fx = 7 - fx;
+                            }
+                            if e & 0x800 != 0 {
+                                fy = 7 - fy;
+                            }
+                            let c = vram8(char_base + (e & 0x3FF) * 64 + fy * 8 + fx) as u32;
+                            if c == 0 {
+                                None
+                            } else if bg_extpal_on {
+                                Some(rgb555(m.bg_extpal(0, bg as usize, e >> 12, c)))
+                            } else {
+                                Some(bg_pal_rgb[c as usize])
+                            }
+                        }
+                        BgKind::Extended if bgcnt & 0x04 != 0 => {
+                            let c = vram16(bmp_base + (py * (map_w as u32) + px) * 2);
+                            if c & 0x8000 == 0 {
+                                None
+                            } else {
+                                Some(rgb555(c & 0x7FFF))
+                            }
+                        }
+                        _ => {
+                            let c = vram8(bmp_base + py * (map_w as u32) + px) as usize;
+                            if c == 0 {
+                                None
+                            } else {
+                                Some(bg_pal_rgb[c])
+                            }
+                        }
+                    };
+                    if let Some(rgb) = rgb_opt {
+                        push_bg(x as usize, rgb);
+                    }
+                }
+            }
+
+            // Composite sprites into over/under buckets relative to BG0's priority.
+            let mut over_semi = [false; WIDTH];
+            let mut over_bmp_a = [0u8; WIDTH];
+            let mut under_semi = [false; WIDTH];
+            let mut under_bmp_a = [0u8; WIDTH];
+            let mut row_has_semi = false;
+            if any_obj_drawn {
+                for x in 0..WIDTH {
+                    let i = row_off + x;
+                    let op = obj_prio[i];
+                    if op == 0xFF {
+                        continue;
+                    }
+                    if windows_on && layers_at(x as u32) & 0x10 == 0 {
+                        continue;
+                    }
+                    let obj_rgb = rgb555(obj_col[i]);
+                    let s = any_semi_obj && obj_semi[i];
+                    let ba = if any_semi_obj { obj_bmp_alpha[i] } else { 0 };
+                    if op <= bg0_prio {
+                        if !over_has[x] || op <= over_prio[x] {
+                            if over_has[x] {
+                                over_sec_has[x] = true;
+                                over_sec_col[x] = over_col[x];
+                                over_sec_layer[x] = over_layer[x];
+                            }
+                            over_has[x] = true;
+                            over_col[x] = obj_rgb;
+                            over_layer[x] = 4;
+                            over_prio[x] = op;
+                            over_semi[x] = s;
+                            over_bmp_a[x] = ba;
+                            if s || ba > 0 {
+                                row_has_semi = true;
+                            }
+                        }
+                    } else if op <= under_prio[x] {
+                        under_sec_col[x] = under_col[x];
+                        under_sec_layer[x] = under_layer[x];
+                        under_col[x] = obj_rgb;
+                        under_layer[x] = 4;
+                        under_prio[x] = op;
+                        under_semi[x] = s;
+                        under_bmp_a[x] = ba;
+                        if s || ba > 0 {
+                            row_has_semi = true;
+                        }
+                    }
+                }
+            }
+
+            let apply_fx = bld_mode != 0 || row_has_semi;
+            let blend_px = |top: u32, top_l: u8, sec: u32, sec_l: u8, semi: bool, ba: u8| -> u32 {
+                if !apply_fx {
+                    return top;
+                }
+                let first_ok = bldcnt >> top_l & 1 != 0;
+                let second_ok = bldcnt >> (8 + sec_l) & 1 != 0;
+                let alpha = |eva_c: u32, evb_c: u32| {
+                    let bl = |sh: u32| {
+                        (((top >> sh & 0xFF) * eva_c + (sec >> sh & 0xFF) * evb_c) >> 4).min(255)
+                    };
+                    bl(16) << 16 | bl(8) << 8 | bl(0)
+                };
+                if ba > 0 && second_ok {
+                    let ba_u = ba as u32;
+                    alpha(ba_u, 16 - ba_u)
+                } else if semi && second_ok {
+                    alpha(eva, evb)
+                } else {
+                    match bld_mode {
+                        1 if first_ok && second_ok => alpha(eva, evb),
+                        2 if first_ok => {
+                            let bl = |sh: u32| {
+                                let c = top >> sh & 0xFF;
+                                c + (((255 - c) * evy) >> 4)
+                            };
+                            bl(16) << 16 | bl(8) << 8 | bl(0)
+                        }
+                        3 if first_ok => {
+                            let bl = |sh: u32| {
+                                let c = top >> sh & 0xFF;
+                                c - ((c * evy) >> 4)
+                            };
+                            bl(16) << 16 | bl(8) << 8 | bl(0)
+                        }
+                        _ => top,
+                    }
+                }
+            };
+
+            let y2 = (y as usize) * 2;
+            let row3d_0 = &render3d.fb[y2 * HD_W..(y2 + 1) * HD_W];
+            let row3d_1 = &render3d.fb[(y2 + 1) * HD_W..(y2 + 2) * HD_W];
+            let dst_base_0 = y2 * HD_W;
+            let dst_base_1 = (y2 + 1) * HD_W;
+
+            for x in 0..WIDTH {
+                let bg0_ok = !windows_on || (layers_at(x as u32) & 1 != 0);
+                let x2 = x * 2;
+                let sample_sub = |px3d: u32| -> u32 {
+                    let has3d = bg0_ok && px3d != super::render3d::TRANSPARENT;
+                    if over_has[x] {
+                        let (sec, sec_l) = if over_sec_has[x] {
+                            (over_sec_col[x], over_sec_layer[x])
+                        } else if has3d {
+                            (px3d, 0)
+                        } else {
+                            (under_col[x], under_layer[x])
+                        };
+                        blend_px(
+                            over_col[x],
+                            over_layer[x],
+                            sec,
+                            sec_l,
+                            over_semi[x],
+                            over_bmp_a[x],
+                        )
+                    } else if has3d {
+                        blend_px(px3d, 0, under_col[x], under_layer[x], false, 0)
+                    } else {
+                        blend_px(
+                            under_col[x],
+                            under_layer[x],
+                            under_sec_col[x],
+                            under_sec_layer[x],
+                            under_semi[x],
+                            under_bmp_a[x],
+                        )
+                    }
+                };
+                let c00 = sample_sub(row3d_0[x2]);
+                let c01 = sample_sub(row3d_0[x2 + 1]);
+                let c10 = sample_sub(row3d_1[x2]);
+                let c11 = sample_sub(row3d_1[x2 + 1]);
+                fb_hd[dst_base_0 + x2] = c00;
+                fb_hd[dst_base_0 + x2 + 1] = c01;
+                fb_hd[dst_base_1 + x2] = c10;
+                fb_hd[dst_base_1 + x2 + 1] = c11;
+                fb_1x[row_off + x] = c00;
+            }
+        }
+    }
+
     /// Render all OAM sprites for one engine into per-pixel color/priority
     /// buffers (lower OAM index wins), bitmap per-OBJ alpha, and the OBJ-window mask.
     /// Returns `(any_obj_drawn, any_semi_or_bmp_alpha)`.
@@ -851,13 +1426,6 @@ impl Ppu {
             if sy_start >= sy_end || sx_start >= sx_end {
                 continue;
             }
-            let (pa, pb, pc, pd) = if rot {
-                let grp = oam_base + (a1 >> 9 & 0x1F) as usize * 32;
-                let p = |o: usize| i16::from_le_bytes([m.oam[grp + o], m.oam[grp + o + 1]]) as i32;
-                (p(6), p(14), p(22), p(30))
-            } else {
-                (0x100, 0, 0, 0x100)
-            };
             let tile = (a2 & 0x3FF) as u32;
             let prio = (a2 >> 10 & 3) as u8;
             let tsz: u32 = if eight_bpp { 64 } else { 32 };
@@ -865,6 +1433,84 @@ impl Ppu {
             if mode == 1 || (mode == 3 && palnum < 15) {
                 any_semi = true;
             }
+
+            // Fast path: non-rotated standard tiled sprite (mode 0 or 1, ~95% of DS sprites).
+            if !rot && mode <= 1 {
+                let hflip = a1 & 0x1000 != 0;
+                let vflip = a1 & 0x2000 != 0;
+                let is_semi = mode == 1;
+                let base_tile_off = if one_d {
+                    tile * boundary
+                } else if eight_bpp {
+                    (tile & !1) * 32
+                } else {
+                    tile * 32
+                };
+                let pal_row_base = pal_base + (palnum * 32) as usize;
+                for sy in sy_start..sy_end {
+                    let row_y = (top + sy) as usize * WIDTH;
+                    let ty = (if vflip { h - 1 - sy } else { sy }) as u32;
+                    let cty = ty >> 3;
+                    let fy = ty & 7;
+                    let row_tile_off = if one_d {
+                        base_tile_off + cty * w_tiles * tsz
+                    } else if eight_bpp {
+                        base_tile_off + cty * 1024
+                    } else {
+                        base_tile_off + cty * 1024
+                    };
+                    if eight_bpp {
+                        for sx in sx_start..sx_end {
+                            let tx = (if hflip { w - 1 - sx } else { sx }) as u32;
+                            let tile_off = row_tile_off + (tx >> 3) * 64;
+                            let color =
+                                vram_page_read8(&obj_pages, tile_off + fy * 8 + (tx & 7)) as u32;
+                            if color == 0 {
+                                continue;
+                            }
+                            let i = row_y + (left + sx) as usize;
+                            obj_semi[i] = is_semi;
+                            obj_bmp_alpha[i] = 0;
+                            obj_col[i] = if obj_extpal_on {
+                                m.obj_extpal(eng, palnum, color)
+                            } else {
+                                let poff = pal_base + (color as usize) * 2;
+                                u16::from_le_bytes([m.pal[poff], m.pal[poff + 1]])
+                            };
+                            obj_prio[i] = prio;
+                            any_drawn = true;
+                        }
+                    } else {
+                        for sx in sx_start..sx_end {
+                            let tx = (if hflip { w - 1 - sx } else { sx }) as u32;
+                            let tile_off = row_tile_off + (tx >> 3) * 32;
+                            let fx = tx & 7;
+                            let b =
+                                vram_page_read8(&obj_pages, tile_off + fy * 4 + (fx >> 1)) as u32;
+                            let color = if fx & 1 == 0 { b & 0xF } else { b >> 4 };
+                            if color == 0 {
+                                continue;
+                            }
+                            let i = row_y + (left + sx) as usize;
+                            obj_semi[i] = is_semi;
+                            obj_bmp_alpha[i] = 0;
+                            let poff = pal_row_base + (color as usize) * 2;
+                            obj_col[i] = u16::from_le_bytes([m.pal[poff], m.pal[poff + 1]]);
+                            obj_prio[i] = prio;
+                            any_drawn = true;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let (pa, pb, pc, pd) = if rot {
+                let grp = oam_base + (a1 >> 9 & 0x1F) as usize * 32;
+                let p = |o: usize| i16::from_le_bytes([m.oam[grp + o], m.oam[grp + o + 1]]) as i32;
+                (p(6), p(14), p(22), p(30))
+            } else {
+                (0x100, 0, 0, 0x100)
+            };
             for sy in sy_start..sy_end {
                 let y = (top + sy) as usize;
                 let row_y = y * WIDTH;

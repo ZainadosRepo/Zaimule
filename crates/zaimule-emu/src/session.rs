@@ -120,6 +120,12 @@ pub struct StationBootstrap {
     pub speed_multiplier: u8,
     #[serde(default)]
     pub nds_layout: String,
+    #[serde(default)]
+    pub nds_3d_scale: u8,
+    #[serde(default)]
+    pub viewport_integer_scale: bool,
+    #[serde(default)]
+    pub rewind_enabled: bool,
 }
 
 /// Combined frame step response for single, dual (2P), or quad (4P Tournament) viewport rendering.
@@ -324,6 +330,7 @@ fn native_fps_for_console(console: ConsoleKind) -> f64 {
 fn normalize_nds_layout(raw: &str) -> String {
     match raw.trim().to_ascii_lowercase().as_str() {
         "horizontal" => "horizontal".into(),
+        "hybrid" => "hybrid".into(),
         "vertical-swapped" => "vertical-swapped".into(),
         "horizontal-swapped" => "horizontal-swapped".into(),
         _ => "vertical".into(),
@@ -353,6 +360,9 @@ pub struct EmulatorSession {
     pub rom_cache_dir: PathBuf,
     pub switch_vault_root: PathBuf,
     pub switch_vault: SwitchVaultStatus,
+    bios_entries_cache: Vec<BiosEntry>,
+    pcm_scratch: Vec<f32>,
+    merged_pcm_scratch: Vec<f32>,
     pub last_scan_report: Option<DirectoryScanReport>,
     pub active_launched_rom_path: Option<PathBuf>,
     pub active_disasm_rom: Vec<u8>,
@@ -386,8 +396,10 @@ impl EmulatorSession {
     /// Starts a clean Zaimule session with zero demo ROMs, zero fake data, and zero disk auto-scans.
     pub fn new() -> Self {
         let base_tmp = std::env::temp_dir().join("zaimule");
+        let system_dir = base_tmp.join("system");
         let switch_vault_root = base_tmp.join("switch");
         let switch_vault = inspect_switch_vault(&switch_vault_root);
+        let bios_entries_cache = scan_bios_registry(&system_dir);
         Self {
             settings: GlobalSettings::default(),
             catalog: Vec::new(),
@@ -414,11 +426,14 @@ impl EmulatorSession {
                 spectator_mode_active: false,
             },
             udp_node: UdpNetplayNode::bind_ephemeral(),
-            system_dir: base_tmp.join("system"),
+            system_dir,
             save_dir: base_tmp.join("saves"),
             rom_cache_dir: base_tmp.join("rom_cache"),
             switch_vault_root,
             switch_vault,
+            bios_entries_cache,
+            pcm_scratch: Vec::with_capacity(2048),
+            merged_pcm_scratch: Vec::with_capacity(2048),
             last_scan_report: None,
             active_launched_rom_path: None,
             active_disasm_rom: Vec::new(),
@@ -456,6 +471,12 @@ impl EmulatorSession {
         self.system_dir = system_dir;
         self.save_dir = save_dir;
         self.rom_cache_dir = rom_cache_dir;
+        self.refresh_bios_cache();
+    }
+
+    /// Re-scans `system_dir` for BIOS/firmware files and updates the cached registry.
+    pub fn refresh_bios_cache(&mut self) {
+        self.bios_entries_cache = scan_bios_registry(&self.system_dir);
     }
 
     pub fn set_switch_vault_root(&mut self, vault_root: PathBuf) {
@@ -487,6 +508,7 @@ impl EmulatorSession {
         }
         settings.nds_layout = normalize_nds_layout(&settings.nds_layout);
         settings.speed_multiplier = settings.speed_multiplier.clamp(1, 8);
+        settings.nds_3d_scale = settings.nds_3d_scale.clamp(1, 2);
         if !settings.keymapper_widgets.is_empty() {
             self.keymapper_widgets = settings.keymapper_widgets.clone();
         }
@@ -511,6 +533,8 @@ impl EmulatorSession {
         let cfg = resolve_effective_config(&self.settings, &game.id, game.console);
         self.core_p1.set_cpu_overclock_pct(cfg.cpu_overclock_pct);
         self.core_p1.set_color_correction(cfg.pgxp_subpixel);
+        self.core_p1
+            .set_3d_scale(self.settings.nds_3d_scale.clamp(1, 2));
     }
 
     /// Refreshes the active core's cached SRAM slice before inspection or export.
@@ -532,6 +556,28 @@ impl EmulatorSession {
         speed_multiplier: Option<u8>,
         nds_layout: Option<String>,
     ) -> StationBootstrap {
+        self.update_ui_preferences_extended(
+            shader_css,
+            upscaler_mode,
+            speed_multiplier,
+            nds_layout,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_ui_preferences_extended(
+        &mut self,
+        shader_css: Option<String>,
+        upscaler_mode: Option<String>,
+        speed_multiplier: Option<u8>,
+        nds_layout: Option<String>,
+        nds_3d_scale: Option<u8>,
+        viewport_integer_scale: Option<bool>,
+        rewind_enabled: Option<bool>,
+    ) -> StationBootstrap {
         if let Some(shader) = shader_css {
             let trimmed = shader.trim();
             if !trimmed.is_empty() {
@@ -550,6 +596,19 @@ impl EmulatorSession {
         if let Some(layout) = nds_layout {
             if !layout.trim().is_empty() {
                 self.settings.nds_layout = normalize_nds_layout(&layout);
+            }
+        }
+        if let Some(scale) = nds_3d_scale {
+            self.settings.nds_3d_scale = scale.clamp(1, 2);
+            self.core_p1.set_3d_scale(self.settings.nds_3d_scale);
+        }
+        if let Some(integer_scale) = viewport_integer_scale {
+            self.settings.viewport_integer_scale = integer_scale;
+        }
+        if let Some(rewind_on) = rewind_enabled {
+            self.settings.rewind_enabled = rewind_on;
+            if !rewind_on {
+                self.rewind_buffer.clear();
             }
         }
         self.bootstrap_snapshot()
@@ -651,7 +710,7 @@ impl EmulatorSession {
             udp_packets_sent: self.udp_node.packets_sent,
             udp_packets_received: self.udp_node.packets_received,
             native_cores: built_in_native_cores_info(),
-            bios_entries: scan_bios_registry(&self.system_dir),
+            bios_entries: self.bios_entries_cache.clone(),
             link_telemetry: self.link_telemetry.clone(),
             rewind_snapshots_count: self.rewind_buffer.len(),
             rewind_memory_bytes: self.rewind_buffer.memory_usage_bytes(),
@@ -663,6 +722,9 @@ impl EmulatorSession {
             upscaler_mode: self.settings.upscaler_mode.clone(),
             speed_multiplier: self.settings.speed_multiplier.clamp(1, 8),
             nds_layout: normalize_nds_layout(&self.settings.nds_layout),
+            nds_3d_scale: self.settings.nds_3d_scale.clamp(1, 2),
+            viewport_integer_scale: self.settings.viewport_integer_scale,
+            rewind_enabled: self.settings.rewind_enabled,
         }
     }
 
@@ -1023,6 +1085,7 @@ impl EmulatorSession {
         paths: &[PathBuf],
     ) -> Result<(BiosImportReport, StationBootstrap), String> {
         let report = import_bios_from_paths(paths, &self.system_dir)?;
+        self.refresh_bios_cache();
         Ok((report, self.bootstrap_snapshot()))
     }
 
@@ -1573,6 +1636,10 @@ impl EmulatorSession {
 
     /// Executes `step_viewport_with_speed` and serializes to `"ZMFR"` v1 binary bytes,
     /// optionally skipping the JSON debug metadata trailer on non-telemetry frames.
+    ///
+    /// Single-player sessions use a zero-copy fast path (`step_frame_borrowed` + `rgba_frame`)
+    /// that skips PPU/3D rasterization on intermediate fast-forward frames and avoids
+    /// per-frame RGBA clones and `CpuDebugSnapshot` string allocations.
     pub fn step_viewport_binary_bytes_ex(
         &mut self,
         raw_buttons_p1: u16,
@@ -1581,9 +1648,236 @@ impl EmulatorSession {
         speed_mult: u8,
         include_debug_meta: bool,
     ) -> Vec<u8> {
-        let resp =
-            self.step_viewport_with_speed(raw_buttons_p1, raw_buttons_p2, turbo_active, speed_mult);
-        encode_viewport_binary_packet_with_meta(&resp, self.sram_dirty, include_debug_meta)
+        if self.link_telemetry.enabled {
+            let resp = self.step_viewport_with_speed(
+                raw_buttons_p1,
+                raw_buttons_p2,
+                turbo_active,
+                speed_mult,
+            );
+            return encode_viewport_binary_packet_with_meta(
+                &resp,
+                self.sram_dirty,
+                include_debug_meta,
+            );
+        }
+
+        let steps = usize::from(speed_mult.clamp(1, 8));
+        self.merged_pcm_scratch.clear();
+        let mut acc_l = 0.0f32;
+        let mut acc_r = 0.0f32;
+        let mut acc_count = 0usize;
+        let mut last_meta = crate::traits::FastFrameMeta::default();
+        let mut newly_unlocked_achievement: Option<String> = None;
+        let console = self.core_p1.console();
+        let inv_steps = 1.0 / (steps as f32);
+
+        for s in 0..steps {
+            let current_frame = self.frame_counter;
+            let mut mask_p1 = raw_buttons_p1;
+
+            if turbo_active {
+                let turbos: Vec<(u16, u8)> = self
+                    .keymapper_widgets
+                    .iter()
+                    .filter_map(|w| w.turbo_hz.map(|hz| (w.button_mask, hz)))
+                    .collect();
+                mask_p1 = apply_turbo_mask(mask_p1, &turbos, current_frame);
+            }
+
+            if let Some(ref macro_id) = self.active_macro_id {
+                if let Some(seq) = self.macros.iter().find(|m| &m.id == macro_id) {
+                    let offset = current_frame.saturating_sub(self.macro_start_frame);
+                    if let Some(macro_mask) = seq.sample_at_frame(offset) {
+                        mask_p1 |= macro_mask;
+                    } else {
+                        self.active_macro_id = None;
+                    }
+                }
+            }
+
+            for cheat in &self.cheat_codes {
+                if cheat.enabled {
+                    self.core_p1.apply_ram_cheat(cheat.addr, cheat.value);
+                }
+            }
+
+            for wp in &self.memory_watchpoints {
+                if wp.frozen {
+                    self.core_p1.apply_ram_cheat(wp.addr, wp.frozen_value);
+                }
+            }
+
+            if self.udp_node.peer_addr.is_some() {
+                let snap = self.core_p1.debug_snapshot();
+                let sb = u8::from_str_radix(snap.serial_sb_hex.trim_start_matches("0x"), 16)
+                    .unwrap_or(0);
+                let _ = self.udp_node.send_frame_packet(NetplayWirePacket {
+                    frame: current_frame as u32,
+                    buttons_mask: mask_p1,
+                    sio_sb: sb,
+                    sio_sc: 0x81,
+                });
+                let _ = self.udp_node.poll_incoming_packet();
+            }
+
+            let skip_render = s + 1 < steps;
+            self.pcm_scratch.clear();
+            let meta =
+                self.core_p1
+                    .step_frame_borrowed(mask_p1, skip_render, &mut self.pcm_scratch);
+
+            if steps > 1 {
+                for pair in self.pcm_scratch.as_chunks::<2>().0 {
+                    acc_l += pair[0];
+                    acc_r += pair[1];
+                    acc_count += 1;
+                    if acc_count == steps {
+                        self.merged_pcm_scratch.push(acc_l * inv_steps);
+                        self.merged_pcm_scratch.push(acc_r * inv_steps);
+                        acc_l = 0.0;
+                        acc_r = 0.0;
+                        acc_count = 0;
+                    }
+                }
+            } else {
+                std::mem::swap(&mut self.merged_pcm_scratch, &mut self.pcm_scratch);
+            }
+
+            self.frame_counter = self.frame_counter.saturating_add(1);
+            if self.core_loaded && !self.active_game_id.is_empty() {
+                self.playtime_frame_accum += 1.0 / native_fps_for_console(console);
+                if self.playtime_frame_accum >= 1.0 {
+                    let whole_secs = self.playtime_frame_accum.floor() as u64;
+                    self.playtime_frame_accum -= whole_secs as f64;
+                    if let Some(game) = self
+                        .catalog
+                        .iter_mut()
+                        .find(|g| g.id == self.active_game_id)
+                    {
+                        game.playtime_seconds = game.playtime_seconds.saturating_add(whole_secs);
+                        self.playtime_dirty = true;
+                    }
+                }
+            }
+
+            if !self.memory_watchpoints.is_empty() {
+                self.core_p1.sync_debug_caches();
+                let ram_slice = self.core_p1.read_ram_slice();
+                if !ram_slice.is_empty() {
+                    for wp in &mut self.memory_watchpoints {
+                        wp.previous_value = wp.current_value;
+                        if wp.frozen {
+                            wp.current_value = wp.frozen_value;
+                        } else {
+                            let idx = (wp.addr as usize).wrapping_sub(0xC000) % ram_slice.len();
+                            wp.current_value = ram_slice[idx];
+                        }
+                    }
+                }
+            }
+
+            let rewind_stride = if console == ConsoleKind::Nds { 90 } else { 16 };
+            if self.core_loaded
+                && self.settings.rewind_enabled
+                && meta.frame_number.is_multiple_of(rewind_stride)
+            {
+                if let Ok(raw_state) = self.core_p1.save_state() {
+                    self.rewind_buffer
+                        .push_snapshot_owned(meta.frame_number, raw_state);
+                }
+            }
+            if self.recent_inputs_trace.len() >= 120 {
+                self.recent_inputs_trace.remove(0);
+            }
+            self.recent_inputs_trace.push((mask_p1 & 0xFF) as u8);
+
+            let sram_stride = if console == ConsoleKind::Nds { 60 } else { 16 };
+            if self.core_loaded
+                && self.frame_counter.is_multiple_of(sram_stride)
+                && self.core_p1.sram_maybe_dirty()
+            {
+                self.refresh_sram_dirty_flag();
+            }
+
+            if s + 1 == steps {
+                if steps > 1 && acc_count > 0 && self.merged_pcm_scratch.is_empty() {
+                    let inv = 1.0 / (acc_count as f32);
+                    self.merged_pcm_scratch.push(acc_l * inv);
+                    self.merged_pcm_scratch.push(acc_r * inv);
+                }
+                last_meta = meta;
+            }
+        }
+
+        if !self.achievements.is_empty() {
+            for ach in &mut self.achievements {
+                if !ach.unlocked && self.last_score >= ach.target_score {
+                    ach.unlocked = true;
+                    newly_unlocked_achievement = Some(format!(
+                        "{} {} (+{} pts)",
+                        ach.badge_symbol, ach.title, ach.points
+                    ));
+                }
+            }
+        }
+
+        let emit_meta = include_debug_meta
+            || newly_unlocked_achievement.is_some()
+            || self.active_macro_id.is_some();
+        let meta_json = if emit_meta {
+            let cpu = self.core_p1.debug_snapshot();
+            self.last_score = cpu.score;
+            serde_json::to_vec(&ViewportPacketMetadata {
+                console,
+                cpu: &cpu,
+                link_telemetry: &self.link_telemetry,
+                active_macro_id: self.active_macro_id.as_deref(),
+                newly_unlocked_achievement: newly_unlocked_achievement.as_deref(),
+            })
+            .unwrap_or_else(|_| b"{}".to_vec())
+        } else {
+            Vec::new()
+        };
+
+        let (width, height, rgba) = self.core_p1.rgba_frame();
+        let pcm_bytes_len = self.merged_pcm_scratch.len() * 4;
+        let total_cap = 35 + 8 + rgba.len() + 4 + pcm_bytes_len + 4 + meta_json.len();
+        let mut out = Vec::with_capacity(total_cap);
+
+        let mut flags = 0u8;
+        if self.sram_dirty {
+            flags |= 0x04;
+        }
+        if self.active_macro_id.is_some() {
+            flags |= 0x08;
+        }
+
+        out.extend_from_slice(&VIEWPORT_BINARY_MAGIC);
+        out.push(VIEWPORT_BINARY_VERSION);
+        out.push(flags);
+        out.extend_from_slice(&last_meta.sample_rate_hz.to_le_bytes());
+        out.extend_from_slice(&last_meta.frame_number.to_le_bytes());
+        out.extend_from_slice(&last_meta.audio_level.to_le_bytes());
+        out.extend_from_slice(&last_meta.audio_freq_hz.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        out.extend_from_slice(&(self.rewind_buffer.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.rewind_buffer.memory_usage_bytes() as u32).to_le_bytes());
+        out.push(1u8); // view count = 1
+
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        out.extend_from_slice(&(rgba.len() as u32).to_le_bytes());
+        out.extend_from_slice(rgba);
+
+        out.extend_from_slice(&(self.merged_pcm_scratch.len() as u32).to_le_bytes());
+        for &sample in &self.merged_pcm_scratch {
+            out.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        out.extend_from_slice(&(meta_json.len() as u32).to_le_bytes());
+        out.extend_from_slice(&meta_json);
+        out
     }
 
     fn step_single_viewport_tick(
@@ -1708,11 +2002,14 @@ impl EmulatorSession {
         }
 
         let rewind_stride = if primary.console == ConsoleKind::Nds {
-            60
+            90
         } else {
             16
         };
-        if self.core_loaded && primary.frame_number.is_multiple_of(rewind_stride) {
+        if self.core_loaded
+            && self.settings.rewind_enabled
+            && primary.frame_number.is_multiple_of(rewind_stride)
+        {
             if let Ok(raw_state) = self.core_p1.save_state() {
                 self.rewind_buffer
                     .push_snapshot_owned(primary.frame_number, raw_state);
@@ -1723,8 +2020,13 @@ impl EmulatorSession {
             self.recent_inputs_trace.remove(0);
         }
         self.recent_inputs_trace.push((mask_p1 & 0xFF) as u8);
+        let sram_stride = if primary.console == ConsoleKind::Nds {
+            60
+        } else {
+            16
+        };
         if self.core_loaded
-            && self.frame_counter.is_multiple_of(rewind_stride)
+            && self.frame_counter.is_multiple_of(sram_stride)
             && self.core_p1.sram_maybe_dirty()
         {
             self.refresh_sram_dirty_flag();

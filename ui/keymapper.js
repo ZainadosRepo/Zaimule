@@ -101,11 +101,12 @@ export function applyPressedTurboWidgets(baseMask, pressedSet, widgets, frame, f
 /**
  * Maps normalized viewport coordinates (0..1, 0..1) on the Nintendo DS dual-screen
  * canvas into NDS touchscreen coordinates (0..255, 0..191), independent of upscaler
- * resolution and supporting all 4 dual-screen layouts:
+ * resolution and supporting all 5 dual-screen layouts:
  * - `"vertical"` (default): top screen 0..0.5 Y, touchscreen 0.5..1.0 Y
  * - `"vertical-swapped"`: touchscreen 0..0.5 Y, top screen 0.5..1.0 Y
  * - `"horizontal"`: top screen 0..0.5 X, touchscreen 0.5..1.0 X
  * - `"horizontal-swapped"`: touchscreen 0..0.5 X, top screen 0.5..1.0 X
+ * - `"hybrid"`: main screen 0..(2/3) X, touchscreen (2/3)..1.0 X & 0.25..0.75 Y
  */
 export function mapCanvasToNdsStylus(normX, normY, layout = "vertical") {
   const clampedX = Math.max(0, Math.min(1, Number(normX) || 0));
@@ -115,7 +116,14 @@ export function mapCanvasToNdsStylus(normX, normY, layout = "vertical") {
   let touchNormX = clampedX;
   let touchNormY = clampedY;
 
-  if (mode === "vertical-swapped") {
+  if (mode === "hybrid") {
+    const splitX = 2 / 3;
+    if (clampedX < splitX || clampedY < 0.25 || clampedY > 0.75) {
+      return { onBottomScreen: false, x: 0, y: 0 };
+    }
+    touchNormX = (clampedX - splitX) / (1 - splitX);
+    touchNormY = (clampedY - 0.25) / 0.5;
+  } else if (mode === "vertical-swapped") {
     if (clampedY >= 0.5) {
       return { onBottomScreen: false, x: 0, y: 0 };
     }

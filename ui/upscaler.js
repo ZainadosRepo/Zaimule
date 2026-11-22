@@ -1,7 +1,7 @@
 // Zaimule — Real-Time Pixel-Art Upscaler & CRT Phosphor Bloom Pipeline
 // Pure ES module testable under Node.js (`node --test`) and browser WebView.
 
-export const UPSCALER_MODES = ["OFF", "SCALE2X", "XBRZ", "BLOOM"];
+export const UPSCALER_MODES = ["OFF", "SHARP", "SCALE2X", "XBRZ", "BLOOM"];
 
 const IS_LITTLE_ENDIAN = (() => {
   const buf = new ArrayBuffer(2);
@@ -366,6 +366,7 @@ export function applyCrtPhosphorBloomRgba(rgba, width, height) {
 
 export const NDS_LAYOUT_MODES = [
   "vertical",
+  "hybrid",
   "horizontal",
   "vertical-swapped",
   "horizontal-swapped",
@@ -398,6 +399,7 @@ export function upscaleFrameIfEnabled(frame, mode = "OFF") {
  * - `"vertical-swapped"` -> `(W, H)` with touchscreen on top, main screen below
  * - `"horizontal"` -> `(2*W, H/2)` with main screen left, touchscreen right
  * - `"horizontal-swapped"` -> `(2*W, H/2)` with touchscreen left, main screen right
+ * - `"hybrid"` -> `(3*W, H)` with 2x main screen on left `(0..2*W, 0..H)` and 1x touchscreen centered on right `(2*W..3*W, H/4..3*H/4)`
  */
 export function arrangeNdsDualScreenFrame(frame, layout = "vertical") {
   if (!frame || !frame.rgba) {
@@ -445,6 +447,58 @@ export function arrangeNdsDualScreenFrame(frame, layout = "vertical") {
         out.set(src.subarray(topOff, topOff + rowBytes), dstOff);
         out.set(src.subarray(botOff, botOff + rowBytes), dstOff + rowBytes);
       }
+    }
+    return { width: outW, height: outH, rgba: out };
+  }
+
+  if (mode === "hybrid") {
+    const outW = w * 3;
+    const outH = h;
+    const out = new Uint8ClampedArray(outW * outH * 4);
+    // Fill background with obsidian (#090c10)
+    for (let i = 0; i < out.length; i += 4) {
+      out[i] = 9;
+      out[i + 1] = 12;
+      out[i + 2] = 16;
+      out[i + 3] = 255;
+    }
+    // Left 2W x H: 2x nearest-neighbor scaled top screen
+    for (let y = 0; y < halfH; y += 1) {
+      const srcRow = y * rowBytes;
+      const dstRow0 = y * 2 * outW * 4;
+      const dstRow1 = (y * 2 + 1) * outW * 4;
+      for (let x = 0; x < w; x += 1) {
+        const sIdx = srcRow + x * 4;
+        const r = src[sIdx];
+        const g = src[sIdx + 1];
+        const b = src[sIdx + 2];
+        const a = src[sIdx + 3];
+        const d0 = dstRow0 + x * 8;
+        const d1 = dstRow1 + x * 8;
+        out[d0] = r;
+        out[d0 + 1] = g;
+        out[d0 + 2] = b;
+        out[d0 + 3] = a;
+        out[d0 + 4] = r;
+        out[d0 + 5] = g;
+        out[d0 + 6] = b;
+        out[d0 + 7] = a;
+        out[d1] = r;
+        out[d1 + 1] = g;
+        out[d1 + 2] = b;
+        out[d1 + 3] = a;
+        out[d1 + 4] = r;
+        out[d1 + 5] = g;
+        out[d1 + 6] = b;
+        out[d1 + 7] = a;
+      }
+    }
+    // Right W x halfH centered vertically at yOffset = floor(halfH / 2)
+    const yOffset = halfH >> 1;
+    for (let y = 0; y < halfH; y += 1) {
+      const botOff = (y + halfH) * rowBytes;
+      const dstOff = ((yOffset + y) * outW + w * 2) * 4;
+      out.set(src.subarray(botOff, botOff + rowBytes), dstOff);
     }
     return { width: outW, height: outH, rgba: out };
   }

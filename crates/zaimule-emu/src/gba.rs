@@ -8,7 +8,7 @@
 
 use crate::traits::{
     buttons_to_termboy, pcm_rms_level, solid_obsidian_rgba, CpuDebugSnapshot, EmulatorBackend,
-    FrameStepResult, DEFAULT_SAMPLE_RATE_HZ,
+    FastFrameMeta, FrameStepResult, DEFAULT_SAMPLE_RATE_HZ,
 };
 use termboy_core::Core;
 use termboy_gba::cpu::psr::{C, N, V, Z};
@@ -25,7 +25,7 @@ pub struct GbaCore {
     color_correction: bool,
     sram_cache: Vec<u8>,
     audio_pairs_scratch: Vec<(f32, f32)>,
-    standby_rgba: Vec<u8>,
+    rgba_buf: Vec<u8>,
 }
 
 impl Default for GbaCore {
@@ -47,7 +47,7 @@ impl GbaCore {
             color_correction: true,
             sram_cache: Vec::new(),
             audio_pairs_scratch: Vec::with_capacity(1024),
-            standby_rgba: solid_obsidian_rgba(GBA_WIDTH, GBA_HEIGHT),
+            rgba_buf: solid_obsidian_rgba(GBA_WIDTH, GBA_HEIGHT),
         }
     }
 
@@ -80,46 +80,55 @@ impl EmulatorBackend for GbaCore {
         Ok(())
     }
 
-    fn step_frame(&mut self, buttons_mask: u16) -> FrameStepResult {
+    fn step_frame_borrowed(
+        &mut self,
+        buttons_mask: u16,
+        skip_render: bool,
+        pcm_out: &mut Vec<f32>,
+    ) -> FastFrameMeta {
         self.frame_number = self.frame_number.saturating_add(1);
         let frame_number = self.frame_number;
         let sample_rate_hz = self.sample_rate_hz;
 
         let Some(ref mut gba) = self.inner else {
-            return FrameStepResult {
-                console: ConsoleKind::Gba,
+            return FastFrameMeta {
                 frame_number,
                 width: GBA_WIDTH as u16,
                 height: GBA_HEIGHT as u16,
-                rgba: self.standby_rgba.clone(),
                 audio_level: 0.0,
                 audio_freq_hz: 0,
-                audio_samples: Vec::new(),
                 sample_rate_hz,
                 serial_out_byte: None,
-                cpu: self.debug_snapshot(),
             };
         };
 
-        let fb = gba.run_frame(buttons_to_termboy(buttons_mask));
-        let mut rgba = Vec::with_capacity(GBA_WIDTH * GBA_HEIGHT * 4);
-        for px in &fb.pixels {
-            rgba.push(px.0);
-            rgba.push(px.1);
-            rgba.push(px.2);
-            rgba.push(255);
+        let buttons = buttons_to_termboy(buttons_mask);
+        if skip_render {
+            gba.run_frame_skip_render(buttons);
+        } else {
+            let fb = gba.run_frame(buttons);
+            for (dst, px) in self
+                .rgba_buf
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(fb.pixels.iter())
+            {
+                *dst = [px.0, px.1, px.2, 255];
+            }
         }
 
         self.audio_pairs_scratch.clear();
         gba.drain_audio(&mut self.audio_pairs_scratch);
-        let mut audio_samples = Vec::with_capacity(self.audio_pairs_scratch.len() * 2);
+        let pcm_start = pcm_out.len();
+        pcm_out.reserve(self.audio_pairs_scratch.len() * 2);
         for &(l, r) in &self.audio_pairs_scratch {
-            audio_samples.push(l.clamp(-1.0, 1.0));
-            audio_samples.push(r.clamp(-1.0, 1.0));
+            pcm_out.push(l.clamp(-1.0, 1.0));
+            pcm_out.push(r.clamp(-1.0, 1.0));
         }
 
         let (apu_freq, apu_level_pct) = gba.apu_telemetry();
-        let rms = pcm_rms_level(&audio_samples);
+        let rms = pcm_rms_level(&pcm_out[pcm_start..]);
         let audio_level = if rms > 0.001 {
             rms
         } else {
@@ -127,18 +136,35 @@ impl EmulatorBackend for GbaCore {
         };
         let audio_freq_hz = apu_freq.min(u32::from(u16::MAX)) as u16;
 
-        let cpu = self.debug_snapshot();
-
-        FrameStepResult {
-            console: ConsoleKind::Gba,
+        FastFrameMeta {
             frame_number,
             width: GBA_WIDTH as u16,
             height: GBA_HEIGHT as u16,
-            rgba,
             audio_level,
             audio_freq_hz,
-            audio_samples,
             sample_rate_hz,
+            serial_out_byte: None,
+        }
+    }
+
+    fn rgba_frame(&self) -> (u16, u16, &[u8]) {
+        (GBA_WIDTH as u16, GBA_HEIGHT as u16, &self.rgba_buf)
+    }
+
+    fn step_frame(&mut self, buttons_mask: u16) -> FrameStepResult {
+        let mut audio_samples = Vec::with_capacity(1664);
+        let meta = self.step_frame_borrowed(buttons_mask, false, &mut audio_samples);
+        let cpu = self.debug_snapshot();
+        FrameStepResult {
+            console: ConsoleKind::Gba,
+            frame_number: meta.frame_number,
+            width: meta.width,
+            height: meta.height,
+            rgba: self.rgba_buf.clone(),
+            audio_level: meta.audio_level,
+            audio_freq_hz: meta.audio_freq_hz,
+            audio_samples,
+            sample_rate_hz: meta.sample_rate_hz,
             serial_out_byte: None,
             cpu,
         }
