@@ -2437,7 +2437,7 @@ impl EmulatorSession {
         }
         let pack = ZaimulePortablePack {
             magic: PORTABLE_PACK_MAGIC.into(),
-            version: "1.6.2".into(),
+            version: "1.7.0".into(),
             active_game_id: self.active_game_id.clone(),
             sram_rle,
             sram_uncompressed_len: sram_raw.len(),
