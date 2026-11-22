@@ -28,7 +28,7 @@ static DUMP3D: std::sync::LazyLock<Option<String>> =
 pub const TRANSPARENT: u32 = u32::MAX;
 
 /// Sub-texel bias applied before picking a texel (NDS_TEXBIAS overrides it).
-static TEXBIAS: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+static TEXBIAS: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
     std::env::var("NDS_TEXBIAS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -43,31 +43,32 @@ static TEXDBG: std::sync::LazyLock<Option<u32>> = std::sync::LazyLock::new(|| {
 #[derive(Clone, Copy, Default)]
 struct V {
     // Clip space (raw 20.12 units as floats; the scale cancels out).
-    x: f32,
-    y: f32,
-    z: f32,
-    w: f32,
-    r: f32,
-    g: f32,
-    b: f32,
-    s: f32, // texcoords in texels (input is 12.4 fixed)
-    t: f32,
+    x: f64,
+    y: f64,
+    z: f64,
+    w: f64,
+    r: f64,
+    g: f64,
+    b: f64,
+    s: f64, // texcoords in texels (input is 12.4 fixed)
+    t: f64,
     // Screen space, filled after projection.
-    sx: f32,
-    sy: f32,
-    d: f32,  // depth value
-    rw: f32, // 1/w
+    sx: f64,
+    sy: f64,
+    d: f64,  // depth value
+    rw: f64, // 1/w
 }
 
 /// Reusable scratch buffers owned by [`super::ppu::Ppu`] so 3D rasterization
 /// performs zero heap allocations per frame.
 pub struct Render3dScratch {
     pub fb: Vec<u32>,
-    depth: Vec<f32>,
+    depth: Vec<f64>,
     poly_id: Vec<u8>,
+    trans_poly_id: Vec<u8>,
     stencil: Vec<bool>,
     prep_verts: Vec<V>,
-    prepared: Vec<(usize, usize, usize, f32)>,
+    prepared: Vec<(usize, usize, usize, f64)>,
     clip_a: Vec<V>,
     clip_b: Vec<V>,
     order: Vec<usize>,
@@ -84,7 +85,8 @@ impl Render3dScratch {
         Self {
             fb: vec![TRANSPARENT; WIDTH * HEIGHT],
             depth: vec![1.0; WIDTH * HEIGHT],
-            poly_id: vec![0; WIDTH * HEIGHT],
+            poly_id: vec![0xFF; WIDTH * HEIGHT],
+            trans_poly_id: vec![0xFF; WIDTH * HEIGHT],
             stencil: vec![false; WIDTH * HEIGHT],
             prep_verts: Vec::with_capacity(4096),
             prepared: Vec::with_capacity(1024),
@@ -96,8 +98,8 @@ impl Render3dScratch {
 }
 
 #[inline(always)]
-fn lerp(a: &V, b: &V, f: f32) -> V {
-    let l = |p: f32, q: f32| p + (q - p) * f;
+fn lerp(a: &V, b: &V, f: f64) -> V {
+    let l = |p: f64, q: f64| p + (q - p) * f;
     V {
         x: l(a.x, b.x),
         y: l(a.y, b.y),
@@ -116,7 +118,7 @@ fn lerp(a: &V, b: &V, f: f32) -> V {
 /// Returns `true` when `dst` now holds the active polygon (either clipped or empty),
 /// or `false` when every vertex is already inside so `src` remains valid in-place.
 #[inline(always)]
-fn clip_plane_into(src: &[V], dst: &mut Vec<V>, dist: impl Fn(&V) -> f32) -> bool {
+fn clip_plane_into(src: &[V], dst: &mut Vec<V>, dist: impl Fn(&V) -> f64) -> bool {
     let mut all_in = true;
     let mut any_in = false;
     for v in src {
@@ -150,9 +152,9 @@ fn clip_plane_into(src: &[V], dst: &mut Vec<V>, dist: impl Fn(&V) -> f32) -> boo
 }
 
 #[inline(always)]
-fn fast_floor(x: f32) -> i32 {
+fn fast_floor(x: f64) -> i32 {
     let i = x as i32;
-    i - i32::from(x < i as f32)
+    i - i32::from(x < i as f64)
 }
 
 #[derive(Clone, Copy)]
@@ -169,12 +171,12 @@ struct TexInfo {
     color0_clear: bool,
     base: u32,
     pltt: u32,
-    bias: f32,
+    bias: f64,
 }
 
 impl TexInfo {
     #[inline(always)]
-    fn from_poly(tp: u32, pltt: u32, bias: f32) -> Self {
+    fn from_poly(tp: u32, pltt: u32, bias: f64) -> Self {
         let tw = 8i32 << ((tp >> 20) & 7);
         let th = 8i32 << ((tp >> 23) & 7);
         Self {
@@ -285,8 +287,8 @@ impl<'a> TexVramCache<'a> {
 fn sample_tex_cached(
     cache: &TexVramCache<'_>,
     tex: &TexInfo,
-    s: f32,
-    t: f32,
+    s: f64,
+    t: f64,
 ) -> Option<(u16, u32)> {
     let x = wrap_texcoord(
         fast_floor(s + tex.bias),
@@ -398,7 +400,7 @@ fn sample_tex_cached(
 /// Sample a texture; `None` = transparent texel, `Some((rgb15, alpha 0..=31))`.
 #[cfg(test)]
 #[inline]
-fn sample_tex(m: &Machine, tex: &TexInfo, s: f32, t: f32) -> Option<(u16, u32)> {
+fn sample_tex(m: &Machine, tex: &TexInfo, s: f64, t: f64) -> Option<(u16, u32)> {
     let cache = TexVramCache::new(m);
     sample_tex_cached(&cache, tex, s, t)
 }
@@ -418,7 +420,7 @@ fn blend_modulate_u32(t: u32, v6: u32) -> u32 {
 }
 
 #[inline(always)]
-fn f32_to_v6(v: f32) -> u32 {
+fn f64_to_v6(v: f64) -> u32 {
     let vc = v.clamp(0.0, 31.0);
     if vc > 0.0 {
         (vc * 2.0 + 1.0) as u32
@@ -446,7 +448,7 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
     let scale = scale.clamp(1, 2);
     let out_w = WIDTH * scale;
     let out_h = HEIGHT * scale;
-    let sf = scale as f32;
+    let sf = scale as f64;
     let gx = &m.gx;
     let tex_cache = TexVramCache::new(m);
     let wbuffer = gx.swap_param & 2 != 0;
@@ -461,7 +463,8 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
     if scratch.fb.len() != len {
         scratch.fb.resize(len, clear_px);
         scratch.depth.resize(len, 1.0);
-        scratch.poly_id.resize(len, 0);
+        scratch.poly_id.resize(len, 0xFF);
+        scratch.trans_poly_id.resize(len, 0xFF);
         scratch.stencil.resize(len, false);
     }
     scratch.fb.fill(clear_px);
@@ -471,38 +474,39 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
     }
 
     let clear_d = if wbuffer {
-        f32::MAX
+        f64::MAX
     } else {
-        gx.clear_depth as f32 / 0x7FFF as f32
+        gx.clear_depth as f64 / 0x7FFF as f64
     };
     scratch.depth.fill(clear_d);
-    scratch.poly_id.fill(0);
+    scratch.poly_id.fill(0xFF);
 
     // Viewport (y flipped: clip-space +Y is up, screen +Y is down).
-    let vx0 = gx.viewport[0] as f32;
-    let vy0 = gx.viewport[1] as f32;
-    let vw = (gx.viewport[2] as f32 - vx0 + 1.0).max(1.0);
-    let vh = (gx.viewport[3] as f32 - vy0 + 1.0).max(1.0);
+    let vx0 = gx.viewport[0] as f64;
+    let vy0 = gx.viewport[1] as f64;
+    let vw = (gx.viewport[2] as f64 - vx0 + 1.0).max(1.0);
+    let vh = (gx.viewport[3] as f64 - vy0 + 1.0).max(1.0);
 
     scratch.prep_verts.clear();
     scratch.prepared.clear();
     let mut has_pass1 = false;
     let mut has_shadows = false;
+    let mut has_poly_translucent = false;
 
     for (pi, poly) in gx.disp_polys.iter().enumerate() {
         scratch.clip_a.clear();
         for &i in &poly.verts[..poly.nverts as usize] {
             let v = &gx.disp_verts[i as usize];
             scratch.clip_a.push(V {
-                x: v.clip[0] as f32,
-                y: v.clip[1] as f32,
-                z: v.clip[2] as f32,
-                w: v.clip[3] as f32,
-                r: (v.color & 0x1F) as f32,
-                g: (v.color >> 5 & 0x1F) as f32,
-                b: (v.color >> 10 & 0x1F) as f32,
-                s: v.tex[0] as f32 * 0.0625,
-                t: v.tex[1] as f32 * 0.0625,
+                x: v.clip[0] as f64,
+                y: v.clip[1] as f64,
+                z: v.clip[2] as f64,
+                w: v.clip[3] as f64,
+                r: (v.color & 0x1F) as f64,
+                g: (v.color >> 5 & 0x1F) as f64,
+                b: (v.color >> 10 & 0x1F) as f64,
+                s: v.tex[0] as f64 * 0.0625,
+                t: v.tex[1] as f64 * 0.0625,
                 ..Default::default()
             });
         }
@@ -542,16 +546,19 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
             continue;
         }
 
-        // Project (multiply by `sf` before snapping so 2x HD mode gets true sub-pixel geometry edges).
+        // Hardware computes screen coordinates by integer division, so every vertex
+        // lands on a whole 1x pixel and a polygon's texture is re-fitted to that
+        // integer outline. Locking to the 1x integer grid before multiplying by `sf`
+        // prevents outdoor buildings and ground tiles from wobbling while walking.
         for v in pv.iter_mut() {
             v.rw = 1.0 / v.w;
-            v.sx = ((vx0 + (v.x * v.rw * 0.5 + 0.5) * vw) * sf).floor();
-            v.sy = (((HEIGHT as f32) - (vy0 + (v.y * v.rw * 0.5 + 0.5) * vh)) * sf).floor();
+            v.sx = (vx0 + (v.x * v.rw * 0.5 + 0.5) * vw).floor() * sf;
+            v.sy = ((HEIGHT as f64) - (vy0 + (v.y * v.rw * 0.5 + 0.5) * vh)).floor() * sf;
             v.d = if wbuffer { v.w } else { v.z * v.rw * 0.5 + 0.5 };
         }
 
         // Face culling: signed area in screen space (y down).
-        let mut area2 = 0.0f32;
+        let mut area2 = 0.0f64;
         for i in 0..pv.len() {
             let a = &pv[i];
             let b = &pv[if i + 1 < pv.len() { i + 1 } else { 0 }];
@@ -570,13 +577,14 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
         if poly_mode == 3 {
             has_shadows = true;
             has_pass1 = true;
-        } else if (raw_alpha != 0 && raw_alpha < 31)
-            || (poly_mode != 1 && (format == 1 || format == 6))
-        {
+        } else if raw_alpha != 0 && raw_alpha < 31 {
+            has_poly_translucent = true;
+            has_pass1 = true;
+        } else if poly_mode != 1 && (format == 1 || format == 6) {
             has_pass1 = true;
         }
 
-        let avg_d = pv.iter().map(|v| v.d).sum::<f32>() / pv.len() as f32;
+        let avg_d = pv.iter().map(|v| v.d).sum::<f64>() / pv.len() as f64;
         let v_start = scratch.prep_verts.len();
         scratch.prep_verts.extend_from_slice(pv);
         let v_end = scratch.prep_verts.len();
@@ -587,9 +595,13 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
         return;
     }
 
+    if has_pass1 {
+        scratch.trans_poly_id.fill(0xFF);
+    }
     if has_shadows {
         scratch.stencil.fill(false);
     }
+    let _ = has_poly_translucent;
 
     if *POLYSTATS {
         let mut modes = [0usize; 4];
@@ -677,15 +689,6 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
     scratch.order.extend(0..scratch.prepared.len());
 
     for pass in 0..passes {
-        if pass == 1 {
-            let prep = &scratch.prepared;
-            scratch.order.sort_by(|&a, &b| {
-                prep[b]
-                    .3
-                    .partial_cmp(&prep[a].3)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
         for oi in 0..scratch.order.len() {
             let pidx = scratch.order[oi];
             let (pi, vs, ve, _) = scratch.prepared[pidx];
@@ -728,28 +731,34 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
                 &mut scratch.fb,
                 &mut scratch.depth,
                 &mut scratch.poly_id,
+                &mut scratch.trans_poly_id,
                 &mut scratch.stencil,
             );
         }
     }
 
-    // Close single-pixel pinholes between adjacent fixed-point tile edges.
-    if clear_px == TRANSPARENT {
+    // Close single-pixel pinholes between adjacent fixed-point tile edges
+    // (works regardless of whether clear_alpha is 0 or 31 by checking untouched poly_id == 0xFF).
+    {
         let fb = &mut scratch.fb;
+        let pid_buf = &scratch.poly_id;
         for y in 1..out_h - 1 {
             let row = y * out_w;
             for x in 1..out_w - 1 {
                 let i = row + x;
-                if fb[i] != TRANSPARENT {
+                if pid_buf[i] != 0xFF {
                     continue;
                 }
-                let (a, b) = if fb[i - 1] != TRANSPARENT && fb[i + 1] != TRANSPARENT {
+                let (a, b) = if pid_buf[i - 1] != 0xFF && pid_buf[i + 1] != 0xFF {
                     (fb[i - 1], fb[i + 1])
-                } else if fb[i - out_w] != TRANSPARENT && fb[i + out_w] != TRANSPARENT {
+                } else if pid_buf[i - out_w] != 0xFF && pid_buf[i + out_w] != 0xFF {
                     (fb[i - out_w], fb[i + out_w])
                 } else {
                     continue;
                 };
+                if a == TRANSPARENT || b == TRANSPARENT {
+                    continue;
+                }
                 let r = (((a >> 16) & 0xFF) + ((b >> 16) & 0xFF)) >> 1;
                 let g = (((a >> 8) & 0xFF) + ((b >> 8) & 0xFF)) >> 1;
                 let bl = ((a & 0xFF) + (b & 0xFF)) >> 1;
@@ -832,13 +841,14 @@ fn raster_poly(
     pass: usize,
     wbuffer: bool,
     highlight_mode: bool,
-    tex_bias: f32,
+    tex_bias: f64,
     pixdbg: Option<(usize, usize)>,
     out_w: usize,
     out_h: usize,
     fb: &mut [u32],
-    depth: &mut [f32],
+    depth: &mut [f64],
     poly_id: &mut [u8],
+    trans_poly_id: &mut [u8],
     stencil: &mut [bool],
 ) {
     let depth_equal = poly.attr & (1 << 14) != 0;
@@ -847,7 +857,7 @@ fn raster_poly(
     let poly_mode = (poly.attr >> 4) & 3;
     let shadow_mask = poly_mode == 3 && pid == 0;
     let shadow_draw = poly_mode == 3 && pid != 0;
-    let eps = if wbuffer { 0x200 as f32 } else { 1.0 / 4096.0 };
+    let eps = if wbuffer { 0x200 as f64 } else { 1.0 / 4096.0 };
     let tex = TexInfo::from_poly(poly.texparam, poly.pltt, tex_bias);
     let textured = tex.format != 0;
     let fast_opaque_mod = pass == 0 && poly_mode == 0 && poly_alpha >= 31 && pixdbg.is_none();
@@ -887,7 +897,7 @@ fn raster_poly(
             continue;
         }
 
-        let inv = 1.0f32 / area as f32;
+        let inv = 1.0f64 / area as f64;
         let (d0, d1, d2) = (tri[0].d, tri[1].d, tri[2].d);
         let (rw0, rw1, rw2) = (tri[0].rw, tri[1].rw, tri[2].rw);
         let (r0, r1, r2) = (tri[0].r * rw0, tri[1].r * rw1, tri[2].r * rw2);
@@ -902,9 +912,9 @@ fn raster_poly(
             && (tri[0].g - tri[2].g).abs() < 1e-4
             && (tri[0].b - tri[1].b).abs() < 1e-4
             && (tri[0].b - tri[2].b).abs() < 1e-4;
-        let flat_vr6 = f32_to_v6(tri[0].r);
-        let flat_vg6 = f32_to_v6(tri[0].g);
-        let flat_vb6 = f32_to_v6(tri[0].b);
+        let flat_vr6 = f64_to_v6(tri[0].r);
+        let flat_vg6 = f64_to_v6(tri[0].g);
+        let flat_vb6 = f64_to_v6(tri[0].b);
         let flat_white = flat_color && flat_vr6 == 63 && flat_vg6 == 63 && flat_vb6 == 63;
 
         let dx0 = (p1.1 - p2.1) * 16;
@@ -914,9 +924,9 @@ fn raster_poly(
         let dx2 = (p0.1 - p1.1) * 16;
         let dy2 = (p1.0 - p0.0) * 16;
 
-        let dl0 = dx0 as f32 * inv;
-        let dl1 = dx1 as f32 * inv;
-        let dl2 = dx2 as f32 * inv;
+        let dl0 = dx0 as f64 * inv;
+        let dl1 = dx1 as f64 * inv;
+        let dl2 = dx2 as f64 * inv;
         let dd_dx = dl0 * d0 + dl1 * d1 + dl2 * d2;
         let drw_dx = dl0 * rw0 + dl1 * rw1 + dl2 * rw2;
         let dr_dx = dl0 * r0 + dl1 * r1 + dl2 * r2;
@@ -941,9 +951,9 @@ fn raster_poly(
                 if let Some((k_lo, k_hi)) =
                     row_span_k(w0_row + b0, dx0, w1_row + b1, dx1, w2_row + b2, dx2, max_k)
                 {
-                    let l0 = (w0_row + k_lo * dx0) as f32 * inv;
-                    let l1 = (w1_row + k_lo * dx1) as f32 * inv;
-                    let l2 = (w2_row + k_lo * dx2) as f32 * inv;
+                    let l0 = (w0_row + k_lo * dx0) as f64 * inv;
+                    let l1 = (w1_row + k_lo * dx1) as f64 * inv;
+                    let l2 = (w2_row + k_lo * dx2) as f64 * inv;
                     let mut d = l0 * d0 + l1 * d1 + l2 * d2;
                     let row_base = py * out_w + px0;
                     let x_start = k_lo as usize;
@@ -986,9 +996,9 @@ fn raster_poly(
                     if let Some((k_lo, k_hi)) =
                         row_span_k(w0_row + b0, dx0, w1_row + b1, dx1, w2_row + b2, dx2, max_k)
                     {
-                        let l0 = (w0_row + k_lo * dx0) as f32 * inv;
-                        let l1 = (w1_row + k_lo * dx1) as f32 * inv;
-                        let l2 = (w2_row + k_lo * dx2) as f32 * inv;
+                        let l0 = (w0_row + k_lo * dx0) as f64 * inv;
+                        let l1 = (w1_row + k_lo * dx1) as f64 * inv;
+                        let l2 = (w2_row + k_lo * dx2) as f64 * inv;
                         let mut d = l0 * d0 + l1 * d1 + l2 * d2;
                         let mut rw = l0 * rw0 + l1 * rw1 + l2 * rw2;
                         let mut s_acc = l0 * s0 + l1 * s1 + l2 * s2;
@@ -1027,9 +1037,9 @@ fn raster_poly(
                 if let Some((k_lo, k_hi)) =
                     row_span_k(w0_row + b0, dx0, w1_row + b1, dx1, w2_row + b2, dx2, max_k)
                 {
-                    let l0 = (w0_row + k_lo * dx0) as f32 * inv;
-                    let l1 = (w1_row + k_lo * dx1) as f32 * inv;
-                    let l2 = (w2_row + k_lo * dx2) as f32 * inv;
+                    let l0 = (w0_row + k_lo * dx0) as f64 * inv;
+                    let l1 = (w1_row + k_lo * dx1) as f64 * inv;
+                    let l2 = (w2_row + k_lo * dx2) as f64 * inv;
                     let mut d = l0 * d0 + l1 * d1 + l2 * d2;
                     let mut rw = l0 * rw0 + l1 * rw1 + l2 * rw2;
                     let mut s_acc = l0 * s0 + l1 * s1 + l2 * s2;
@@ -1071,9 +1081,9 @@ fn raster_poly(
                                                 as u16)
                                                 << 10)
                                     } else {
-                                        let vr6 = f32_to_v6(r_acc * inv_rw);
-                                        let vg6 = f32_to_v6(g_acc * inv_rw);
-                                        let vb6 = f32_to_v6(b_acc * inv_rw);
+                                        let vr6 = f64_to_v6(r_acc * inv_rw);
+                                        let vg6 = f64_to_v6(g_acc * inv_rw);
+                                        let vb6 = f64_to_v6(b_acc * inv_rw);
                                         (blend_modulate_u32((tc & 0x1F) as u32, vr6) as u16)
                                             | ((blend_modulate_u32(((tc >> 5) & 0x1F) as u32, vg6)
                                                 as u16)
@@ -1111,9 +1121,9 @@ fn raster_poly(
             if let Some((k_lo, k_hi)) =
                 row_span_k(w0_row + b0, dx0, w1_row + b1, dx1, w2_row + b2, dx2, max_k)
             {
-                let l0 = (w0_row + k_lo * dx0) as f32 * inv;
-                let l1 = (w1_row + k_lo * dx1) as f32 * inv;
-                let l2 = (w2_row + k_lo * dx2) as f32 * inv;
+                let l0 = (w0_row + k_lo * dx0) as f64 * inv;
+                let l1 = (w1_row + k_lo * dx1) as f64 * inv;
+                let l2 = (w2_row + k_lo * dx2) as f64 * inv;
                 let mut d = l0 * d0 + l1 * d1 + l2 * d2;
                 let mut rw = l0 * rw0 + l1 * rw1 + l2 * rw2;
                 let mut r_acc = l0 * r0 + l1 * r1 + l2 * r2;
@@ -1167,6 +1177,9 @@ fn raster_poly(
                     if shadow_draw && (!stencil[i] || poly_id[i] == pid) {
                         continue;
                     }
+                    if pass == 1 && !shadow_draw && poly_alpha < 31 && trans_poly_id[i] == pid {
+                        continue;
+                    }
                     let inv_rw = 1.0 / cur_rw;
                     let vr = cur_r * inv_rw;
                     let vg = cur_g * inv_rw;
@@ -1189,7 +1202,7 @@ fn raster_poly(
                                         let tr = (tc & 0x1F) as u32;
                                         let tg = ((tc >> 5) & 0x1F) as u32;
                                         let tb = ((tc >> 10) & 0x1F) as u32;
-                                        let dec = |tc_ch: u32, vc_ch: f32| -> u16 {
+                                        let dec = |tc_ch: u32, vc_ch: f64| -> u16 {
                                             ((tc_ch * (ta + 1) + (vc_ch as u32) * (31 - ta)) >> 5)
                                                 .min(31)
                                                 as u16
@@ -1242,7 +1255,7 @@ fn raster_poly(
                                     else {
                                         continue;
                                     };
-                                    let vr6 = f32_to_v6(vr);
+                                    let vr6 = f64_to_v6(vr);
                                     (
                                         blend_modulate_u32((tc & 0x1F) as u32, vr6),
                                         blend_modulate_u32(((tc >> 5) & 0x1F) as u32, vr6),
@@ -1278,9 +1291,9 @@ fn raster_poly(
                                                 "[pix]   texel s={s:.3} t={t:.3} -> rgb15={tc:#06X} a={ta}"
                                             );
                                         }
-                                        let vr6 = f32_to_v6(vr);
-                                        let vg6 = f32_to_v6(vg);
-                                        let vb6 = f32_to_v6(vb);
+                                        let vr6 = f64_to_v6(vr);
+                                        let vg6 = f64_to_v6(vg);
+                                        let vb6 = f64_to_v6(vb);
                                         let rgb = (blend_modulate_u32((tc & 0x1F) as u32, vr6)
                                             as u16)
                                             | ((blend_modulate_u32(((tc >> 5) & 0x1F) as u32, vg6)
@@ -1338,6 +1351,9 @@ fn raster_poly(
                             stencil[i] = false;
                         } else {
                             poly_id[i] = pid;
+                            if poly_alpha < 31 {
+                                trans_poly_id[i] = pid;
+                            }
                         }
                     }
                 }
@@ -1489,5 +1505,47 @@ mod tests {
         assert_eq!(ppu.fb_a_hd.len(), (WIDTH * 2) * (HEIGHT * 2));
         assert_eq!(ppu.fb_a_hd[192 * (WIDTH * 2) + 256], hd_center);
         assert_eq!(ppu.fb_a[96 * WIDTH + 128], hd_center);
+    }
+
+    #[test]
+    fn box_test_culls_offscreen_boxes_and_translucent_poly_id_prevents_self_blend() {
+        let mut m = Machine::new();
+        // Identity clip matrix: frustum is [-0x1000, +0x1000]^3 with w = 0x1000.
+        // 1) Box inside frustum: x=-0x0400, y=-0x0400, z=-0x0400, dx=dy=dz=0x0800
+        let pack16 = |lo: i16, hi: i16| -> u32 { (lo as u16 as u32) | ((hi as u16 as u32) << 16) };
+        m.gx.write_port(0x70, pack16(-0x0400, -0x0400));
+        m.gx.write_port(0x70, pack16(-0x0400, 0x0800));
+        m.gx.write_port(0x70, pack16(0x0800, 0x0800));
+        assert_ne!(m.gx.gxstat_lo() & 2, 0, "in-frustum box must report inside");
+
+        // 2) Box far off-screen to the right: x=0x2000..0x2800 (> w=0x1000)
+        m.gx.write_port(0x70, pack16(0x2000, -0x0400));
+        m.gx.write_port(0x70, pack16(-0x0400, 0x0800));
+        m.gx.write_port(0x70, pack16(0x0800, 0x0800));
+        assert_eq!(
+            m.gx.gxstat_lo() & 2,
+            0,
+            "off-screen box must report outside"
+        );
+
+        // 3) Two overlapping translucent polygons with the SAME Polygon ID (pid=7) must not double-blend.
+        m.gx.clear_color = 31 << 16; // opaque black background
+        let trans_attr_same_id = (3 << 6) | (16 << 16) | (7 << 24); // alpha=16, pid=7
+        setup_fullscreen_tri(&mut m, trans_attr_same_id, 0, 0, 31); // pure red
+        let first_poly = m.gx.disp_polys[0];
+        m.gx.disp_polys.push(first_poly); // second identical translucent polygon with same pid=7
+        let fb_same = render(&m);
+        let r_same = (fb_same[96 * WIDTH + 128] >> 16) & 0xFF;
+
+        // With different Polygon IDs (pid=7 then pid=8), the second polygon DOES blend on top.
+        let mut second_diff = first_poly;
+        second_diff.attr = (3 << 6) | (16 << 16) | (8 << 24);
+        m.gx.disp_polys[1] = second_diff;
+        let fb_diff = render(&m);
+        let r_diff = (fb_diff[96 * WIDTH + 128] >> 16) & 0xFF;
+        assert!(
+            r_diff > r_same,
+            "same translucent poly_id must not double-blend ({r_same} vs {r_diff})"
+        );
     }
 }

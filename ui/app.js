@@ -432,6 +432,9 @@ let state = {
   ndsLayout: "vertical",
   nds3dScale: 1,
   viewportIntegerScale: false,
+  viewportStretchMode:
+    (typeof localStorage !== "undefined" && localStorage.getItem("zaimule.viewportStretchMode")) ||
+    "native",
   rewindEnabled: true,
   activeMacroId: null,
   recordingMacro: false,
@@ -3604,6 +3607,30 @@ function bindEvents() {
   for (const id of ["emu-nds-3d-scale-select", "settings-nds-3d-scale-select"]) {
     document.getElementById(id)?.addEventListener("change", (e) => {
       applyNds3dScale(e.target.value);
+    });
+  }
+
+  const applyStretchMode = (nextMode) => {
+    const valid = ["native", "wide", "stretch"];
+    const mode = valid.includes(nextMode) ? nextMode : "native";
+    state.viewportStretchMode = mode;
+    try {
+      localStorage.setItem("zaimule.viewportStretchMode", mode);
+    } catch {
+      // ignore storage errors
+    }
+    applyDisplayPreferencesToDom();
+  };
+
+  document.getElementById("btn-stretch-cycle")?.addEventListener("click", () => {
+    const order = ["native", "wide", "stretch"];
+    const idx = order.indexOf(state.viewportStretchMode);
+    applyStretchMode(order[(idx + 1) % order.length]);
+  });
+
+  for (const id of ["emu-stretch-select", "settings-stretch-select"]) {
+    document.getElementById(id)?.addEventListener("change", (e) => {
+      applyStretchMode(e.target.value);
     });
   }
 

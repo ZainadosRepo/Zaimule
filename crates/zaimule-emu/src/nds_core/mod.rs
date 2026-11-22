@@ -31,7 +31,7 @@ pub const NDS_HEIGHT: usize = ppu::HEIGHT * 2;
 pub const NDS_SAVE_LEN: usize = 0x8_0000;
 
 const SCANLINES_PER_FRAME: u32 = 263;
-const ARM9_INSTR_PER_LINE: u32 = 2000;
+const ARM9_INSTR_PER_LINE: u32 = 3400;
 const ARM7_INSTR_PER_LINE: u32 = 500;
 const SPU_CYCLES_PER_LINE: u32 = 1062;
 const PEN_RELEASE_FRAMES: u32 = 3;

@@ -600,6 +600,18 @@
               <div class="settings-group">
                 <div class="setting-row">
                   <div class="setting-copy">
+                    <div class="setting-name">Taille &amp; Étirement de la vue</div>
+                    <div class="setting-desc">Conserve les proportions de la console, élargit l'image (4:3 / 16:10), ou étire sur 100 % de la zone de jeu.</div>
+                  </div>
+                  <select id="settings-stretch-select" class="field-inline setting-select">
+                    <option value="native">Proportions d'origine (Grand)</option>
+                    <option value="wide">Élargi (Confort 4:3 / 16:10)</option>
+                    <option value="stretch">Étirer (Plein écran 100%)</option>
+                  </select>
+                </div>
+
+                <div class="setting-row">
+                  <div class="setting-copy">
                     <div class="setting-name">Amélioration d'image (Upscaler GPU)</div>
                     <div class="setting-desc">Lisse les contours par shader GPU WebGL2 (xBRZ HD ou Sharp-Bilinear anti-scintillement) sans surcharge CPU.</div>
                   </div>

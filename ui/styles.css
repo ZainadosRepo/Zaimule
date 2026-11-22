@@ -1138,15 +1138,16 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 20px;
-  padding: 20px;
+  gap: 12px;
+  padding: 8px 12px;
+  min-height: 0;
 }
 
 .crt-bezel {
   background-color: var(--bg-surface);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
-  padding: 12px;
+  padding: 6px;
   box-shadow: var(--shadow-elevated);
   display: flex;
   flex-direction: column;
@@ -1160,13 +1161,11 @@ body {
   flex-wrap: wrap;
   font-size: var(--text-xs);
   color: var(--text-secondary);
-  margin-bottom: 8px;
+  margin-bottom: 6px;
 }
 
 .screen-container {
   position: relative;
-  width: 480px;
-  height: 360px;
   background-color: #0E0D0C;
   border-radius: var(--radius-xs);
   overflow: hidden;
@@ -1175,21 +1174,11 @@ body {
   transform: translateZ(0);
 }
 
-.emu-screens-wrap.dual-mode .screen-container {
-  width: 380px;
-  height: 285px;
-}
-
 .emu-screens-wrap.quad-mode {
   display: grid;
   grid-template-columns: repeat(2, auto);
-  gap: 12px;
-  padding: 12px;
-}
-
-.emu-screens-wrap.quad-mode .screen-container {
-  width: 290px;
-  height: 196px;
+  gap: 10px;
+  padding: 8px;
 }
 
 .disasm-row {
@@ -1300,11 +1289,6 @@ canvas.game-canvas {
 .app-shell.big-picture .game-card.selected .game-cover {
   outline: 3px solid var(--accent-primary);
   outline-offset: 4px;
-}
-
-.app-shell.big-picture .screen-container {
-  width: 560px;
-  height: 420px;
 }
 
 .keymapper-overlay {
@@ -1926,22 +1910,24 @@ canvas.game-canvas {
   gap: 4px;
 }
 
-/* True console aspect ratios & full-stage responsive game viewport */
+/* True console aspect ratios, wide comfort mode, and 100% full-stage stretch mode */
 .screen-container {
   --screen-aspect-w: 10;
   --screen-aspect-h: 9;
-  --stage-avail-w: 88vw;
-  --stage-avail-h: calc(100vh - 154px);
+  --stage-avail-w: calc(100vw - 44px);
+  --stage-avail-h: calc(100vh - 134px);
   width: min(
-    1440px,
     var(--stage-avail-w),
     calc(var(--stage-avail-h) * var(--screen-aspect-w) / var(--screen-aspect-h))
   );
   height: min(
-    1080px,
     calc(var(--stage-avail-w) * var(--screen-aspect-h) / var(--screen-aspect-w)),
     var(--stage-avail-h)
   );
+}
+
+.emu-layout:has(.emu-drawer:not(.collapsed)) .screen-container {
+  --stage-avail-w: calc(100vw - 348px);
 }
 
 .screen-container.mode-gb {
@@ -1969,14 +1955,39 @@ canvas.game-canvas {
   --screen-aspect-h: 1;
 }
 
+/* Mode "Élargi (Confort 4:3 / 16:10)" — widens the view significantly without extreme distortion */
+.screen-container.stretch-wide.mode-gb,
+.screen-container.stretch-wide.mode-gba {
+  --screen-aspect-w: 16;
+  --screen-aspect-h: 10;
+}
+
+.screen-container.stretch-wide.mode-nds {
+  --screen-aspect-w: 4;
+  --screen-aspect-h: 3;
+}
+
+.screen-container.stretch-wide.mode-nds.nds-horizontal,
+.screen-container.stretch-wide.mode-nds.nds-hybrid {
+  --screen-aspect-w: 16;
+  --screen-aspect-h: 9;
+}
+
+/* Mode "Étirer (Plein écran 100%)" — stretches the image to fill 100% of available stage width & height */
+.screen-container.stretch-fill,
+.app-shell.viewport-fullscreen .screen-container.stretch-fill {
+  width: var(--stage-avail-w) !important;
+  height: var(--stage-avail-h) !important;
+}
+
 .emu-screens-wrap.dual-mode .screen-container {
-  --stage-avail-w: 44vw;
-  --stage-avail-h: calc(100vh - 180px);
+  --stage-avail-w: 45vw;
+  --stage-avail-h: calc(100vh - 160px);
 }
 
 .emu-screens-wrap.quad-mode .screen-container {
-  --stage-avail-w: 42vw;
-  --stage-avail-h: calc((100vh - 210px) * 0.48);
+  --stage-avail-w: 44vw;
+  --stage-avail-h: calc((100vh - 180px) * 0.48);
 }
 
 .emu-hints-bar {

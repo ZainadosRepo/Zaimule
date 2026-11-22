@@ -1887,6 +1887,29 @@ impl View {
                     fast_done = true;
                 }
             }
+        } else if kind != DMA_CART
+            && cpu == 0
+            && word
+            && src_ctl == 0
+            && dst_ctl == 2
+            && (0x0400_0400..0x0400_0440).contains(&(dst & !3))
+            && (src >> 24) == 0x02
+        {
+            // Fast bulk Geometry-FIFO DMA (display lists in main RAM streamed to GXFIFO).
+            let mut m = self.m.borrow_mut();
+            let byte_len = (len as usize).saturating_mul(4);
+            let src_a = src & !3;
+            let so = (src_a & 0x3F_FFFF) as usize;
+            let dtcm_hit = src_a < m.dtcm_base.wrapping_add(0x4000)
+                && src_a.wrapping_add(byte_len as u32) > m.dtcm_base;
+            if !m.debug_hooks && !dtcm_hit && so + byte_len <= m.main_ram.len() {
+                let Machine { main_ram, gx, .. } = &mut *m;
+                for chunk in main_ram[so..so + byte_len].chunks_exact(4) {
+                    gx.write_fifo(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                }
+                src = src.wrapping_add(len.wrapping_mul(4));
+                fast_done = true;
+            }
         }
         if !fast_done {
             for _ in 0..len {
@@ -2158,6 +2181,10 @@ impl View {
             0x062A if cpu == 0 => (m.gx.pos_result[2] >> 16) as u16,
             0x062C if cpu == 0 => m.gx.pos_result[3] as u16,
             0x062E if cpu == 0 => (m.gx.pos_result[3] >> 16) as u16,
+            // VEC_TEST result.
+            0x0630 if cpu == 0 => m.gx.vec_result[0] as u16,
+            0x0632 if cpu == 0 => m.gx.vec_result[1] as u16,
+            0x0634 if cpu == 0 => m.gx.vec_result[2] as u16,
             // Matrix read-back: current clip matrix and vector-matrix rotation.
             0x0640..=0x067F if cpu == 0 => {
                 let w = m.gx.clip_word(((off - 0x640) / 4) as usize);

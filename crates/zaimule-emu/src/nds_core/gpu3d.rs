@@ -193,6 +193,10 @@ pub struct Gpu3d {
     pub clear_color: u32,
     pub clear_depth: u16,
     pub pos_result: [i32; 4],
+    #[serde(skip, default = "default_box_test")]
+    pub box_test_result: bool,
+    #[serde(skip)]
+    pub vec_result: [i16; 3],
     /// Polygons stored during the latest completed geometry frame.
     pub last_poly_count: usize,
     pub last_vert_count: usize,
@@ -206,6 +210,10 @@ pub struct Gpu3d {
     /// geometry frame, with a vertex count each. Diagnostic only.
     #[serde(skip)]
     lightlog_setups: Vec<(LightSetup, u32)>,
+}
+
+fn default_box_test() -> bool {
+    true
 }
 
 /// Every input the lighting unit uses, so NDS_LIGHTLOG can report how many
@@ -274,6 +282,8 @@ impl Gpu3d {
             clear_color: 0,
             clear_depth: 0x7FFF,
             pos_result: [0; 4],
+            box_test_result: true,
+            vec_result: [0; 3],
             last_poly_count: 0,
             last_vert_count: 0,
             rejected: 0,
@@ -899,7 +909,46 @@ impl Gpu3d {
                     (p[0] >> 24) as u8,
                 ];
             }
-            0x70 => {} // BOX_TEST: result reads back as "inside" via GXSTAT
+            0x70 => {
+                // BOX_TEST: transform all 8 corners of the 4.12 bounding box into clip space
+                // and check if all 8 corners fall outside any one of the 6 view frustum half-spaces.
+                let x0 = p[0] as i16 as i32;
+                let y0 = (p[0] >> 16) as i16 as i32;
+                let z0 = p[1] as i16 as i32;
+                let dx = (p[1] >> 16) as i16 as i32;
+                let dy = p[2] as i16 as i32;
+                let dz = (p[2] >> 16) as i16 as i32;
+                let m = self.clip_matrix();
+                let xs = [x0, x0.wrapping_add(dx)];
+                let ys = [y0, y0.wrapping_add(dy)];
+                let zs = [z0, z0.wrapping_add(dz)];
+                let mut corners = [[0i64; 4]; 8];
+                let mut ci = 0;
+                for &x in &xs {
+                    for &y in &ys {
+                        for &z in &zs {
+                            for j in 0..4 {
+                                let acc = x as i64 * m[j] as i64
+                                    + y as i64 * m[4 + j] as i64
+                                    + z as i64 * m[8 + j] as i64
+                                    + ((m[12 + j] as i64) << 12);
+                                corners[ci][j] = acc >> 12;
+                            }
+                            ci += 1;
+                        }
+                    }
+                }
+                let mut outside = false;
+                for axis in 0..3 {
+                    let all_lo = corners.iter().all(|c| c[axis] < -c[3]);
+                    let all_hi = corners.iter().all(|c| c[axis] > c[3]);
+                    if all_lo || all_hi {
+                        outside = true;
+                        break;
+                    }
+                }
+                self.box_test_result = !outside;
+            }
             0x71 => {
                 // POS_TEST: run x,y,z (last two params) through the clip matrix.
                 let x = p[0] as i16 as i32;
@@ -915,7 +964,12 @@ impl Gpu3d {
                 }
                 self.last_vtx = [x, y, z];
             }
-            0x72 => {} // VEC_TEST
+            0x72 => {
+                // VEC_TEST: rotate 3x10-bit signed vector through the 3x3 vector matrix.
+                let v = [s10(p[0]) << 3, s10(p[0] >> 10) << 3, s10(p[0] >> 20) << 3];
+                let r = self.vec_rotate(v);
+                self.vec_result = [r[0] as i16, r[1] as i16, r[2] as i16];
+            }
             _ => {}
         }
     }
@@ -1002,7 +1056,9 @@ impl Gpu3d {
     /// in bus.rs so the existing IRQ-mode plumbing stays untouched.
     pub fn gxstat_lo(&self) -> u16 {
         let mut v = 0u16;
-        v |= 2; // box test result: report "inside"
+        if self.box_test_result {
+            v |= 2;
+        }
         v |= ((self.pos_sp & 0x1F) as u16) << 8;
         v |= ((self.proj_sp & 1) as u16) << 13;
         if self.stack_error {
