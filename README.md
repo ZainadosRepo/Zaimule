@@ -31,7 +31,7 @@ Au lancement, l'appli regarde sur GitHub si une version plus récente est publi�
 
 ---
 
-## ✨ Architecture & Fonctionnalités (`v1.6.1`)
+## ✨ Architecture & Fonctionnalités (`v1.6.2`)
 
 - **🧹 Démarrage Propre, Bibliothèque & Dossiers ROMs (`.zip`, `.7z`, Fichiers & Dossiers)**
   - **Zéro contenu propriétaire inclus & zéro scan automatique** : la bibliothèque démarre vide sans parcourir vos dossiers personnels ; aucune ROM, aucune clé Switch ni aucun binaire externe n'est distribué avec Zaimule.

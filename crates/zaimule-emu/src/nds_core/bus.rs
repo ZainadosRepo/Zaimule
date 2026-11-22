@@ -511,6 +511,15 @@ pub struct Machine {
     /// Snapshot of `vramcnt` used to build `vram_arm9_lut` (for safe cache coherence).
     #[serde(skip)]
     vram_lut_sig: [u8; 9],
+    /// Last VRAM bank (`0..4`) mapped to each 3D texture slot (`0..4`) with `MST = 3` (`0x83`),
+    /// preserved while a game temporarily switches the bank to LCDC (`0x80`) or disabled (`0x00`)
+    /// mode to CPU/DMA-upload animated character or outdoor textures.
+    #[serde(skip)]
+    pub last_tex_bank: [Option<u8>; 4],
+    /// Last `(bank, sub_chunk)` (`bank in 4..=6`, `sub_chunk in 0..4`) mapped to each 3D palette
+    /// 16 KiB chunk (`0..8`) with `MST = 3` (`0x83`), preserved across temporary LCDC uploads.
+    #[serde(skip)]
+    pub last_pal_chunk: [Option<(u8, u8)>; 8],
 }
 
 /// Two-point touchscreen ADC calibration derived from firmware user settings (`0x58..0x64`).
@@ -831,6 +840,8 @@ impl Machine {
             touch_cal: None,
             vram_arm9_lut: vec![(0xFF, 0); 560],
             vram_lut_sig: [0; 9],
+            last_tex_bank: [None; 4],
+            last_pal_chunk: [None; 8],
             wifi: vec![0; 0x1_0000],
             rtc_reg: 0,
             rtc_bit_n: 0,
@@ -1503,6 +1514,59 @@ impl Machine {
                 }
             }
         }
+        // Track last 3D texture/palette bank bindings across temporary LCDC (`0x80`) or
+        // disabled (`0x00`) CPU/DMA upload phases.
+        for i in 0..4usize {
+            let cnt = self.vramcnt[i];
+            if cnt & 0x80 != 0 {
+                let mst = cnt & 7;
+                if mst == 3 {
+                    for b in &mut self.last_tex_bank {
+                        if *b == Some(i as u8) {
+                            *b = None;
+                        }
+                    }
+                    let slot = ((cnt >> 3) & 3) as usize;
+                    self.last_tex_bank[slot] = Some(i as u8);
+                } else if mst != 0 {
+                    for b in &mut self.last_tex_bank {
+                        if *b == Some(i as u8) {
+                            *b = None;
+                        }
+                    }
+                }
+            }
+        }
+        for i in 4..=6usize {
+            let cnt = self.vramcnt[i];
+            if cnt & 0x80 != 0 {
+                let mst = cnt & 7;
+                if mst == 3 {
+                    for p in &mut self.last_pal_chunk {
+                        if p.map(|(b, _)| b) == Some(i as u8) {
+                            *p = None;
+                        }
+                    }
+                    if i == 4 {
+                        for chunk in 0..4usize {
+                            self.last_pal_chunk[chunk] = Some((4, chunk as u8));
+                        }
+                    } else {
+                        let ofs = ((cnt >> 3) & 3) as usize;
+                        let chunk = (ofs & 1) + ((ofs >> 1) & 1) * 4;
+                        if chunk < 8 {
+                            self.last_pal_chunk[chunk] = Some((i as u8, 0));
+                        }
+                    }
+                } else if mst != 0 {
+                    for p in &mut self.last_pal_chunk {
+                        if p.map(|(b, _)| b) == Some(i as u8) {
+                            *p = None;
+                        }
+                    }
+                }
+            }
+        }
         self.vram_lut_sig = self.vramcnt;
     }
 
@@ -1601,7 +1665,8 @@ impl Machine {
     }
 
     /// Read the 3D texture-image space (4 x 128KB slots): banks A-D with
-    /// MST 3 map to slot OFS.
+    /// MST 3 map to slot OFS. Falls back to the last MST=3 bank when that bank
+    /// is temporarily in LCDC (`0x80`) or disabled (`0x00`) mode for CPU/DMA texture upload.
     pub fn tex_read8(&self, off: u32) -> u8 {
         let slot = (off >> 17 & 3) as u8;
         for i in 0..4 {
@@ -1610,15 +1675,22 @@ impl Machine {
                 return self.vram[i][(off & 0x1_FFFF) as usize];
             }
         }
+        if let Some(b) = self.last_tex_bank[slot as usize] {
+            let bi = b as usize;
+            if bi < 4 && (self.vramcnt[bi] & 0x80 == 0 || self.vramcnt[bi] & 0x87 == 0x80) {
+                return self.vram[bi][(off & 0x1_FFFF) as usize];
+            }
+        }
         0
     }
 
     /// Read the 3D texture-palette space (6 x 16KB slots): bank E with MST 3
     /// covers slots 0-3, banks F/G map to slot (OFS.0) + (OFS.1)*4.
+    /// Falls back to the last MST=3 bank when temporarily in LCDC (`0x80`) or disabled (`0x00`) mode.
     pub fn texpal_read16(&self, off: u32) -> u16 {
         let off = off & 0x1_FFFE;
         let chunk = (off >> 14) as u8;
-        let rd = |v: &Vec<u8>, o: usize| u16::from_le_bytes([v[o], v[o + 1]]);
+        let rd = |v: &[u8], o: usize| u16::from_le_bytes([v[o], v[o + 1]]);
         if chunk < 4 && self.vramcnt[4] & 0x87 == 0x83 {
             return rd(&self.vram[4], off as usize);
         }
@@ -1628,6 +1700,15 @@ impl Machine {
                 let ofs = cnt >> 3 & 3;
                 if (ofs & 1) + (ofs >> 1 & 1) * 4 == chunk {
                     return rd(&self.vram[i], (off & 0x3FFF) as usize);
+                }
+            }
+        }
+        if let Some((b, sub)) = self.last_pal_chunk.get(chunk as usize).copied().flatten() {
+            let bi = b as usize;
+            if bi < 7 && (self.vramcnt[bi] & 0x80 == 0 || self.vramcnt[bi] & 0x87 == 0x80) {
+                let base = (sub as usize) * 0x4000 + (off as usize & 0x3FFF);
+                if base + 1 < self.vram[bi].len() {
+                    return rd(&self.vram[bi], base);
                 }
             }
         }
@@ -1903,6 +1984,7 @@ impl View {
             let dtcm_hit = src_a < m.dtcm_base.wrapping_add(0x4000)
                 && src_a.wrapping_add(byte_len as u32) > m.dtcm_base;
             if !m.debug_hooks && !dtcm_hit && so + byte_len <= m.main_ram.len() {
+                m.gx_cmds += len as u64;
                 let Machine { main_ram, gx, .. } = &mut *m;
                 for chunk in main_ram[so..so + byte_len].chunks_exact(4) {
                     gx.write_fifo(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));

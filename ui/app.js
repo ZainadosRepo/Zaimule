@@ -64,6 +64,11 @@ const NDS_LAYOUT_LABELS = {
   "vertical-swapped": "DS : Inversé",
   "horizontal-swapped": "DS : Côte à côte inv."
 };
+const STRETCH_MODE_LABELS = {
+  native: "Vue : Proportions",
+  wide: "Vue : Large",
+  stretch: "Vue : Étirer 100%"
+};
 
 let toastTimer = null;
 let lastSurfacedWarning = "";
@@ -894,6 +899,9 @@ function syncViewportScreenAspect(game) {
   const layout = String(state.ndsLayout || "vertical").toLowerCase();
   const isHorizontal = isNds && layout.startsWith("horizontal");
   const isHybrid = isNds && layout === "hybrid";
+  const stretchMode = STRETCH_MODE_LABELS[state.viewportStretchMode]
+    ? state.viewportStretchMode
+    : "wide";
   ["screen-1", "screen-2", "screen-3", "screen-4"].forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
@@ -902,6 +910,8 @@ function syncViewportScreenAspect(game) {
     el.classList.toggle("mode-nds", isNds);
     el.classList.toggle("nds-horizontal", isHorizontal);
     el.classList.toggle("nds-hybrid", isHybrid);
+    el.classList.toggle("stretch-wide", stretchMode === "wide");
+    el.classList.toggle("stretch-fill", stretchMode === "stretch");
   });
   const layoutBtn = document.getElementById("btn-nds-layout");
   if (layoutBtn) {
@@ -967,6 +977,16 @@ function applyDisplayPreferencesToDom() {
     if (sel) sel.value = String(nds3dScale);
   }
 
+  const stretchMode = STRETCH_MODE_LABELS[state.viewportStretchMode]
+    ? state.viewportStretchMode
+    : "wide";
+  state.viewportStretchMode = stretchMode;
+  setText("btn-stretch-cycle", STRETCH_MODE_LABELS[stretchMode]);
+  for (const id of ["emu-stretch-select", "settings-stretch-select"]) {
+    const sel = document.getElementById(id);
+    if (sel) sel.value = stretchMode;
+  }
+
   const intScale = Boolean(state.viewportIntegerScale);
   setText(
     "btn-emu-integer-scale",
@@ -982,6 +1002,7 @@ function applyDisplayPreferencesToDom() {
 
   syncViewportScreenAspect(getSelectedGame());
   redrawAllGlViewports();
+  requestAnimationFrame(() => redrawAllGlViewports());
 }
 
 function releaseTransientInputs() {
@@ -3263,7 +3284,7 @@ function bindEvents() {
         new TextEncoder().encode(
           JSON.stringify({
             magic: "ZAIMULE_PACK_V1",
-            version: "1.6.1",
+            version: "1.6.2",
             activeGameId: state.activeGameId,
             cheatCodes: state.cheatCodes,
             macros: state.macros

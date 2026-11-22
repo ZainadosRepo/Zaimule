@@ -910,44 +910,10 @@ impl Gpu3d {
                 ];
             }
             0x70 => {
-                // BOX_TEST: transform all 8 corners of the 4.12 bounding box into clip space
-                // and check if all 8 corners fall outside any one of the 6 view frustum half-spaces.
-                let x0 = p[0] as i16 as i32;
-                let y0 = (p[0] >> 16) as i16 as i32;
-                let z0 = p[1] as i16 as i32;
-                let dx = (p[1] >> 16) as i16 as i32;
-                let dy = p[2] as i16 as i32;
-                let dz = (p[2] >> 16) as i16 as i32;
-                let m = self.clip_matrix();
-                let xs = [x0, x0.wrapping_add(dx)];
-                let ys = [y0, y0.wrapping_add(dy)];
-                let zs = [z0, z0.wrapping_add(dz)];
-                let mut corners = [[0i64; 4]; 8];
-                let mut ci = 0;
-                for &x in &xs {
-                    for &y in &ys {
-                        for &z in &zs {
-                            for j in 0..4 {
-                                let acc = x as i64 * m[j] as i64
-                                    + y as i64 * m[4 + j] as i64
-                                    + z as i64 * m[8 + j] as i64
-                                    + ((m[12 + j] as i64) << 12);
-                                corners[ci][j] = acc >> 12;
-                            }
-                            ci += 1;
-                        }
-                    }
-                }
-                let mut outside = false;
-                for axis in 0..3 {
-                    let all_lo = corners.iter().all(|c| c[axis] < -c[3]);
-                    let all_hi = corners.iter().all(|c| c[axis] > c[3]);
-                    if all_lo || all_hi {
-                        outside = true;
-                        break;
-                    }
-                }
-                self.box_test_result = !outside;
+                // BOX_TEST: always report "inside" via GXSTAT bit 1 so games (like Pokémon HG/SS/Pt)
+                // never skip submitting character billboard sprites or room sub-meshes; per-polygon
+                // clip-space frustum culling is handled in `emit_poly`.
+                self.box_test_result = true;
             }
             0x71 => {
                 // POS_TEST: run x,y,z (last two params) through the clip matrix.
@@ -1056,9 +1022,7 @@ impl Gpu3d {
     /// in bus.rs so the existing IRQ-mode plumbing stays untouched.
     pub fn gxstat_lo(&self) -> u16 {
         let mut v = 0u16;
-        if self.box_test_result {
-            v |= 2;
-        }
+        v |= 2; // box test result: report "inside"
         v |= ((self.pos_sp & 0x1F) as u16) << 8;
         v |= ((self.proj_sp & 1) as u16) << 13;
         if self.stack_error {

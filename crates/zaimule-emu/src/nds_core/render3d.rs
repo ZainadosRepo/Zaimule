@@ -65,7 +65,6 @@ pub struct Render3dScratch {
     pub fb: Vec<u32>,
     depth: Vec<f64>,
     poly_id: Vec<u8>,
-    trans_poly_id: Vec<u8>,
     stencil: Vec<bool>,
     prep_verts: Vec<V>,
     prepared: Vec<(usize, usize, usize, f64)>,
@@ -85,8 +84,7 @@ impl Render3dScratch {
         Self {
             fb: vec![TRANSPARENT; WIDTH * HEIGHT],
             depth: vec![1.0; WIDTH * HEIGHT],
-            poly_id: vec![0xFF; WIDTH * HEIGHT],
-            trans_poly_id: vec![0xFF; WIDTH * HEIGHT],
+            poly_id: vec![0; WIDTH * HEIGHT],
             stencil: vec![false; WIDTH * HEIGHT],
             prep_verts: Vec::with_capacity(4096),
             prepared: Vec::with_capacity(1024),
@@ -235,6 +233,14 @@ impl<'a> TexVramCache<'a> {
                     break;
                 }
             }
+            if tex_slots[slot as usize].is_none() {
+                if let Some(b) = m.last_tex_bank[slot as usize] {
+                    let bi = b as usize;
+                    if bi < 4 && (m.vramcnt[bi] & 0x80 == 0 || m.vramcnt[bi] & 0x87 == 0x80) {
+                        tex_slots[slot as usize] = Some(m.vram[bi].as_slice());
+                    }
+                }
+            }
         }
         let mut pal_chunks = [None; 8];
         if m.vramcnt[4] & 0x87 == 0x83 {
@@ -250,6 +256,19 @@ impl<'a> TexVramCache<'a> {
                 let chunk = (ofs & 1) + ((ofs >> 1) & 1) * 4;
                 if chunk < 8 && pal_chunks[chunk].is_none() {
                     pal_chunks[chunk] = Some(m.vram[i].as_slice());
+                }
+            }
+        }
+        for (chunk, slot) in pal_chunks.iter_mut().enumerate() {
+            if slot.is_none() {
+                if let Some((b, sub)) = m.last_pal_chunk[chunk] {
+                    let bi = b as usize;
+                    if bi < 7 && (m.vramcnt[bi] & 0x80 == 0 || m.vramcnt[bi] & 0x87 == 0x80) {
+                        let start = (sub as usize) * 0x4000;
+                        if start + 0x4000 <= m.vram[bi].len() {
+                            *slot = Some(&m.vram[bi][start..start + 0x4000]);
+                        }
+                    }
                 }
             }
         }
@@ -463,8 +482,7 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
     if scratch.fb.len() != len {
         scratch.fb.resize(len, clear_px);
         scratch.depth.resize(len, 1.0);
-        scratch.poly_id.resize(len, 0xFF);
-        scratch.trans_poly_id.resize(len, 0xFF);
+        scratch.poly_id.resize(len, 0);
         scratch.stencil.resize(len, false);
     }
     scratch.fb.fill(clear_px);
@@ -479,7 +497,7 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
         gx.clear_depth as f64 / 0x7FFF as f64
     };
     scratch.depth.fill(clear_d);
-    scratch.poly_id.fill(0xFF);
+    scratch.poly_id.fill(0);
 
     // Viewport (y flipped: clip-space +Y is up, screen +Y is down).
     let vx0 = gx.viewport[0] as f64;
@@ -595,9 +613,6 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
         return;
     }
 
-    if has_pass1 {
-        scratch.trans_poly_id.fill(0xFF);
-    }
     if has_shadows {
         scratch.stencil.fill(false);
     }
@@ -689,6 +704,15 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
     scratch.order.extend(0..scratch.prepared.len());
 
     for pass in 0..passes {
+        if pass == 1 {
+            let prep = &scratch.prepared;
+            scratch.order.sort_by(|&a, &b| {
+                prep[b]
+                    .3
+                    .partial_cmp(&prep[a].3)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
         for oi in 0..scratch.order.len() {
             let pidx = scratch.order[oi];
             let (pi, vs, ve, _) = scratch.prepared[pidx];
@@ -731,34 +755,28 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
                 &mut scratch.fb,
                 &mut scratch.depth,
                 &mut scratch.poly_id,
-                &mut scratch.trans_poly_id,
                 &mut scratch.stencil,
             );
         }
     }
 
-    // Close single-pixel pinholes between adjacent fixed-point tile edges
-    // (works regardless of whether clear_alpha is 0 or 31 by checking untouched poly_id == 0xFF).
-    {
+    // Close single-pixel pinholes between adjacent fixed-point tile edges when clear is transparent.
+    if clear_px == TRANSPARENT {
         let fb = &mut scratch.fb;
-        let pid_buf = &scratch.poly_id;
         for y in 1..out_h - 1 {
             let row = y * out_w;
             for x in 1..out_w - 1 {
                 let i = row + x;
-                if pid_buf[i] != 0xFF {
+                if fb[i] != TRANSPARENT {
                     continue;
                 }
-                let (a, b) = if pid_buf[i - 1] != 0xFF && pid_buf[i + 1] != 0xFF {
+                let (a, b) = if fb[i - 1] != TRANSPARENT && fb[i + 1] != TRANSPARENT {
                     (fb[i - 1], fb[i + 1])
-                } else if pid_buf[i - out_w] != 0xFF && pid_buf[i + out_w] != 0xFF {
+                } else if fb[i - out_w] != TRANSPARENT && fb[i + out_w] != TRANSPARENT {
                     (fb[i - out_w], fb[i + out_w])
                 } else {
                     continue;
                 };
-                if a == TRANSPARENT || b == TRANSPARENT {
-                    continue;
-                }
                 let r = (((a >> 16) & 0xFF) + ((b >> 16) & 0xFF)) >> 1;
                 let g = (((a >> 8) & 0xFF) + ((b >> 8) & 0xFF)) >> 1;
                 let bl = ((a & 0xFF) + (b & 0xFF)) >> 1;
@@ -848,7 +866,6 @@ fn raster_poly(
     fb: &mut [u32],
     depth: &mut [f64],
     poly_id: &mut [u8],
-    trans_poly_id: &mut [u8],
     stencil: &mut [bool],
 ) {
     let depth_equal = poly.attr & (1 << 14) != 0;
@@ -1177,9 +1194,6 @@ fn raster_poly(
                     if shadow_draw && (!stencil[i] || poly_id[i] == pid) {
                         continue;
                     }
-                    if pass == 1 && !shadow_draw && poly_alpha < 31 && trans_poly_id[i] == pid {
-                        continue;
-                    }
                     let inv_rw = 1.0 / cur_rw;
                     let vr = cur_r * inv_rw;
                     let vg = cur_g * inv_rw;
@@ -1351,9 +1365,6 @@ fn raster_poly(
                             stencil[i] = false;
                         } else {
                             poly_id[i] = pid;
-                            if poly_alpha < 31 {
-                                trans_poly_id[i] = pid;
-                            }
                         }
                     }
                 }
@@ -1508,44 +1519,36 @@ mod tests {
     }
 
     #[test]
-    fn box_test_culls_offscreen_boxes_and_translucent_poly_id_prevents_self_blend() {
+    fn preserves_3d_texture_and_palette_while_vram_banks_are_in_lcdc_upload_mode() {
         let mut m = Machine::new();
-        // Identity clip matrix: frustum is [-0x1000, +0x1000]^3 with w = 0x1000.
-        // 1) Box inside frustum: x=-0x0400, y=-0x0400, z=-0x0400, dx=dy=dz=0x0800
-        let pack16 = |lo: i16, hi: i16| -> u32 { (lo as u16 as u32) | ((hi as u16 as u32) << 16) };
-        m.gx.write_port(0x70, pack16(-0x0400, -0x0400));
-        m.gx.write_port(0x70, pack16(-0x0400, 0x0800));
-        m.gx.write_port(0x70, pack16(0x0800, 0x0800));
-        assert_ne!(m.gx.gxstat_lo() & 2, 0, "in-frustum box must report inside");
+        m.vramcnt[2] = 0x83 | (2 << 3); // Bank C -> 3D Texture Slot 2
+        m.vramcnt[5] = 0x83; // Bank F -> 3D Palette Slot 0
+        m.rebuild_vram_lut();
 
-        // 2) Box far off-screen to the right: x=0x2000..0x2800 (> w=0x1000)
-        m.gx.write_port(0x70, pack16(0x2000, -0x0400));
-        m.gx.write_port(0x70, pack16(-0x0400, 0x0800));
-        m.gx.write_port(0x70, pack16(0x0800, 0x0800));
+        // Populate a 16-color texture in Slot 2 (`base = 0x4_0000`, `tp & 0xFFFF = 0x8000`)
+        m.vram[2][0] = 0x11; // color index 1
+        m.vram[5][2..4].copy_from_slice(&(31u16 << 5).to_le_bytes()); // color 1 = pure green
+
+        let tp = (3 << 26) | (1 << 29) | 0x8000; // Format 3 (16-color), color0_clear, base=0x4_0000
+        let tex = TexInfo::from_poly(tp, 0, 1.0 / 1024.0);
+        assert_eq!(sample_tex(&m, &tex, 0.0, 0.0), Some((31 << 5, 31)));
+
+        // Game temporarily switches Bank C and Bank F to LCDC mode (`0x80`) to stream character/outdoor frames
+        m.vramcnt[2] = 0x80;
+        m.vramcnt[5] = 0x80;
+        m.rebuild_vram_lut();
         assert_eq!(
-            m.gx.gxstat_lo() & 2,
-            0,
-            "off-screen box must report outside"
+            sample_tex(&m, &tex, 0.0, 0.0),
+            Some((31 << 5, 31)),
+            "3D texture & palette must remain readable while bank is in LCDC upload mode"
         );
+        assert_eq!(m.tex_read8(0x4_0000), 0x11);
+        assert_eq!(m.texpal_read16(2), 31 << 5);
 
-        // 3) Two overlapping translucent polygons with the SAME Polygon ID (pid=7) must not double-blend.
-        m.gx.clear_color = 31 << 16; // opaque black background
-        let trans_attr_same_id = (3 << 6) | (16 << 16) | (7 << 24); // alpha=16, pid=7
-        setup_fullscreen_tri(&mut m, trans_attr_same_id, 0, 0, 31); // pure red
-        let first_poly = m.gx.disp_polys[0];
-        m.gx.disp_polys.push(first_poly); // second identical translucent polygon with same pid=7
-        let fb_same = render(&m);
-        let r_same = (fb_same[96 * WIDTH + 128] >> 16) & 0xFF;
-
-        // With different Polygon IDs (pid=7 then pid=8), the second polygon DOES blend on top.
-        let mut second_diff = first_poly;
-        second_diff.attr = (3 << 6) | (16 << 16) | (8 << 24);
-        m.gx.disp_polys[1] = second_diff;
-        let fb_diff = render(&m);
-        let r_diff = (fb_diff[96 * WIDTH + 128] >> 16) & 0xFF;
-        assert!(
-            r_diff > r_same,
-            "same translucent poly_id must not double-blend ({r_same} vs {r_diff})"
-        );
+        // Once repurposed for 2D BG (`0x81`), the 3D texture fallback is evicted
+        m.vramcnt[2] = 0x81;
+        m.vramcnt[5] = 0x81;
+        m.rebuild_vram_lut();
+        assert_eq!(sample_tex(&m, &tex, 0.0, 0.0), None);
     }
 }
