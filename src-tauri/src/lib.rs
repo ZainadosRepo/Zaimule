@@ -26,8 +26,91 @@ use zaimule_emu::session::{EmulatorSession, StationBootstrap, ViewportStepRespon
 const LIVE_SRAM_FLUSH_INTERVAL_MS: u64 = 10_000;
 const LIVE_PLAYTIME_FLUSH_INTERVAL_MS: u64 = 30_000;
 
+type EmuJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct OneShotState<T> {
+    value: Option<Result<T, String>>,
+    waker: Option<std::task::Waker>,
+}
+
+struct OneShotFuture<T>(Arc<Mutex<OneShotState<T>>>);
+
+impl<T> std::future::Future for OneShotFuture<T> {
+    type Output = Result<T, String>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut st = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(val) = st.value.take() {
+            std::task::Poll::Ready(val)
+        } else {
+            st.waker = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        }
+    }
+}
+
+/// Persistent dedicated OS thread (`zaimule-emu-worker`) that runs all frame steps on the
+/// exact same core, keeping ARM9/ARM7 RAM, CPU block caches, and 3D scratch buffers hot in L1/L2
+/// instead of hopping across Tokio's `spawn_blocking` thread pool every frame.
+struct EmuWorker {
+    tx: Mutex<std::sync::mpsc::Sender<EmuJob>>,
+}
+
+impl EmuWorker {
+    fn spawn() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<EmuJob>();
+        let _ = std::thread::Builder::new()
+            .name("zaimule-emu-worker".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    job();
+                }
+            });
+        Self { tx: Mutex::new(tx) }
+    }
+
+    fn run<T, F>(&self, f: F) -> OneShotFuture<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, String> + Send + 'static,
+    {
+        let shared = Arc::new(Mutex::new(OneShotState {
+            value: None,
+            waker: None,
+        }));
+        let shared_done = Arc::clone(&shared);
+        let job: EmuJob = Box::new(move || {
+            let res = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+                Ok(inner) => inner,
+                Err(_) => Err("panique interne dans le thread d'émulation".into()),
+            };
+            let waker = {
+                let mut st = shared_done.lock().unwrap_or_else(|e| e.into_inner());
+                st.value = Some(res);
+                st.waker.take()
+            };
+            if let Some(w) = waker {
+                w.wake();
+            }
+        });
+        let send_err = {
+            let guard = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+            guard.send(job).is_err()
+        };
+        if send_err {
+            let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
+            st.value = Some(Err("thread d'émulation interrompu".into()));
+        }
+        OneShotFuture(shared)
+    }
+}
+
 struct AppState {
     session: Arc<Mutex<EmulatorSession>>,
+    emu_worker: EmuWorker,
     last_sram_flush_ms: Arc<AtomicU64>,
     last_playtime_flush_ms: Arc<AtomicU64>,
 }
@@ -39,6 +122,8 @@ struct StepViewportOptions {
     stylus_y: Option<u8>,
     stylus_pressed: Option<bool>,
     include_debug_meta: Option<bool>,
+    prefer_rgb565: Option<bool>,
+    skip_render: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -487,8 +572,9 @@ async fn step_viewport(
     let last_playtime_flush = Arc::clone(&state.last_playtime_flush_ms);
     let speed = speed_mult.unwrap_or(1);
 
-    let (resp, sram_to_flush, lib_to_flush) =
-        tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+    let (resp, sram_to_flush, lib_to_flush) = state
+        .emu_worker
+        .run(move || -> Result<_, String> {
             let now = now_unix_ms();
             let mut session = session_arc
                 .lock()
@@ -498,8 +584,7 @@ async fn step_viewport(
             let flush_lib = maybe_collect_live_library(&last_playtime_flush, &mut session, now);
             Ok((out, flush_sram, flush_lib))
         })
-        .await
-        .map_err(|e| format!("tâche émulation interrompue : {e}"))??;
+        .await?;
 
     spawn_live_disk_flushes(app, sram_to_flush, lib_to_flush);
     Ok(resp)
@@ -520,13 +605,14 @@ async fn step_viewport_binary(
     let last_playtime_flush = Arc::clone(&state.last_playtime_flush_ms);
     let speed = speed_mult.unwrap_or(1);
 
-    let (pkt, sram_to_flush, lib_to_flush) =
-        tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+    let (pkt, sram_to_flush, lib_to_flush) = state
+        .emu_worker
+        .run(move || -> Result<_, String> {
             let now = now_unix_ms();
             let mut session = session_arc
                 .lock()
                 .map_err(|_| "verrou session indisponible".to_string())?;
-            let mut emit_meta = true;
+            let mut step_opts = zaimule_emu::session::BinaryStepOptions::default();
             if let Some(opts) = options {
                 if let (Some(x), Some(y), Some(pressed)) =
                     (opts.stylus_x, opts.stylus_y, opts.stylus_pressed)
@@ -534,22 +620,27 @@ async fn step_viewport_binary(
                     session.set_nds_stylus(x, y, pressed);
                 }
                 if let Some(flag) = opts.include_debug_meta {
-                    emit_meta = flag;
+                    step_opts.include_debug_meta = flag;
+                }
+                if let Some(flag) = opts.prefer_rgb565 {
+                    step_opts.prefer_rgb565 = flag;
+                }
+                if let Some(flag) = opts.skip_render {
+                    step_opts.skip_render = flag;
                 }
             }
-            let out = session.step_viewport_binary_bytes_ex(
+            let out = session.step_viewport_binary_bytes_with_options(
                 buttons_p1,
                 buttons_p2,
                 turbo_active,
                 speed,
-                emit_meta,
+                step_opts,
             );
             let flush_sram = maybe_collect_live_sram(&last_sram_flush, &mut session, now);
             let flush_lib = maybe_collect_live_library(&last_playtime_flush, &mut session, now);
             Ok((out, flush_sram, flush_lib))
         })
-        .await
-        .map_err(|e| format!("tâche émulation interrompue : {e}"))??;
+        .await?;
 
     spawn_live_disk_flushes(app, sram_to_flush, lib_to_flush);
     Ok(tauri::ipc::Response::new(pkt))
@@ -1789,6 +1880,7 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(AppState {
             session,
+            emu_worker: EmuWorker::spawn(),
             last_sram_flush_ms: Arc::new(AtomicU64::new(0)),
             last_playtime_flush_ms: Arc::new(AtomicU64::new(0)),
         })

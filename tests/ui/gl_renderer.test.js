@@ -89,3 +89,89 @@ test("WebGL2 GLSL ES 3.00 shaders include all upscalers, display shaders, and ND
   assert.equal(renderer.isSupported(), false);
   assert.equal(renderer.renderFrame({ width: 160, height: 144, rgba: new Uint8Array(160 * 144 * 4) }), false);
 });
+
+test("WebGlViewportRenderer uses preserveDrawingBuffer:false and uploads RGB565 and RGBA textures cleanly", () => {
+  const calls = [];
+  let contextOpts = null;
+  const mockGl = {
+    VERTEX_SHADER: 1,
+    FRAGMENT_SHADER: 2,
+    COMPILE_STATUS: 3,
+    LINK_STATUS: 4,
+    TEXTURE_2D: 5,
+    TEXTURE_MIN_FILTER: 6,
+    TEXTURE_MAG_FILTER: 7,
+    TEXTURE_WRAP_S: 8,
+    TEXTURE_WRAP_T: 9,
+    NEAREST: 10,
+    CLAMP_TO_EDGE: 11,
+    UNPACK_ALIGNMENT: 12,
+    RGBA8: 13,
+    RGBA: 14,
+    UNSIGNED_BYTE: 15,
+    RGB565: 16,
+    RGB: 17,
+    UNSIGNED_SHORT_5_6_5: 18,
+    TEXTURE0: 19,
+    TRIANGLES: 20,
+    createShader: () => ({}),
+    shaderSource: () => {},
+    compileShader: () => {},
+    getShaderParameter: () => true,
+    deleteShader: () => {},
+    createProgram: () => ({}),
+    attachShader: () => {},
+    linkProgram: () => {},
+    getProgramParameter: () => true,
+    deleteProgram: () => {},
+    createVertexArray: () => ({}),
+    createTexture: () => ({}),
+    bindTexture: () => {},
+    texParameteri: () => {},
+    getUniformLocation: (_p, name) => name,
+    pixelStorei: (pname, val) => calls.push(["pixelStorei", pname, val]),
+    texImage2D: (_t, _l, internalFmt, w, h, _b, fmt, type, data) =>
+      calls.push(["texImage2D", internalFmt, w, h, fmt, type, data.length]),
+    texSubImage2D: (_t, _l, _x, _y, w, h, fmt, type, data) =>
+      calls.push(["texSubImage2D", w, h, fmt, type, data.length]),
+    viewport: () => {},
+    useProgram: () => {},
+    bindVertexArray: () => {},
+    activeTexture: () => {},
+    uniform1i: () => {},
+    uniform2f: () => {},
+    drawArrays: () => calls.push(["drawArrays"])
+  };
+  const mockCanvas = {
+    width: 0,
+    height: 0,
+    clientWidth: 512,
+    clientHeight: 768,
+    getContext: (kind, opts) => {
+      assert.equal(kind, "webgl2");
+      contextOpts = opts;
+      return mockGl;
+    }
+  };
+
+  const renderer = new WebGlViewportRenderer(mockCanvas);
+  assert.equal(renderer.isSupported(), true);
+  assert.equal(contextOpts.preserveDrawingBuffer, false);
+
+  const rgb565 = new Uint16Array(4).fill(0xf800);
+  assert.equal(renderer.renderFrame({ width: 2, height: 2, pixelFormat: "rgb565", rgb565 }), true);
+  assert.equal(renderer.renderFrame({ width: 2, height: 2, pixelFormat: "rgb565", rgb565 }), true);
+  assert.equal(renderer.renderFrame({ width: 2, height: 2, pixelFormat: "rgba", rgba: new Uint8Array(16) }), true);
+
+  assert.deepEqual(
+    calls.filter(([op]) => op !== "drawArrays"),
+    [
+      ["pixelStorei", mockGl.UNPACK_ALIGNMENT, 4],
+      ["pixelStorei", mockGl.UNPACK_ALIGNMENT, 2],
+      ["texImage2D", mockGl.RGB565, 2, 2, mockGl.RGB, mockGl.UNSIGNED_SHORT_5_6_5, 4],
+      ["texSubImage2D", 2, 2, mockGl.RGB, mockGl.UNSIGNED_SHORT_5_6_5, 4],
+      ["pixelStorei", mockGl.UNPACK_ALIGNMENT, 4],
+      ["texImage2D", mockGl.RGBA8, 2, 2, mockGl.RGBA, mockGl.UNSIGNED_BYTE, 16]
+    ]
+  );
+});

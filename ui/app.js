@@ -73,6 +73,9 @@ const STRETCH_MODE_LABELS = {
 let toastTimer = null;
 let lastSurfacedWarning = "";
 let stepInFlight = false;
+let pendingStepAfterFlight = false;
+let emaStepMs = 8.0;
+let consecutiveSkippedFrames = 0;
 let rafLoopScheduled = false;
 let selectGameInFlightId = "";
 let selectGameInFlightPromise = null;
@@ -860,6 +863,10 @@ function captureScreenshotPng() {
   }
   const canvas = document.getElementById("canvas-p1");
   if (!canvas || !canvas.width || !canvas.height) return;
+  const glRenderer = glRendererCache.get("canvas-p1");
+  if (glRenderer && glRenderer.isSupported()) {
+    glRenderer.redraw();
+  }
   const slug = String(game.title || game.id || "zaimule")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
@@ -1499,13 +1506,18 @@ function renderInspector() {
       for (const c of state.cheatCodes) {
         const row = document.createElement("div");
         row.className = "mod-item";
+        const codeLines = String(c.codeText || "").split(/\r?\n/).filter(Boolean);
+        const codePreview =
+          codeLines.length > 1
+            ? `AR DS · ${codeLines.length}L`
+            : codeLines[0] || "";
         row.innerHTML = `
           <label style="display:flex; align-items:center; gap:8px; min-width:0; flex:1; cursor:pointer;">
             <input type="checkbox" ${c.enabled ? "checked" : ""} />
             <span class="path-ellipsis">${escapeHtml(String(c.label || "").replace(/^[^\w]+/, ""))}</span>
           </label>
           <span style="display:inline-flex; align-items:center; gap:6px; flex-shrink:0;">
-            <span class="mono" style="font-size:10.5px; color:var(--accent-primary);">${escapeHtml(c.codeText)}</span>
+            <span class="mono" style="font-size:10.5px; color:var(--accent-primary);" title="${escapeHtml(String(c.codeText || ""))}">${escapeHtml(codePreview)}</span>
             <button class="btn mono btn-inline-delete btn-remove-cheat" type="button" title="Supprimer ce code" aria-label="Supprimer ce code">✕</button>
           </span>
         `;
@@ -2376,8 +2388,26 @@ function renderStandbyCanvas() {
   }
 }
 
+function unpackRgb565FrameToRgba(frame) {
+  const { width, height, rgb565 } = frame;
+  const pxCount = width * height;
+  const rgba = new Uint8ClampedArray(pxCount * 4);
+  for (let i = 0; i < pxCount; i += 1) {
+    const c = rgb565[i];
+    const r5 = (c >>> 11) & 0x1f;
+    const g6 = (c >>> 5) & 0x3f;
+    const b5 = c & 0x1f;
+    const o = i * 4;
+    rgba[o] = (r5 << 3) | (r5 >>> 2);
+    rgba[o + 1] = (g6 << 2) | (g6 >>> 4);
+    rgba[o + 2] = (b5 << 3) | (b5 >>> 2);
+    rgba[o + 3] = 255;
+  }
+  return { width, height, pixelFormat: "rgba", rgba };
+}
+
 function paintRgbaFrame(canvasId, frame, activeGame = null) {
-  if (!frame || !frame.rgba) return;
+  if (!frame || (!frame.rgba && !frame.rgb565)) return;
   const isPlayerCanvas = canvasId.startsWith("canvas-p");
   if (isPlayerCanvas) {
     const glRenderer = getGlRenderer(canvasId);
@@ -2402,10 +2432,11 @@ function paintRgbaFrame(canvasId, frame, activeGame = null) {
   if (!entry) return;
   const { canvas, ctx } = entry;
 
+  const rgbaFrame = frame.rgba ? frame : unpackRgb565FrameToRgba(frame);
   let processed =
     isPlayerCanvas && state.upscalerMode !== "OFF"
-      ? upscaleFrameIfEnabled(frame, state.upscalerMode)
-      : frame;
+      ? upscaleFrameIfEnabled(rgbaFrame, state.upscalerMode)
+      : rgbaFrame;
 
   if (isPlayerCanvas && state.ndsLayout !== "vertical") {
     const g = activeGame || getSelectedGame();
@@ -2715,16 +2746,21 @@ function scheduleDebuggerRefresh(nowMs, force = false) {
   });
 }
 
-async function tickEmulationLoop(nowMs) {
-  rafLoopScheduled = false;
-  if (shouldKeepEmulationLoopAlive()) {
-    rafLoopScheduled = true;
-    requestAnimationFrame(tickEmulationLoop);
+async function tickEmulationLoop(nowMs, fromCatchup = false) {
+  if (!fromCatchup) {
+    rafLoopScheduled = false;
+    if (shouldKeepEmulationLoopAlive()) {
+      rafLoopScheduled = true;
+      requestAnimationFrame(tickEmulationLoop);
+    }
   }
   if (stepInFlight) {
+    pendingStepAfterFlight = true;
     return;
   }
   stepInFlight = true;
+  pendingStepAfterFlight = false;
+  let activeTargetFps = 60.0;
   try {
     const activeGame = getSelectedGame();
     const isSwitch = isSwitchGame(activeGame);
@@ -2745,24 +2781,28 @@ async function tickEmulationLoop(nowMs) {
         stopEmulationPlayback();
       } else {
         framePacer.reset();
+        consecutiveSkippedFrames = 0;
       }
       return;
     }
 
     if (document.hidden || activePane !== "view-emulator") {
       framePacer.reset();
+      consecutiveSkippedFrames = 0;
       return;
     }
 
     if (state.debuggerPaused && !state.stepOnceRequested) {
       framePacer.reset();
+      consecutiveSkippedFrames = 0;
       return;
     }
 
     const targetFps = targetFpsForConsole(activeGame.console);
+    activeTargetFps = targetFps;
     const manualStep = state.stepOnceRequested;
     const pacing = manualStep
-      ? { shouldStep: true, measuredFps: targetFps, frameTimeMs: 1000 / targetFps }
+      ? { shouldStep: true, behindFrames: 0, measuredFps: targetFps, frameTimeMs: 1000 / targetFps }
       : framePacer.advance(nowMs, targetFps);
 
     if (!pacing.shouldStep) {
@@ -2788,7 +2828,33 @@ async function tickEmulationLoop(nowMs) {
       state.debuggerPaused ||
       manualStep;
 
-    const stepOptions = { includeDebugMeta: wantTelemetry };
+    const isNdsGame = String(activeGame.console || "").toUpperCase() === "NDS";
+    const glPrimary = getGlRenderer("canvas-p1");
+    const allowAutoSkip =
+      isNdsGame &&
+      state.speedMult === 1 &&
+      !manualStep &&
+      !state.debuggerPaused &&
+      !state.dualLinkEnabled &&
+      !state.quadLinkMode;
+    const skipRender =
+      allowAutoSkip &&
+      pacing.behindFrames >= 1 &&
+      consecutiveSkippedFrames === 0 &&
+      emaStepMs > 16.5;
+    if (skipRender) {
+      consecutiveSkippedFrames += 1;
+    } else {
+      consecutiveSkippedFrames = 0;
+    }
+
+    const stepOptions = {
+      includeDebugMeta: wantTelemetry,
+      preferRgb565: Boolean(
+        isNdsGame && glPrimary && !state.dualLinkEnabled && !state.quadLinkMode
+      ),
+      skipRender
+    };
     if (pendingNdsStylus) {
       stepOptions.stylusX = pendingNdsStylus.x;
       stepOptions.stylusY = pendingNdsStylus.y;
@@ -2796,6 +2862,7 @@ async function tickEmulationLoop(nowMs) {
       pendingNdsStylus = null;
     }
 
+    const stepStartMs = performance.now();
     const rawPkt = await invokeBackend(
       "step_viewport_binary",
       {
@@ -2807,12 +2874,16 @@ async function tickEmulationLoop(nowMs) {
       },
       { silent: true }
     );
+    const stepElapsedMs = performance.now() - stepStartMs;
+    if (!skipRender && Number.isFinite(stepElapsedMs)) {
+      emaStepMs = emaStepMs * 0.8 + stepElapsedMs * 0.2;
+    }
 
     if (rawPkt) {
       const pkt = decodeViewportBinaryPacket(rawPkt);
+      state.currentFrame = pkt.frameNumber || state.currentFrame + 1;
       const primary = pkt.views[0];
       if (primary) {
-        state.currentFrame = pkt.frameNumber || state.currentFrame + 1;
         paintRgbaFrame("canvas-p1", primary, activeGame);
         if (pkt.views[1]) {
           paintRgbaFrame("canvas-p2", pkt.views[1], activeGame);
@@ -2827,51 +2898,48 @@ async function tickEmulationLoop(nowMs) {
         } else if (state.quadLinkMode) {
           paintRgbaFrame("canvas-p4", primary, activeGame);
         }
+      }
 
-        // Draw waveform BEFORE transferring pkt.pcmSamples buffer ownership to AudioWorklet
-        renderAudioOscilloscope(pkt.audioFreqHz || 0, pkt.frameNumber, pkt.pcmSamples, nowMs);
-        apuAudio.pushPcmSamples(pkt.pcmSamples, pkt.sampleRateHz);
+      // Draw waveform BEFORE transferring pkt.pcmSamples buffer ownership to AudioWorklet
+      renderAudioOscilloscope(pkt.audioFreqHz || 0, pkt.frameNumber, pkt.pcmSamples, nowMs);
+      apuAudio.pushPcmSamples(pkt.pcmSamples, pkt.sampleRateHz);
 
-        if (pkt.audioFreqHz >= 1200 && connectedPad) {
-          triggerGamepadRumble(connectedPad, 55, 0.35, 0.65);
+      if (pkt.audioFreqHz >= 1200 && connectedPad) {
+        triggerGamepadRumble(connectedPad, 55, 0.35, 0.65);
+      }
+
+      const meta = pkt.meta || {};
+      if (meta.newlyUnlockedAchievement) {
+        if (connectedPad) {
+          triggerGamepadRumble(connectedPad, 140, 0.6, 0.95);
+        }
+        showToast(`Succès débloqué : ${meta.newlyUnlockedAchievement}`, "ok");
+        const boot = await invokeBackend("get_station_bootstrap", {}, { silent: true });
+        if (boot) applyBootstrap(boot);
+        else renderInspector();
+      }
+
+      if (wantTelemetry) {
+        lastTelemetryDomUpdateMs = nowMs;
+        const fpsEl = getCachedEl("tel-fps");
+        if (fpsEl) {
+          const hasGl = Boolean(glRendererCache.get("canvas-p1")?.isSupported());
+          const hdTag = isNdsGame && state.nds3dScale >= 2 ? " · 3D 2x" : "";
+          fpsEl.textContent = `${Math.round(pacing.measuredFps * state.speedMult)} FPS${hasGl ? " · GPU" : ""}${hdTag}`;
         }
 
-        const meta = pkt.meta || {};
-        if (meta.newlyUnlockedAchievement) {
-          if (connectedPad) {
-            triggerGamepadRumble(connectedPad, 140, 0.6, 0.95);
-          }
-          showToast(`Succès débloqué : ${meta.newlyUnlockedAchievement}`, "ok");
-          const boot = await invokeBackend("get_station_bootstrap", {}, { silent: true });
-          if (boot) applyBootstrap(boot);
-          else renderInspector();
-        }
-
-        if (wantTelemetry) {
-          lastTelemetryDomUpdateMs = nowMs;
-          const fpsEl = getCachedEl("tel-fps");
-          if (fpsEl) {
-            const hasGl = Boolean(glRendererCache.get("canvas-p1")?.isSupported());
-            const hdTag =
-              String(activeGame.console || "").toUpperCase() === "NDS" && state.nds3dScale >= 2
-                ? " · 3D 2x"
-                : "";
-            fpsEl.textContent = `${Math.round(pacing.measuredFps * state.speedMult)} FPS${hasGl ? " · GPU" : ""}${hdTag}`;
-          }
-
-          const cpu = meta.cpu || {};
-          const pcSpEl = getCachedEl("dbg-pc-sp");
-          if (pcSpEl) pcSpEl.textContent = `${cpu.pcHex || "—"} / ${cpu.spHex || "—"}`;
-          const afBcEl = getCachedEl("dbg-af-bc");
-          if (afBcEl) afBcEl.textContent = `${cpu.regAHex || "—"} / ${cpu.regBcHex || "—"}`;
-          const deHlEl = getCachedEl("dbg-de-hl");
-          if (deHlEl) deHlEl.textContent = `${cpu.regDeHex || "—"} / ${cpu.regHlHex || "—"}`;
-          const sioEl = getCachedEl("dbg-sio");
-          if (sioEl) sioEl.textContent = `${cpu.serialSbHex || "0x00"} / ${pkt.audioFreqHz || 0} Hz`;
-        }
-        if (manualStep || state.debuggerPaused || vramCanvasVisible) {
-          scheduleDebuggerRefresh(nowMs, manualStep || state.debuggerPaused);
-        }
+        const cpu = meta.cpu || {};
+        const pcSpEl = getCachedEl("dbg-pc-sp");
+        if (pcSpEl) pcSpEl.textContent = `${cpu.pcHex || "—"} / ${cpu.spHex || "—"}`;
+        const afBcEl = getCachedEl("dbg-af-bc");
+        if (afBcEl) afBcEl.textContent = `${cpu.regAHex || "—"} / ${cpu.regBcHex || "—"}`;
+        const deHlEl = getCachedEl("dbg-de-hl");
+        if (deHlEl) deHlEl.textContent = `${cpu.regDeHex || "—"} / ${cpu.regHlHex || "—"}`;
+        const sioEl = getCachedEl("dbg-sio");
+        if (sioEl) sioEl.textContent = `${cpu.serialSbHex || "0x00"} / ${pkt.audioFreqHz || 0} Hz`;
+      }
+      if (manualStep || state.debuggerPaused || vramCanvasVisible) {
+        scheduleDebuggerRefresh(nowMs, manualStep || state.debuggerPaused);
       }
     }
   } catch (err) {
@@ -2880,6 +2948,13 @@ async function tickEmulationLoop(nowMs) {
     stepInFlight = false;
     if (shouldKeepEmulationLoopAlive()) {
       ensureEmulationLoopRunning();
+      const postNow = performance.now();
+      if (pendingStepAfterFlight || framePacer.isReady(postNow, activeTargetFps)) {
+        pendingStepAfterFlight = false;
+        setTimeout(() => tickEmulationLoop(performance.now(), true), 0);
+      }
+    } else {
+      pendingStepAfterFlight = false;
     }
   }
 }
@@ -3258,7 +3333,13 @@ function bindEvents() {
 
   document.getElementById("btn-overclock-cycle")?.addEventListener("click", async () => {
     state.cpuOverclockPct =
-      state.cpuOverclockPct === 100 ? 150 : state.cpuOverclockPct === 150 ? 200 : 100;
+      state.cpuOverclockPct === 100
+        ? 125
+        : state.cpuOverclockPct === 125
+          ? 150
+          : state.cpuOverclockPct === 150
+            ? 200
+            : 100;
     const boot = await invokeBackend("set_hardware_overclock_profile", {
       cpuOverclockPct: state.cpuOverclockPct,
       pgxpSubpixel: state.pgxpSubpixel
@@ -3341,15 +3422,25 @@ function bindEvents() {
     if (!rawCode) return;
     const boot = await invokeBackend("add_cheat_code", {
       rawCode,
-      label: `GameShark ${rawCode.toUpperCase()}`
+      label: ""
     });
     if (boot) {
       applyBootstrap(boot);
     } else {
+      const lines = rawCode
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+      const isArDs = lines.length > 1 || /^[0-9a-fA-F]{8}\s+[0-9a-fA-F]{8}$/.test(lines[0] || "");
       state.cheatCodes.unshift({
         id: `cheat-${Date.now()}`,
-        label: `GameShark ${rawCode.toUpperCase()}`,
-        codeText: rawCode.toUpperCase(),
+        label: isArDs
+          ? lines.length > 1
+            ? `Action Replay DS (${lines.length} lignes)`
+            : `Action Replay DS ${(lines[0] || "").slice(0, 8).toUpperCase()}`
+          : `GameShark ${rawCode.toUpperCase()}`,
+        codeText: lines.join("\n").toUpperCase(),
+        kind: isArDs ? "actionReplayDs" : "gameSharkGb",
         enabled: true
       });
       renderInspector();

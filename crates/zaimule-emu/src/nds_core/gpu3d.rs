@@ -121,12 +121,162 @@ pub struct Polygon {
 pub const MAX_POLYS: usize = 2048;
 pub const MAX_VERTS: usize = 6144;
 
+/// Stack-inline 4-byte packed command queue with the exact serde wire layout of `VecDeque<u8>`.
+#[derive(Clone, Copy, Default)]
+struct InlineCmdQueue {
+    buf: [u8; 4],
+    head: u8,
+    len: u8,
+}
+
+impl InlineCmdQueue {
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline(always)]
+    fn push_back(&mut self, cmd: u8) {
+        if self.len < 4 {
+            let tail = ((self.head + self.len) & 3) as usize;
+            self.buf[tail] = cmd;
+            self.len += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn pop_front(&mut self) -> Option<u8> {
+        if self.len == 0 {
+            return None;
+        }
+        let v = self.buf[self.head as usize];
+        self.head = (self.head + 1) & 3;
+        self.len -= 1;
+        Some(v)
+    }
+}
+
+impl serde::Serialize for InlineCmdQueue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.len as usize))?;
+        for i in 0..self.len {
+            let idx = ((self.head + i) & 3) as usize;
+            seq.serialize_element(&self.buf[idx])?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for InlineCmdQueue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct QVisitor;
+        impl<'de> serde::de::Visitor<'de> for QVisitor {
+            type Value = InlineCmdQueue;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("packed GX command queue")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut q = InlineCmdQueue::default();
+                while let Some(b) = seq.next_element::<u8>()? {
+                    q.push_back(b);
+                }
+                Ok(q)
+            }
+        }
+        deserializer.deserialize_seq(QVisitor)
+    }
+}
+
+/// Stack-inline 32-word GX parameter buffer with the exact serde wire layout of `Vec<u32>`.
+#[derive(Clone, Copy)]
+struct InlineParamBuf {
+    buf: [u32; 32],
+    len: u8,
+}
+
+impl Default for InlineParamBuf {
+    fn default() -> Self {
+        Self {
+            buf: [0; 32],
+            len: 0,
+        }
+    }
+}
+
+impl InlineParamBuf {
+    #[inline(always)]
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    #[inline(always)]
+    fn push(&mut self, v: u32) {
+        let i = self.len as usize;
+        if i < 32 {
+            self.buf[i] = v;
+            self.len += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[inline(always)]
+    fn take_array(&mut self) -> ([u32; 32], usize) {
+        let n = self.len as usize;
+        let out = self.buf;
+        self.len = 0;
+        (out, n)
+    }
+}
+
+impl serde::Serialize for InlineParamBuf {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let n = self.len as usize;
+        let mut seq = serializer.serialize_seq(Some(n))?;
+        for &w in &self.buf[..n] {
+            seq.serialize_element(&w)?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for InlineParamBuf {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct PVisitor;
+        impl<'de> serde::de::Visitor<'de> for PVisitor {
+            type Value = InlineParamBuf;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("GX parameter buffer")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut p = InlineParamBuf::default();
+                while let Some(w) = seq.next_element::<u32>()? {
+                    p.push(w);
+                }
+                Ok(p)
+            }
+        }
+        deserializer.deserialize_seq(PVisitor)
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Gpu3d {
-    // Command decode state.
-    pending: std::collections::VecDeque<u8>, // packed commands awaiting params
+    // Command decode state (inline buffers — zero heap allocations per GX command).
+    pending: InlineCmdQueue,
     cur_cmd: Option<u8>,
-    params: Vec<u32>,
+    params: InlineParamBuf,
 
     // Matrix engine.
     pub mtx_mode: u8,
@@ -235,7 +385,7 @@ impl Gpu3d {
         Self {
             pending: Default::default(),
             cur_cmd: None,
-            params: Vec::new(),
+            params: InlineParamBuf::default(),
             mtx_mode: 0,
             proj: IDENTITY,
             pos: IDENTITY,
@@ -259,8 +409,8 @@ impl Gpu3d {
             teximage: 0,
             pltt_base: 0,
             prim_mode: 0,
-            strip_v: Vec::new(),
-            strip_ci: Vec::new(),
+            strip_v: Vec::with_capacity(64),
+            strip_ci: Vec::with_capacity(64),
             strip_parity: false,
             light_vec: [[0, 0, -0x1000]; 4],
             light_half: [[0, 0, -0x1000]; 4],
@@ -271,10 +421,10 @@ impl Gpu3d {
             emi: [0; 3],
             shine: default_shininess(),
             shine_table_en: false,
-            verts: Vec::new(),
-            polys: Vec::new(),
-            disp_verts: Vec::new(),
-            disp_polys: Vec::new(),
+            verts: Vec::with_capacity(2048),
+            polys: Vec::with_capacity(1024),
+            disp_verts: Vec::with_capacity(2048),
+            disp_polys: Vec::with_capacity(1024),
             ram_overflow: false,
             swap_param: 0,
             swap_count: 0,
@@ -295,6 +445,7 @@ impl Gpu3d {
     // ---- Command input --------------------------------------------------
 
     /// Packed write to GXFIFO (0x04000400).
+    #[inline]
     pub fn write_fifo(&mut self, v: u32) {
         if self.cur_cmd.is_none() && self.pending.is_empty() {
             // Command word: up to four command bytes, low byte first.
@@ -311,6 +462,7 @@ impl Gpu3d {
     }
 
     /// Direct per-command register write (0x04000440-0x05FF).
+    #[inline]
     pub fn write_port(&mut self, cmd: u8, v: u32) {
         if param_count(cmd).is_none() {
             return;
@@ -329,6 +481,7 @@ impl Gpu3d {
 
     /// Pop zero-parameter commands off the queue and set up the next one
     /// that still needs parameters.
+    #[inline]
     fn advance(&mut self) {
         while self.cur_cmd.is_none() {
             let Some(c) = self.pending.pop_front() else {
@@ -343,6 +496,7 @@ impl Gpu3d {
         }
     }
 
+    #[inline]
     fn feed_param(&mut self, v: u32) {
         let Some(cmd) = self.cur_cmd else {
             // Stray parameter with nothing pending: treat as a command word.
@@ -351,9 +505,9 @@ impl Gpu3d {
         };
         self.params.push(v);
         if self.params.len() >= param_count(cmd).unwrap_or(1) {
-            let params = std::mem::take(&mut self.params);
+            let (params, n) = self.params.take_array();
             self.cur_cmd = None;
-            self.execute(cmd, &params);
+            self.execute(cmd, &params[..n]);
             self.advance();
         }
     }
@@ -748,23 +902,44 @@ impl Gpu3d {
             0x1A => self.mult(&Self::mtx_from_3x3(p)),
             0x1B => {
                 // MTX_SCALE: never touches the vector matrix, even in mode 2.
-                let mut m = IDENTITY;
-                m[0] = p[0] as i32;
-                m[5] = p[1] as i32;
-                m[10] = p[2] as i32;
-                match self.mtx_mode {
-                    0 => self.proj = mtx_mul(&m, &self.proj),
-                    1 | 2 => self.pos = mtx_mul(&m, &self.pos),
-                    _ => self.tex = mtx_mul(&m, &self.tex),
+                let sx = p[0] as i32 as i64;
+                let sy = p[1] as i32 as i64;
+                let sz = p[2] as i32 as i64;
+                let dst = match self.mtx_mode {
+                    0 => &mut self.proj,
+                    1 | 2 => &mut self.pos,
+                    _ => &mut self.tex,
+                };
+                for j in 0..4 {
+                    dst[j] = ((sx * dst[j] as i64) >> 12) as i32;
+                    dst[4 + j] = ((sy * dst[4 + j] as i64) >> 12) as i32;
+                    dst[8 + j] = ((sz * dst[8 + j] as i64) >> 12) as i32;
                 }
                 self.clip_dirty = true;
             }
             0x1C => {
-                let mut m = IDENTITY;
-                m[12] = p[0] as i32;
-                m[13] = p[1] as i32;
-                m[14] = p[2] as i32;
-                self.mult(&m);
+                let tx = p[0] as i32 as i64;
+                let ty = p[1] as i32 as i64;
+                let tz = p[2] as i32 as i64;
+                let translate = |dst: &mut Mtx| {
+                    for j in 0..4 {
+                        let acc = tx * dst[j] as i64
+                            + ty * dst[4 + j] as i64
+                            + tz * dst[8 + j] as i64
+                            + ((dst[12 + j] as i64) << 12);
+                        dst[12 + j] = (acc >> 12) as i32;
+                    }
+                };
+                match self.mtx_mode {
+                    0 => translate(&mut self.proj),
+                    1 => translate(&mut self.pos),
+                    2 => {
+                        translate(&mut self.pos);
+                        translate(&mut self.vec);
+                    }
+                    _ => translate(&mut self.tex),
+                }
+                self.clip_dirty = true;
             }
             0x20 => {
                 self.cur_color = (p[0] & 0x7FFF) as u16;
@@ -910,10 +1085,71 @@ impl Gpu3d {
                 ];
             }
             0x70 => {
-                // BOX_TEST: always report "inside" via GXSTAT bit 1 so games (like Pokémon HG/SS/Pt)
-                // never skip submitting character billboard sprites or room sub-meshes; per-polygon
-                // clip-space frustum culling is handled in `emit_poly`.
-                self.box_test_result = true;
+                // Conservative hardware BOX_TEST:
+                // - Rejects boxes strictly behind the camera (all 8 corners w <= 0)
+                // - Never rejects boxes straddling w == 0 (protects near-camera billboards/sprites)
+                // - When all 8 corners have w > 0, rejects only if all 8 lie strictly beyond a
+                //   frustum half-space plus a 12.5% guard band so edge billboards never pop out
+                //   while off-screen outdoor map chunks are skipped by the ARM9.
+                let x0 = p[0] as i16 as i32;
+                let y0 = (p[0] >> 16) as i16 as i32;
+                let z0 = p[1] as i16 as i32;
+                let dx = (p[1] >> 16) as i16 as i32;
+                let dy = p[2] as i16 as i32;
+                let dz = (p[2] >> 16) as i16 as i32;
+                let m = self.clip_matrix();
+                let xs = [x0, x0.wrapping_add(dx)];
+                let ys = [y0, y0.wrapping_add(dy)];
+                let zs = [z0, z0.wrapping_add(dz)];
+                let mut corners = [[0i64; 4]; 8];
+                let mut all_w_nonpos = true;
+                let mut any_w_nonpos = false;
+                let mut ci = 0;
+                for &x in &xs {
+                    for &y in &ys {
+                        for &z in &zs {
+                            for j in 0..4 {
+                                let acc = x as i64 * m[j] as i64
+                                    + y as i64 * m[4 + j] as i64
+                                    + z as i64 * m[8 + j] as i64
+                                    + ((m[12 + j] as i64) << 12);
+                                corners[ci][j] = acc >> 12;
+                            }
+                            if corners[ci][3] <= 0 {
+                                any_w_nonpos = true;
+                            } else {
+                                all_w_nonpos = false;
+                            }
+                            ci += 1;
+                        }
+                    }
+                }
+                if all_w_nonpos {
+                    self.box_test_result = false;
+                } else if any_w_nonpos {
+                    self.box_test_result = true;
+                } else {
+                    let mut outside = false;
+                    for axis in 0..3 {
+                        let mut all_lo = true;
+                        let mut all_hi = true;
+                        for c in &corners {
+                            let w = c[3];
+                            let bound = w + (w >> 3).max(0x100);
+                            if c[axis] >= -bound {
+                                all_lo = false;
+                            }
+                            if c[axis] <= bound {
+                                all_hi = false;
+                            }
+                        }
+                        if all_lo || all_hi {
+                            outside = true;
+                            break;
+                        }
+                    }
+                    self.box_test_result = !outside;
+                }
             }
             0x71 => {
                 // POS_TEST: run x,y,z (last two params) through the clip matrix.
@@ -944,8 +1180,10 @@ impl Gpu3d {
         self.swap_param = param;
         self.last_poly_count = self.polys.len();
         self.last_vert_count = self.verts.len();
-        self.disp_polys = std::mem::take(&mut self.polys);
-        self.disp_verts = std::mem::take(&mut self.verts);
+        std::mem::swap(&mut self.disp_polys, &mut self.polys);
+        self.polys.clear();
+        std::mem::swap(&mut self.disp_verts, &mut self.verts);
+        self.verts.clear();
         self.ram_overflow = false;
         self.swap_count += 1;
         self.lightlog_left = LIGHTLOG_PER_FRAME;
@@ -1022,7 +1260,9 @@ impl Gpu3d {
     /// in bus.rs so the existing IRQ-mode plumbing stays untouched.
     pub fn gxstat_lo(&self) -> u16 {
         let mut v = 0u16;
-        v |= 2; // box test result: report "inside"
+        if self.box_test_result {
+            v |= 2;
+        }
         v |= ((self.pos_sp & 0x1F) as u16) << 8;
         v |= ((self.proj_sp & 1) as u16) << 13;
         if self.stack_error {

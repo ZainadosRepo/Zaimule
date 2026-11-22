@@ -128,9 +128,183 @@ pub struct CpuState {
     cp15_itcm: u32,
 }
 
+const BLOCK_CACHE_SIZE: usize = 2048;
+const MAX_BLOCK_OPS: usize = 16;
+
+#[derive(Clone, Copy)]
+enum DecodedOp {
+    Nop,
+    // ---- ARM pre-decoded ops ----
+    ArmMovImm {
+        cond: u8,
+        rd: u8,
+        s: bool,
+        carry_out: u8,
+        imm: u32,
+    },
+    ArmAddSubImm {
+        cond: u8,
+        rd: u8,
+        rn: u8,
+        flags: u8, // bit0 = S, bit1 = SUB
+        imm: u32,
+    },
+    ArmCmpImm {
+        cond: u8,
+        rn: u8,
+        cmn: bool,
+        imm: u32,
+    },
+    ArmLogicImm {
+        cond: u8,
+        opc: u8,
+        rd: u8,
+        rn: u8,
+        s: bool,
+        carry_out: u8,
+        imm: u32,
+    },
+    ArmDpRegSimple {
+        cond: u8,
+        opc: u8,
+        rd: u8,
+        rn: u8,
+        rm: u8,
+        shift_ty: u8,
+        shift_amt: u8,
+        s: bool,
+    },
+    ArmLdr32Pc {
+        cond: u8,
+        rd: u8,
+        addr: u32,
+    },
+    ArmLdrImm {
+        cond: u8,
+        rd: u8,
+        rn: u8,
+        flags: u8, // bit0 = byte, bit1 = pre, bit2 = wb
+        off: i32,
+    },
+    ArmStrImm {
+        cond: u8,
+        rd: u8,
+        rn: u8,
+        flags: u8, // bit0 = byte, bit1 = pre, bit2 = wb
+        off: i32,
+    },
+    ArmBranch {
+        cond: u8,
+        link: bool,
+        target: u32,
+        ret_pc: u32,
+    },
+    ArmBx {
+        cond: u8,
+        rm: u8,
+        link: bool,
+        ret_pc: u32,
+    },
+    ArmFallback {
+        raw: u32,
+        pc: u32,
+        ends_block: bool,
+    },
+    // ---- Thumb pre-decoded ops ----
+    ThumbShiftImm {
+        opc: u8,
+        rd: u8,
+        rs: u8,
+        imm5: u8,
+    },
+    ThumbAddSub {
+        opc: u8, // bit0 = sub, bit1 = imm3
+        rd: u8,
+        rs: u8,
+        rn_or_imm: u8,
+    },
+    ThumbImm8 {
+        opc: u8,
+        rd: u8,
+        imm: u8,
+    },
+    ThumbAlu {
+        opc: u8,
+        rd: u8,
+        rs: u8,
+    },
+    ThumbHiReg {
+        opc: u8, // 0=ADD, 1=CMP, 2=MOV (rd!=15, rs!=15)
+        rd: u8,
+        rs: u8,
+    },
+    ThumbLdrPc {
+        rd: u8,
+        addr: u32,
+    },
+    ThumbLdrStrImm {
+        kind: u8, // 0=STR32, 1=STR8, 2=LDR32, 3=LDR8, 4=STR16, 5=LDR16
+        rd: u8,
+        rb: u8,
+        off: u16,
+    },
+    ThumbAddPcSp {
+        is_sp: bool,
+        rd: u8,
+        val_or_off: u32,
+    },
+    ThumbCondBranch {
+        cond: u8,
+        target: u32,
+    },
+    ThumbBranch {
+        target: u32,
+    },
+    ThumbBlPair {
+        target: u32,
+        ret_lr: u32,
+        to_arm: bool,
+        raw0: u16,
+    },
+    ThumbFallback {
+        raw: u16,
+        pc: u32,
+        ends_block: bool,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct CachedBlock {
+    start_pc: u32,
+    page_gen: u32,
+    page_idx: u16,
+    len: u8,
+    flags: u8, // bit0 = thumb, bit1 = is_idle_loop, bit2 = is_poll_loop
+    ops: [DecodedOp; MAX_BLOCK_OPS],
+}
+
+impl CachedBlock {
+    const fn empty() -> Self {
+        Self {
+            start_pc: 0,
+            page_gen: 0,
+            page_idx: u16::MAX,
+            len: 0,
+            flags: 0,
+            ops: [DecodedOp::Nop; MAX_BLOCK_OPS],
+        }
+    }
+}
+
+#[inline(always)]
+fn block_slot(pc: u32) -> usize {
+    (((pc >> 1) ^ (pc >> 12)) as usize) & (BLOCK_CACHE_SIZE - 1)
+}
+
 pub struct Cpu<B: Bus> {
     pub st: CpuState,
     brk: Option<u32>,
+    block_cache: Box<[CachedBlock; BLOCK_CACHE_SIZE]>,
     pub bus: B,
 }
 
@@ -139,6 +313,11 @@ impl<B: Bus> Cpu<B> {
         let mut regs = [0u32; 16];
         regs[13] = sp;
         regs[15] = entry;
+        let block_cache = vec![CachedBlock::empty(); BLOCK_CACHE_SIZE]
+            .into_boxed_slice()
+            .try_into()
+            .ok()
+            .expect("block cache size");
         Self {
             st: CpuState {
                 regs,
@@ -168,7 +347,14 @@ impl<B: Bus> Cpu<B> {
             brk: std::env::var("NDS_BREAK")
                 .ok()
                 .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()),
+            block_cache,
             bus,
+        }
+    }
+
+    pub fn flush_block_cache(&mut self) {
+        for slot in self.block_cache.iter_mut() {
+            slot.page_idx = u16::MAX;
         }
     }
 
@@ -176,6 +362,7 @@ impl<B: Bus> Cpu<B> {
     /// debug breakpoint stay as they are.
     pub fn restore(&mut self, st: CpuState) {
         self.st = st;
+        self.flush_block_cache();
     }
 
     #[inline(always)]
@@ -471,7 +658,1450 @@ impl<B: Bus> Cpu<B> {
         }
     }
 
-    /// Tight instruction execution loop used when no breakpoint/watch/I/O-log hooks are active.
+    #[inline(always)]
+    fn apply_logical_imm_flags(&mut self, r: u32, carry_out: u8) {
+        let mut cpsr = self.st.cpsr & !(N | Z);
+        cpsr |= r & N;
+        if r == 0 {
+            cpsr |= Z;
+        }
+        if carry_out == 1 {
+            cpsr &= !C;
+        } else if carry_out == 2 {
+            cpsr |= C;
+        }
+        self.st.cpsr = cpsr;
+    }
+
+    fn decode_arm_block(
+        &mut self,
+        start_pc: u32,
+        page_idx: u16,
+        page_gen: u32,
+        page_ptr: *const u8,
+        start_off: usize,
+    ) -> CachedBlock {
+        let mut blk = CachedBlock {
+            start_pc,
+            page_gen,
+            page_idx,
+            len: 0,
+            flags: 0,
+            ops: [DecodedOp::Nop; MAX_BLOCK_OPS],
+        };
+        let mut cur_pc = start_pc;
+        let mut off = start_off & !3;
+        let mut written_regs: u16 = 0;
+        let mut base_regs: u16 = 0;
+        let mut has_load = false;
+        let mut poll_pure = true;
+
+        while (blk.len as usize) < MAX_BLOCK_OPS && off + 4 <= 0x1000 {
+            // SAFETY: `off + 4 <= 0x1000` within valid 4 KiB page.
+            let raw =
+                unsafe { u32::from_le(std::ptr::read_unaligned(page_ptr.add(off) as *const u32)) };
+            let cond = (raw >> 28) as u8;
+
+            let (op, ends_block) = if cond == 0xF {
+                poll_pure = false;
+                if B::IS_ARM9 {
+                    (
+                        DecodedOp::ArmFallback {
+                            raw,
+                            pc: cur_pc,
+                            ends_block: true,
+                        },
+                        true,
+                    )
+                } else {
+                    (DecodedOp::Nop, false)
+                }
+            } else {
+                let lut_idx = (((raw >> 16) & 0xFF0) | ((raw >> 4) & 0x00F)) as usize;
+                match ARM_LUT[lut_idx] {
+                    OP_BRANCH => {
+                        let delta = ((raw << 8) as i32 >> 6) as u32;
+                        let target = cur_pc.wrapping_add(8).wrapping_add(delta);
+                        let link = raw & 0x0100_0000 != 0;
+                        if !link && target == start_pc {
+                            if blk.len == 0 && cond == 0xE {
+                                blk.flags |= 2; // unconditional B . idle loop
+                            } else if blk.len > 0
+                                && cond < 0xE
+                                && poll_pure
+                                && has_load
+                                && (written_regs & base_regs) == 0
+                            {
+                                blk.flags |= 4; // read-only poll loop
+                            }
+                        }
+                        (
+                            DecodedOp::ArmBranch {
+                                cond,
+                                link,
+                                target,
+                                ret_pc: cur_pc.wrapping_add(4),
+                            },
+                            true,
+                        )
+                    }
+                    OP_MISC => {
+                        poll_pure = false;
+                        if raw & 0x0FFF_FFF0 == 0x012F_FF10 {
+                            let rm = (raw & 0xF) as u8;
+                            if rm != 15 {
+                                (
+                                    DecodedOp::ArmBx {
+                                        cond,
+                                        rm,
+                                        link: false,
+                                        ret_pc: 0,
+                                    },
+                                    true,
+                                )
+                            } else {
+                                (
+                                    DecodedOp::ArmFallback {
+                                        raw,
+                                        pc: cur_pc,
+                                        ends_block: true,
+                                    },
+                                    true,
+                                )
+                            }
+                        } else if B::IS_ARM9 && raw & 0x0FFF_FFF0 == 0x012F_FF30 {
+                            let rm = (raw & 0xF) as u8;
+                            if rm != 15 {
+                                (
+                                    DecodedOp::ArmBx {
+                                        cond,
+                                        rm,
+                                        link: true,
+                                        ret_pc: cur_pc.wrapping_add(4),
+                                    },
+                                    true,
+                                )
+                            } else {
+                                (
+                                    DecodedOp::ArmFallback {
+                                        raw,
+                                        pc: cur_pc,
+                                        ends_block: true,
+                                    },
+                                    true,
+                                )
+                            }
+                        } else {
+                            // MSR/MRS/CLZ/SWP/QADD etc. - end block on MSR (may change CPSR I/mode).
+                            let is_msr = raw & 0x0DB0_F000 == 0x0120_F000;
+                            let rd = (raw >> 12) & 0xF;
+                            let ends = is_msr || rd == 15;
+                            (
+                                DecodedOp::ArmFallback {
+                                    raw,
+                                    pc: cur_pc,
+                                    ends_block: ends,
+                                },
+                                ends,
+                            )
+                        }
+                    }
+                    OP_DP => {
+                        let opcode = ((raw >> 21) & 0xF) as u8;
+                        let s = raw & 0x0010_0000 != 0;
+                        let rn = ((raw >> 16) & 0xF) as u8;
+                        let rd = ((raw >> 12) & 0xF) as u8;
+                        let is_test = (0x8..=0xB).contains(&opcode);
+                        if rd == 15 || (is_test && !s) {
+                            poll_pure = false;
+                            (
+                                DecodedOp::ArmFallback {
+                                    raw,
+                                    pc: cur_pc,
+                                    ends_block: rd == 15,
+                                },
+                                rd == 15,
+                            )
+                        } else if raw & 0x0200_0000 != 0 {
+                            // Immediate operand2
+                            let imm8 = raw & 0xFF;
+                            let rot = ((raw >> 8) & 0xF) * 2;
+                            let (imm, carry_out) = if rot == 0 {
+                                (imm8, 0u8)
+                            } else {
+                                let v = imm8.rotate_right(rot);
+                                (v, if v >> 31 != 0 { 2u8 } else { 1u8 })
+                            };
+                            match opcode {
+                                0xD => {
+                                    // MOV imm
+                                    if cond == 0xE {
+                                        written_regs |= 1 << rd;
+                                    } else {
+                                        poll_pure = false;
+                                    }
+                                    (
+                                        DecodedOp::ArmMovImm {
+                                            cond,
+                                            rd,
+                                            s,
+                                            carry_out,
+                                            imm,
+                                        },
+                                        false,
+                                    )
+                                }
+                                0x2 | 0x4 if rn != 15 => {
+                                    poll_pure = false;
+                                    let flags = u8::from(s) | (u8::from(opcode == 0x2) << 1);
+                                    (
+                                        DecodedOp::ArmAddSubImm {
+                                            cond,
+                                            rd,
+                                            rn,
+                                            flags,
+                                            imm,
+                                        },
+                                        false,
+                                    )
+                                }
+                                0xA | 0xB if rn != 15 => {
+                                    if cond != 0xE {
+                                        poll_pure = false;
+                                    }
+                                    (
+                                        DecodedOp::ArmCmpImm {
+                                            cond,
+                                            rn,
+                                            cmn: opcode == 0xB,
+                                            imm,
+                                        },
+                                        false,
+                                    )
+                                }
+                                0x0 | 0x1 | 0x8 | 0x9 | 0xC | 0xE | 0xF
+                                    if rn != 15 || opcode == 0xF =>
+                                {
+                                    if cond != 0xE {
+                                        poll_pure = false;
+                                    } else if opcode != 0x8 && opcode != 0x9 {
+                                        if opcode != 0xF
+                                            && rn == rd
+                                            && (written_regs & (1 << rn)) == 0
+                                        {
+                                            poll_pure = false;
+                                        }
+                                        written_regs |= 1 << rd;
+                                    }
+                                    (
+                                        DecodedOp::ArmLogicImm {
+                                            cond,
+                                            opc: opcode,
+                                            rd,
+                                            rn,
+                                            s,
+                                            carry_out,
+                                            imm,
+                                        },
+                                        false,
+                                    )
+                                }
+                                _ => {
+                                    poll_pure = false;
+                                    (
+                                        DecodedOp::ArmFallback {
+                                            raw,
+                                            pc: cur_pc,
+                                            ends_block: false,
+                                        },
+                                        false,
+                                    )
+                                }
+                            }
+                        } else if raw & 0x10 == 0 {
+                            // Register operand2 with immediate shift
+                            let rm = (raw & 0xF) as u8;
+                            if rn != 15 && rm != 15 {
+                                let shift_ty = ((raw >> 5) & 3) as u8;
+                                let shift_amt = ((raw >> 7) & 0x1F) as u8;
+                                if cond != 0xE {
+                                    poll_pure = false;
+                                } else if !is_test {
+                                    let pure_logic =
+                                        matches!(opcode, 0x0 | 0x1 | 0xC | 0xD | 0xE | 0xF);
+                                    if !pure_logic {
+                                        poll_pure = false;
+                                    } else {
+                                        if (opcode != 0xD
+                                            && opcode != 0xF
+                                            && rn == rd
+                                            && (written_regs & (1 << rn)) == 0)
+                                            || (rm == rd && (written_regs & (1 << rm)) == 0)
+                                        {
+                                            poll_pure = false;
+                                        }
+                                        written_regs |= 1 << rd;
+                                    }
+                                }
+                                (
+                                    DecodedOp::ArmDpRegSimple {
+                                        cond,
+                                        opc: opcode,
+                                        rd,
+                                        rn,
+                                        rm,
+                                        shift_ty,
+                                        shift_amt,
+                                        s,
+                                    },
+                                    false,
+                                )
+                            } else {
+                                poll_pure = false;
+                                (
+                                    DecodedOp::ArmFallback {
+                                        raw,
+                                        pc: cur_pc,
+                                        ends_block: false,
+                                    },
+                                    false,
+                                )
+                            }
+                        } else {
+                            poll_pure = false;
+                            (
+                                DecodedOp::ArmFallback {
+                                    raw,
+                                    pc: cur_pc,
+                                    ends_block: false,
+                                },
+                                false,
+                            )
+                        }
+                    }
+                    OP_SINGLE => {
+                        let rn = ((raw >> 16) & 0xF) as u8;
+                        let rd = ((raw >> 12) & 0xF) as u8;
+                        let reg_off = raw & 0x0200_0000 != 0;
+                        let pre = raw & 0x0100_0000 != 0;
+                        let up = raw & 0x0080_0000 != 0;
+                        let byte = raw & 0x0040_0000 != 0;
+                        let wb = raw & 0x0020_0000 != 0;
+                        let load = raw & 0x0010_0000 != 0;
+                        let imm12 = raw & 0xFFF;
+                        if load && !reg_off && !byte && pre && !wb && rn == 15 && rd != 15 {
+                            let pc8 = cur_pc.wrapping_add(8);
+                            let addr = if up {
+                                pc8.wrapping_add(imm12)
+                            } else {
+                                pc8.wrapping_sub(imm12)
+                            };
+                            if cond == 0xE {
+                                has_load = true;
+                                written_regs |= 1 << rd;
+                            } else {
+                                poll_pure = false;
+                            }
+                            (DecodedOp::ArmLdr32Pc { cond, rd, addr }, false)
+                        } else if !reg_off && rd != 15 && rn != 15 {
+                            let off_i32 = if up { imm12 as i32 } else { -(imm12 as i32) };
+                            let flags = u8::from(byte) | (u8::from(pre) << 1) | (u8::from(wb) << 2);
+                            if load {
+                                if cond == 0xE && pre && !wb {
+                                    has_load = true;
+                                    base_regs |= 1 << rn;
+                                    written_regs |= 1 << rd;
+                                } else {
+                                    poll_pure = false;
+                                }
+                                (
+                                    DecodedOp::ArmLdrImm {
+                                        cond,
+                                        rd,
+                                        rn,
+                                        flags,
+                                        off: off_i32,
+                                    },
+                                    false,
+                                )
+                            } else {
+                                poll_pure = false;
+                                (
+                                    DecodedOp::ArmStrImm {
+                                        cond,
+                                        rd,
+                                        rn,
+                                        flags,
+                                        off: off_i32,
+                                    },
+                                    false,
+                                )
+                            }
+                        } else {
+                            poll_pure = false;
+                            let ends = load && rd == 15;
+                            (
+                                DecodedOp::ArmFallback {
+                                    raw,
+                                    pc: cur_pc,
+                                    ends_block: ends,
+                                },
+                                ends,
+                            )
+                        }
+                    }
+                    OP_BLOCK => {
+                        poll_pure = false;
+                        let load = raw & 0x0010_0000 != 0;
+                        let list = raw & 0xFFFF;
+                        let ends = load && (list == 0 || (list & 0x8000) != 0);
+                        (
+                            DecodedOp::ArmFallback {
+                                raw,
+                                pc: cur_pc,
+                                ends_block: ends,
+                            },
+                            ends,
+                        )
+                    }
+                    OP_SWI | OP_COPROC => {
+                        poll_pure = false;
+                        (
+                            DecodedOp::ArmFallback {
+                                raw,
+                                pc: cur_pc,
+                                ends_block: true,
+                            },
+                            true,
+                        )
+                    }
+                    _ => {
+                        poll_pure = false;
+                        (
+                            DecodedOp::ArmFallback {
+                                raw,
+                                pc: cur_pc,
+                                ends_block: false,
+                            },
+                            false,
+                        )
+                    }
+                }
+            };
+
+            blk.ops[blk.len as usize] = op;
+            blk.len += 1;
+            cur_pc = cur_pc.wrapping_add(4);
+            off += 4;
+            if ends_block {
+                break;
+            }
+        }
+
+        self.bus.mark_code_page(page_idx);
+        blk
+    }
+
+    fn decode_thumb_block(
+        &mut self,
+        start_pc: u32,
+        page_idx: u16,
+        page_gen: u32,
+        page_ptr: *const u8,
+        start_off: usize,
+    ) -> CachedBlock {
+        let mut blk = CachedBlock {
+            start_pc,
+            page_gen,
+            page_idx,
+            len: 0,
+            flags: 1, // bit0 = thumb
+            ops: [DecodedOp::Nop; MAX_BLOCK_OPS],
+        };
+        let mut cur_pc = start_pc;
+        let mut off = start_off & !1;
+        let mut written_regs: u16 = 0;
+        let mut base_regs: u16 = 0;
+        let mut has_load = false;
+        let mut poll_pure = true;
+
+        while (blk.len as usize) < MAX_BLOCK_OPS && off + 2 <= 0x1000 {
+            // SAFETY: `off + 2 <= 0x1000` within valid 4 KiB page.
+            let raw =
+                unsafe { u16::from_le(std::ptr::read_unaligned(page_ptr.add(off) as *const u16)) };
+            let op32 = raw as u32;
+            let mut advance = 2usize;
+
+            let (op, ends_block) = match op32 >> 13 {
+                0b000 => {
+                    if (op32 >> 11) & 3 == 3 {
+                        poll_pure = false;
+                        let rd = (op32 & 7) as u8;
+                        let rs = ((op32 >> 3) & 7) as u8;
+                        let rn_or_imm = ((op32 >> 6) & 7) as u8;
+                        let opc = u8::from(op32 & 0x200 != 0) | (u8::from(op32 & 0x400 != 0) << 1);
+                        (
+                            DecodedOp::ThumbAddSub {
+                                opc,
+                                rd,
+                                rs,
+                                rn_or_imm,
+                            },
+                            false,
+                        )
+                    } else {
+                        let rd = (op32 & 7) as u8;
+                        let rs = ((op32 >> 3) & 7) as u8;
+                        let imm5 = ((op32 >> 6) & 0x1F) as u8;
+                        let opc = ((op32 >> 11) & 3) as u8;
+                        if rs == rd && (written_regs & (1 << rs)) == 0 {
+                            poll_pure = false;
+                        }
+                        written_regs |= 1 << rd;
+                        (DecodedOp::ThumbShiftImm { opc, rd, rs, imm5 }, false)
+                    }
+                }
+                0b001 => {
+                    let rd = ((op32 >> 8) & 7) as u8;
+                    let imm = (op32 & 0xFF) as u8;
+                    let opc = ((op32 >> 11) & 3) as u8;
+                    if opc == 0 {
+                        written_regs |= 1 << rd;
+                    } else if opc >= 2 {
+                        poll_pure = false;
+                    }
+                    (DecodedOp::ThumbImm8 { opc, rd, imm }, false)
+                }
+                0b010 => {
+                    if op32 & 0x1C00 == 0x0000 {
+                        let rd = (op32 & 7) as u8;
+                        let rs = ((op32 >> 3) & 7) as u8;
+                        let opc = ((op32 >> 6) & 0xF) as u8;
+                        match opc {
+                            0x8 | 0xA | 0xB => {}
+                            0x0 | 0x1 | 0xC | 0xE | 0xF => {
+                                if (opc != 0xF && (written_regs & (1 << rd)) == 0)
+                                    || (rs == rd && (written_regs & (1 << rs)) == 0)
+                                {
+                                    poll_pure = false;
+                                }
+                                written_regs |= 1 << rd;
+                            }
+                            _ => poll_pure = false,
+                        }
+                        (DecodedOp::ThumbAlu { opc, rd, rs }, false)
+                    } else if op32 & 0x1C00 == 0x0400 {
+                        let opc = ((op32 >> 8) & 3) as u8;
+                        let rd = ((op32 & 7) | ((op32 >> 4) & 8)) as u8;
+                        let rs = ((op32 >> 3) & 0xF) as u8;
+                        if opc < 3 && rd != 15 && rs != 15 {
+                            if opc != 1 {
+                                poll_pure = false;
+                            }
+                            (DecodedOp::ThumbHiReg { opc, rd, rs }, false)
+                        } else {
+                            poll_pure = false;
+                            let ends = opc == 3 || rd == 15;
+                            (
+                                DecodedOp::ThumbFallback {
+                                    raw,
+                                    pc: cur_pc,
+                                    ends_block: ends,
+                                },
+                                ends,
+                            )
+                        }
+                    } else if op32 & 0x1800 == 0x0800 {
+                        let rd = ((op32 >> 8) & 7) as u8;
+                        let addr = ((cur_pc.wrapping_add(4)) & !3).wrapping_add((op32 & 0xFF) << 2);
+                        has_load = true;
+                        written_regs |= 1 << rd;
+                        (DecodedOp::ThumbLdrPc { rd, addr }, false)
+                    } else {
+                        poll_pure = false;
+                        (
+                            DecodedOp::ThumbFallback {
+                                raw,
+                                pc: cur_pc,
+                                ends_block: false,
+                            },
+                            false,
+                        )
+                    }
+                }
+                0b011 => {
+                    let rd = (op32 & 7) as u8;
+                    let rb = ((op32 >> 3) & 7) as u8;
+                    let imm = (op32 >> 6) & 0x1F;
+                    let byte = op32 & 0x1000 != 0;
+                    let load = op32 & 0x0800 != 0;
+                    let off_u16 = if byte { imm as u16 } else { (imm << 2) as u16 };
+                    let kind = match (load, byte) {
+                        (false, false) => 0u8,
+                        (false, true) => 1u8,
+                        (true, false) => 2u8,
+                        (true, true) => 3u8,
+                    };
+                    if load {
+                        has_load = true;
+                        base_regs |= 1 << rb;
+                        written_regs |= 1 << rd;
+                    } else {
+                        poll_pure = false;
+                    }
+                    (
+                        DecodedOp::ThumbLdrStrImm {
+                            kind,
+                            rd,
+                            rb,
+                            off: off_u16,
+                        },
+                        false,
+                    )
+                }
+                0b100 => {
+                    if op32 & 0x1000 == 0 {
+                        let rd = (op32 & 7) as u8;
+                        let rb = ((op32 >> 3) & 7) as u8;
+                        let off_u16 = (((op32 >> 6) & 0x1F) << 1) as u16;
+                        let load = op32 & 0x0800 != 0;
+                        if load {
+                            has_load = true;
+                            base_regs |= 1 << rb;
+                            written_regs |= 1 << rd;
+                        } else {
+                            poll_pure = false;
+                        }
+                        (
+                            DecodedOp::ThumbLdrStrImm {
+                                kind: if load { 5 } else { 4 },
+                                rd,
+                                rb,
+                                off: off_u16,
+                            },
+                            false,
+                        )
+                    } else {
+                        let rd = ((op32 >> 8) & 7) as u8;
+                        let off_u16 = ((op32 & 0xFF) << 2) as u16;
+                        let load = op32 & 0x0800 != 0;
+                        if load {
+                            has_load = true;
+                            base_regs |= 1 << 13;
+                            written_regs |= 1 << rd;
+                        } else {
+                            poll_pure = false;
+                        }
+                        (
+                            DecodedOp::ThumbLdrStrImm {
+                                kind: if load { 2 } else { 0 },
+                                rd,
+                                rb: 13,
+                                off: off_u16,
+                            },
+                            false,
+                        )
+                    }
+                }
+                0b101 => {
+                    poll_pure = false;
+                    if op32 & 0x1000 == 0 {
+                        let rd = ((op32 >> 8) & 7) as u8;
+                        let imm = (op32 & 0xFF) << 2;
+                        let is_sp = op32 & 0x0800 != 0;
+                        let val_or_off = if is_sp {
+                            imm
+                        } else {
+                            (cur_pc.wrapping_add(4) & !3).wrapping_add(imm)
+                        };
+                        (
+                            DecodedOp::ThumbAddPcSp {
+                                is_sp,
+                                rd,
+                                val_or_off,
+                            },
+                            false,
+                        )
+                    } else if op32 & 0x0F00 == 0 {
+                        let imm = (op32 & 0x7F) << 2;
+                        let val_or_off = if op32 & 0x80 != 0 {
+                            0u32.wrapping_sub(imm)
+                        } else {
+                            imm
+                        };
+                        (
+                            DecodedOp::ThumbAddPcSp {
+                                is_sp: true,
+                                rd: 13,
+                                val_or_off,
+                            },
+                            false,
+                        )
+                    } else {
+                        let ends = (op32 & 0x0F00) == 0x0D00; // POP {..., pc}
+                        (
+                            DecodedOp::ThumbFallback {
+                                raw,
+                                pc: cur_pc,
+                                ends_block: ends,
+                            },
+                            ends,
+                        )
+                    }
+                }
+                0b110 => {
+                    if op32 & 0x1000 == 0 {
+                        poll_pure = false;
+                        let ends = (op32 & 0xFF) == 0 && (op32 & 0x0800 != 0);
+                        (
+                            DecodedOp::ThumbFallback {
+                                raw,
+                                pc: cur_pc,
+                                ends_block: ends,
+                            },
+                            ends,
+                        )
+                    } else {
+                        let cond = ((op32 >> 8) & 0xF) as u8;
+                        if cond < 0xE {
+                            let delta = ((op32 & 0xFF) as i8 as i32) << 1;
+                            let target = cur_pc.wrapping_add(4).wrapping_add(delta as u32);
+                            if blk.len > 0
+                                && target == start_pc
+                                && poll_pure
+                                && has_load
+                                && (written_regs & base_regs) == 0
+                            {
+                                blk.flags |= 4; // read-only poll loop
+                            }
+                            (DecodedOp::ThumbCondBranch { cond, target }, true)
+                        } else {
+                            poll_pure = false;
+                            (
+                                DecodedOp::ThumbFallback {
+                                    raw,
+                                    pc: cur_pc,
+                                    ends_block: true,
+                                },
+                                true,
+                            )
+                        }
+                    }
+                }
+                _ => {
+                    if op32 & 0x1800 == 0x0000 {
+                        let delta = ((op32 << 21) as i32 >> 20) as u32;
+                        let target = cur_pc.wrapping_add(4).wrapping_add(delta);
+                        if blk.len == 0 && target == start_pc {
+                            blk.flags |= 2; // unconditional B . idle loop
+                        }
+                        (DecodedOp::ThumbBranch { target }, true)
+                    } else if op32 & 0x1800 == 0x1000 && off + 4 <= 0x1000 {
+                        // Fuse Thumb BL / BLX prefix+suffix pair within the same 4 KiB page.
+                        let next_raw = unsafe {
+                            u16::from_le(std::ptr::read_unaligned(
+                                page_ptr.add(off + 2) as *const u16
+                            ))
+                        };
+                        let next32 = next_raw as u32;
+                        if next32 & 0xF800 == 0xF800 || (B::IS_ARM9 && next32 & 0xF800 == 0xE800) {
+                            let hi_off = ((op32 << 21) as i32 >> 9) as u32;
+                            let lr_mid = cur_pc.wrapping_add(4).wrapping_add(hi_off);
+                            let to_arm = next32 & 0xF800 == 0xE800;
+                            let target = lr_mid.wrapping_add((next32 & 0x7FF) << 1)
+                                & if to_arm { !3 } else { !1 };
+                            let ret_lr = cur_pc.wrapping_add(4) | 1;
+                            advance = 4;
+                            (
+                                DecodedOp::ThumbBlPair {
+                                    target,
+                                    ret_lr,
+                                    to_arm,
+                                    raw0: raw,
+                                },
+                                true,
+                            )
+                        } else {
+                            poll_pure = false;
+                            (
+                                DecodedOp::ThumbFallback {
+                                    raw,
+                                    pc: cur_pc,
+                                    ends_block: true,
+                                },
+                                true,
+                            )
+                        }
+                    } else {
+                        poll_pure = false;
+                        (
+                            DecodedOp::ThumbFallback {
+                                raw,
+                                pc: cur_pc,
+                                ends_block: true,
+                            },
+                            true,
+                        )
+                    }
+                }
+            };
+
+            blk.ops[blk.len as usize] = op;
+            blk.len += 1;
+            cur_pc = cur_pc.wrapping_add(advance as u32);
+            off += advance;
+            if ends_block {
+                break;
+            }
+        }
+
+        self.bus.mark_code_page(page_idx);
+        blk
+    }
+
+    #[inline(always)]
+    fn exec_cached_block(&mut self, blk_ptr: *const CachedBlock, remaining: &mut u32) {
+        // SAFETY: `self.block_cache` is never mutated or reallocated during block execution.
+        let blk = unsafe { &*blk_ptr };
+        let is_thumb = (blk.flags & 1) != 0;
+        let is_idle_loop = (blk.flags & 2) != 0;
+        let is_poll_loop = (blk.flags & 4) != 0;
+        let page_idx = blk.page_idx;
+        let page_gen = blk.page_gen;
+        let step_bytes: u32 = if is_thumb { 2 } else { 4 };
+        let mut cur_pc = blk.start_pc;
+        let mut poll_load_safe = is_poll_loop;
+        let len = blk.len as usize;
+
+        for idx in 0..len {
+            if *remaining == 0 {
+                self.st.regs[15] = cur_pc;
+                return;
+            }
+            let op = blk.ops[idx];
+            match op {
+                DecodedOp::Nop => {}
+                DecodedOp::ArmMovImm {
+                    cond,
+                    rd,
+                    s,
+                    carry_out,
+                    imm,
+                } => {
+                    if cond == 0xE || self.cond(cond as u32) {
+                        self.st.regs[rd as usize] = imm;
+                        if s {
+                            self.apply_logical_imm_flags(imm, carry_out);
+                        }
+                    }
+                }
+                DecodedOp::ArmAddSubImm {
+                    cond,
+                    rd,
+                    rn,
+                    flags,
+                    imm,
+                } => {
+                    if cond == 0xE || self.cond(cond as u32) {
+                        let a = self.st.regs[rn as usize];
+                        let s = (flags & 1) != 0;
+                        let r = if (flags & 2) != 0 {
+                            self.sub_with_flags(a, imm, 1, s)
+                        } else {
+                            self.add_with_flags(a, imm, 0, s)
+                        };
+                        self.st.regs[rd as usize] = r;
+                    }
+                }
+                DecodedOp::ArmCmpImm { cond, rn, cmn, imm } => {
+                    if cond == 0xE || self.cond(cond as u32) {
+                        let a = self.st.regs[rn as usize];
+                        if cmn {
+                            self.add_with_flags(a, imm, 0, true);
+                        } else {
+                            self.sub_with_flags(a, imm, 1, true);
+                        }
+                    }
+                }
+                DecodedOp::ArmLogicImm {
+                    cond,
+                    opc,
+                    rd,
+                    rn,
+                    s,
+                    carry_out,
+                    imm,
+                } => {
+                    if cond == 0xE || self.cond(cond as u32) {
+                        let a = self.st.regs[rn as usize];
+                        match opc {
+                            0x0 => {
+                                let r = a & imm;
+                                self.st.regs[rd as usize] = r;
+                                if s {
+                                    self.apply_logical_imm_flags(r, carry_out);
+                                }
+                            }
+                            0x1 => {
+                                let r = a ^ imm;
+                                self.st.regs[rd as usize] = r;
+                                if s {
+                                    self.apply_logical_imm_flags(r, carry_out);
+                                }
+                            }
+                            0x8 => self.apply_logical_imm_flags(a & imm, carry_out),
+                            0x9 => self.apply_logical_imm_flags(a ^ imm, carry_out),
+                            0xC => {
+                                let r = a | imm;
+                                self.st.regs[rd as usize] = r;
+                                if s {
+                                    self.apply_logical_imm_flags(r, carry_out);
+                                }
+                            }
+                            0xE => {
+                                let r = a & !imm;
+                                self.st.regs[rd as usize] = r;
+                                if s {
+                                    self.apply_logical_imm_flags(r, carry_out);
+                                }
+                            }
+                            _ => {
+                                let r = !imm;
+                                self.st.regs[rd as usize] = r;
+                                if s {
+                                    self.apply_logical_imm_flags(r, carry_out);
+                                }
+                            }
+                        }
+                    }
+                }
+                DecodedOp::ArmDpRegSimple {
+                    cond,
+                    opc,
+                    rd,
+                    rn,
+                    rm,
+                    shift_ty,
+                    shift_amt,
+                    s,
+                } => {
+                    if cond == 0xE || self.cond(cond as u32) {
+                        let rm_val = self.st.regs[rm as usize];
+                        let (op2, sh_carry) = if shift_ty == 0 && shift_amt == 0 {
+                            (rm_val, self.flag(C))
+                        } else {
+                            self.shift(shift_ty as u32, rm_val, shift_amt as u32, true)
+                        };
+                        let a = self.st.regs[rn as usize];
+                        let set_log = |cpu: &mut Self, r: u32| {
+                            let mut cpsr = cpu.st.cpsr & !(N | Z | C);
+                            cpsr |= r & N;
+                            if r == 0 {
+                                cpsr |= Z;
+                            }
+                            if sh_carry {
+                                cpsr |= C;
+                            }
+                            cpu.st.cpsr = cpsr;
+                        };
+                        match opc {
+                            0x0 => {
+                                let r = a & op2;
+                                self.st.regs[rd as usize] = r;
+                                if s {
+                                    set_log(self, r);
+                                }
+                            }
+                            0x1 => {
+                                let r = a ^ op2;
+                                self.st.regs[rd as usize] = r;
+                                if s {
+                                    set_log(self, r);
+                                }
+                            }
+                            0x2 => self.st.regs[rd as usize] = self.sub_with_flags(a, op2, 1, s),
+                            0x3 => self.st.regs[rd as usize] = self.sub_with_flags(op2, a, 1, s),
+                            0x4 => self.st.regs[rd as usize] = self.add_with_flags(a, op2, 0, s),
+                            0x5 => {
+                                let c = self.flag(C) as u32;
+                                self.st.regs[rd as usize] = self.add_with_flags(a, op2, c, s);
+                            }
+                            0x6 => {
+                                let c = self.flag(C) as u32;
+                                self.st.regs[rd as usize] = self.sub_with_flags(a, op2, c, s);
+                            }
+                            0x7 => {
+                                let c = self.flag(C) as u32;
+                                self.st.regs[rd as usize] = self.sub_with_flags(op2, a, c, s);
+                            }
+                            0x8 => set_log(self, a & op2),
+                            0x9 => set_log(self, a ^ op2),
+                            0xA => {
+                                self.sub_with_flags(a, op2, 1, true);
+                            }
+                            0xB => {
+                                self.add_with_flags(a, op2, 0, true);
+                            }
+                            0xC => {
+                                let r = a | op2;
+                                self.st.regs[rd as usize] = r;
+                                if s {
+                                    set_log(self, r);
+                                }
+                            }
+                            0xD => {
+                                self.st.regs[rd as usize] = op2;
+                                if s {
+                                    set_log(self, op2);
+                                }
+                            }
+                            0xE => {
+                                let r = a & !op2;
+                                self.st.regs[rd as usize] = r;
+                                if s {
+                                    set_log(self, r);
+                                }
+                            }
+                            _ => {
+                                let r = !op2;
+                                self.st.regs[rd as usize] = r;
+                                if s {
+                                    set_log(self, r);
+                                }
+                            }
+                        }
+                    }
+                }
+                DecodedOp::ArmLdr32Pc { cond, rd, addr } => {
+                    if cond == 0xE || self.cond(cond as u32) {
+                        if poll_load_safe && (addr >> 16) == 0x0410 {
+                            poll_load_safe = false;
+                        }
+                        let raw = self.bus.read32(addr);
+                        let v = if addr & 3 == 0 {
+                            raw
+                        } else {
+                            raw.rotate_right((addr & 3) * 8)
+                        };
+                        self.st.regs[rd as usize] = v;
+                    }
+                }
+                DecodedOp::ArmLdrImm {
+                    cond,
+                    rd,
+                    rn,
+                    flags,
+                    off,
+                } => {
+                    if cond == 0xE || self.cond(cond as u32) {
+                        let base = self.st.regs[rn as usize];
+                        let off_base = base.wrapping_add(off as u32);
+                        let pre = (flags & 2) != 0;
+                        let addr = if pre { off_base } else { base };
+                        if poll_load_safe && (addr >> 16) == 0x0410 {
+                            poll_load_safe = false;
+                        }
+                        let v = if (flags & 1) != 0 {
+                            self.bus.read8(addr) as u32
+                        } else {
+                            let raw = self.bus.read32(addr);
+                            if addr & 3 == 0 {
+                                raw
+                            } else {
+                                raw.rotate_right((addr & 3) * 8)
+                            }
+                        };
+                        if !pre || (flags & 4) != 0 {
+                            self.st.regs[rn as usize] = off_base;
+                        }
+                        self.st.regs[rd as usize] = v;
+                    }
+                }
+                DecodedOp::ArmStrImm {
+                    cond,
+                    rd,
+                    rn,
+                    flags,
+                    off,
+                } => {
+                    if cond == 0xE || self.cond(cond as u32) {
+                        let base = self.st.regs[rn as usize];
+                        let off_base = base.wrapping_add(off as u32);
+                        let pre = (flags & 2) != 0;
+                        let addr = if pre { off_base } else { base };
+                        let v = self.st.regs[rd as usize];
+                        if (flags & 1) != 0 {
+                            self.bus.write8(addr, v as u8);
+                        } else {
+                            self.bus.write32(addr, v);
+                        }
+                        if !pre || (flags & 4) != 0 {
+                            self.st.regs[rn as usize] = off_base;
+                        }
+                        if self.bus.code_page_gen(page_idx) != page_gen {
+                            *remaining -= 1;
+                            self.st.regs[15] = cur_pc.wrapping_add(4);
+                            return;
+                        }
+                    }
+                }
+                DecodedOp::ArmBranch {
+                    cond,
+                    link,
+                    target,
+                    ret_pc,
+                } => {
+                    *remaining -= 1;
+                    if cond == 0xE || self.cond(cond as u32) {
+                        if link {
+                            self.st.regs[14] = ret_pc;
+                        }
+                        self.st.regs[15] = target;
+                        if is_idle_loop || (is_poll_loop && poll_load_safe) {
+                            *remaining = 0;
+                        }
+                    } else {
+                        self.st.regs[15] = cur_pc.wrapping_add(4);
+                    }
+                    return;
+                }
+                DecodedOp::ArmBx {
+                    cond,
+                    rm,
+                    link,
+                    ret_pc,
+                } => {
+                    *remaining -= 1;
+                    if cond == 0xE || self.cond(cond as u32) {
+                        let v = self.st.regs[rm as usize];
+                        if link {
+                            self.st.regs[14] = ret_pc;
+                        }
+                        self.set_flag(T, v & 1 != 0);
+                        self.st.regs[15] = v & !1 & if v & 1 != 0 { !0 } else { !3 };
+                    } else {
+                        self.st.regs[15] = cur_pc.wrapping_add(4);
+                    }
+                    return;
+                }
+                DecodedOp::ArmFallback {
+                    raw,
+                    pc,
+                    ends_block,
+                } => {
+                    self.st.regs[15] = pc;
+                    let c = raw >> 28;
+                    if c == 0xE {
+                        self.exec_arm(raw);
+                    } else if c == 0xF {
+                        if B::IS_ARM9 {
+                            self.exec_arm_uncond(raw);
+                        }
+                    } else if self.cond(c) {
+                        self.exec_arm(raw);
+                    }
+                    *remaining -= 1;
+                    let branched = self.st.regs[15] != pc;
+                    if !branched {
+                        self.st.regs[15] = pc.wrapping_add(4);
+                    }
+                    if branched
+                        || ends_block
+                        || self.thumb()
+                        || self.st.halted
+                        || self.st.spin > 0
+                        || self.st.intr_wait.is_some()
+                        || self.bus.code_page_gen(page_idx) != page_gen
+                    {
+                        return;
+                    }
+                    cur_pc = pc.wrapping_add(4);
+                    continue;
+                }
+                // ---- Thumb pre-decoded ops ----
+                DecodedOp::ThumbShiftImm { opc, rd, rs, imm5 } => {
+                    let (r, c) =
+                        self.shift(opc as u32, self.st.regs[rs as usize], imm5 as u32, true);
+                    self.st.regs[rd as usize] = r;
+                    self.set_nz(r);
+                    self.set_flag(C, c);
+                }
+                DecodedOp::ThumbAddSub {
+                    opc,
+                    rd,
+                    rs,
+                    rn_or_imm,
+                } => {
+                    let a = self.st.regs[rs as usize];
+                    let v = if (opc & 2) != 0 {
+                        rn_or_imm as u32
+                    } else {
+                        self.st.regs[rn_or_imm as usize]
+                    };
+                    let r = if (opc & 1) != 0 {
+                        self.sub_with_flags(a, v, 1, true)
+                    } else {
+                        self.add_with_flags(a, v, 0, true)
+                    };
+                    self.st.regs[rd as usize] = r;
+                }
+                DecodedOp::ThumbImm8 { opc, rd, imm } => {
+                    let imm32 = imm as u32;
+                    let a = self.st.regs[rd as usize];
+                    match opc {
+                        0 => {
+                            self.st.regs[rd as usize] = imm32;
+                            self.set_nz(imm32);
+                        }
+                        1 => {
+                            self.sub_with_flags(a, imm32, 1, true);
+                        }
+                        2 => {
+                            self.st.regs[rd as usize] = self.add_with_flags(a, imm32, 0, true);
+                        }
+                        _ => {
+                            self.st.regs[rd as usize] = self.sub_with_flags(a, imm32, 1, true);
+                        }
+                    }
+                }
+                DecodedOp::ThumbAlu { opc, rd, rs } => {
+                    let a = self.st.regs[rd as usize];
+                    let b = self.st.regs[rs as usize];
+                    match opc {
+                        0x0 => {
+                            let r = a & b;
+                            self.st.regs[rd as usize] = r;
+                            self.set_nz(r);
+                        }
+                        0x1 => {
+                            let r = a ^ b;
+                            self.st.regs[rd as usize] = r;
+                            self.set_nz(r);
+                        }
+                        0x2 => {
+                            let (r, cy) = self.shift(0, a, b & 0xFF, false);
+                            self.st.regs[rd as usize] = r;
+                            self.set_nz(r);
+                            self.set_flag(C, cy);
+                        }
+                        0x3 => {
+                            let (r, cy) = self.shift(1, a, b & 0xFF, false);
+                            self.st.regs[rd as usize] = r;
+                            self.set_nz(r);
+                            self.set_flag(C, cy);
+                        }
+                        0x4 => {
+                            let (r, cy) = self.shift(2, a, b & 0xFF, false);
+                            self.st.regs[rd as usize] = r;
+                            self.set_nz(r);
+                            self.set_flag(C, cy);
+                        }
+                        0x5 => {
+                            let c = self.flag(C) as u32;
+                            self.st.regs[rd as usize] = self.add_with_flags(a, b, c, true);
+                        }
+                        0x6 => {
+                            let c = self.flag(C) as u32;
+                            self.st.regs[rd as usize] = self.sub_with_flags(a, b, c, true);
+                        }
+                        0x7 => {
+                            let (r, cy) = self.shift(3, a, b & 0xFF, false);
+                            self.st.regs[rd as usize] = r;
+                            self.set_nz(r);
+                            self.set_flag(C, cy);
+                        }
+                        0x8 => self.set_nz(a & b),
+                        0x9 => {
+                            self.st.regs[rd as usize] = self.sub_with_flags(0, b, 1, true);
+                        }
+                        0xA => {
+                            self.sub_with_flags(a, b, 1, true);
+                        }
+                        0xB => {
+                            self.add_with_flags(a, b, 0, true);
+                        }
+                        0xC => {
+                            let r = a | b;
+                            self.st.regs[rd as usize] = r;
+                            self.set_nz(r);
+                        }
+                        0xD => {
+                            let r = a.wrapping_mul(b);
+                            self.st.regs[rd as usize] = r;
+                            self.set_nz(r);
+                        }
+                        0xE => {
+                            let r = a & !b;
+                            self.st.regs[rd as usize] = r;
+                            self.set_nz(r);
+                        }
+                        _ => {
+                            let r = !b;
+                            self.st.regs[rd as usize] = r;
+                            self.set_nz(r);
+                        }
+                    }
+                }
+                DecodedOp::ThumbHiReg { opc, rd, rs } => match opc {
+                    0 => {
+                        self.st.regs[rd as usize] =
+                            self.st.regs[rd as usize].wrapping_add(self.st.regs[rs as usize]);
+                    }
+                    1 => {
+                        let a = self.st.regs[rd as usize];
+                        let b = self.st.regs[rs as usize];
+                        self.sub_with_flags(a, b, 1, true);
+                    }
+                    _ => {
+                        self.st.regs[rd as usize] = self.st.regs[rs as usize];
+                    }
+                },
+                DecodedOp::ThumbLdrPc { rd, addr } => {
+                    if poll_load_safe && (addr >> 16) == 0x0410 {
+                        poll_load_safe = false;
+                    }
+                    self.st.regs[rd as usize] = self.bus.read32(addr);
+                }
+                DecodedOp::ThumbLdrStrImm { kind, rd, rb, off } => {
+                    let addr = self.st.regs[rb as usize].wrapping_add(off as u32);
+                    match kind {
+                        0 => {
+                            self.bus.write32(addr, self.st.regs[rd as usize]);
+                            if self.bus.code_page_gen(page_idx) != page_gen {
+                                *remaining -= 1;
+                                self.st.regs[15] = cur_pc.wrapping_add(2);
+                                return;
+                            }
+                        }
+                        1 => {
+                            self.bus.write8(addr, self.st.regs[rd as usize] as u8);
+                            if self.bus.code_page_gen(page_idx) != page_gen {
+                                *remaining -= 1;
+                                self.st.regs[15] = cur_pc.wrapping_add(2);
+                                return;
+                            }
+                        }
+                        2 => {
+                            if poll_load_safe && (addr >> 16) == 0x0410 {
+                                poll_load_safe = false;
+                            }
+                            let raw = self.bus.read32(addr);
+                            self.st.regs[rd as usize] = if addr & 3 == 0 {
+                                raw
+                            } else {
+                                raw.rotate_right((addr & 3) * 8)
+                            };
+                        }
+                        3 => {
+                            if poll_load_safe && (addr >> 16) == 0x0410 {
+                                poll_load_safe = false;
+                            }
+                            self.st.regs[rd as usize] = self.bus.read8(addr) as u32;
+                        }
+                        4 => {
+                            self.bus.write16(addr, self.st.regs[rd as usize] as u16);
+                            if self.bus.code_page_gen(page_idx) != page_gen {
+                                *remaining -= 1;
+                                self.st.regs[15] = cur_pc.wrapping_add(2);
+                                return;
+                            }
+                        }
+                        _ => {
+                            if poll_load_safe && (addr >> 16) == 0x0410 {
+                                poll_load_safe = false;
+                            }
+                            let raw = self.bus.read16(addr) as u32;
+                            self.st.regs[rd as usize] = raw.rotate_right((addr & 1) * 8);
+                        }
+                    }
+                }
+                DecodedOp::ThumbAddPcSp {
+                    is_sp,
+                    rd,
+                    val_or_off,
+                } => {
+                    self.st.regs[rd as usize] = if is_sp {
+                        self.st.regs[13].wrapping_add(val_or_off)
+                    } else {
+                        val_or_off
+                    };
+                }
+                DecodedOp::ThumbCondBranch { cond, target } => {
+                    *remaining -= 1;
+                    if self.cond(cond as u32) {
+                        self.st.regs[15] = target;
+                        if is_poll_loop && poll_load_safe {
+                            *remaining = 0;
+                        }
+                    } else {
+                        self.st.regs[15] = cur_pc.wrapping_add(2);
+                    }
+                    return;
+                }
+                DecodedOp::ThumbBranch { target } => {
+                    *remaining -= 1;
+                    self.st.regs[15] = target;
+                    if is_idle_loop {
+                        *remaining = 0;
+                    }
+                    return;
+                }
+                DecodedOp::ThumbBlPair {
+                    target,
+                    ret_lr,
+                    to_arm,
+                    raw0,
+                } => {
+                    if *remaining < 2 {
+                        self.st.regs[15] = cur_pc;
+                        self.exec_thumb(raw0);
+                        self.st.regs[15] = cur_pc.wrapping_add(2);
+                        *remaining = 0;
+                        return;
+                    }
+                    *remaining -= 2;
+                    self.st.regs[14] = ret_lr;
+                    if to_arm {
+                        self.set_flag(T, false);
+                    }
+                    self.st.regs[15] = target;
+                    return;
+                }
+                DecodedOp::ThumbFallback {
+                    raw,
+                    pc,
+                    ends_block,
+                } => {
+                    self.st.regs[15] = pc;
+                    self.exec_thumb(raw);
+                    *remaining -= 1;
+                    let branched = self.st.regs[15] != pc;
+                    if !branched {
+                        self.st.regs[15] = pc.wrapping_add(2);
+                    }
+                    if branched
+                        || ends_block
+                        || !self.thumb()
+                        || self.st.halted
+                        || self.st.spin > 0
+                        || self.st.intr_wait.is_some()
+                        || self.bus.code_page_gen(page_idx) != page_gen
+                    {
+                        return;
+                    }
+                    cur_pc = pc.wrapping_add(2);
+                    continue;
+                }
+            }
+
+            *remaining -= 1;
+            cur_pc = cur_pc.wrapping_add(step_bytes);
+        }
+
+        self.st.regs[15] = cur_pc;
+    }
+
+    /// Tight cached basic-block execution loop used when no breakpoint/watch/I/O-log hooks are active.
     fn run_slice_fast(&mut self, mut remaining: u32) {
         while remaining > 0 {
             if let Some(mask) = self.st.intr_wait {
@@ -494,29 +2124,69 @@ impl<B: Bus> Cpu<B> {
             }
 
             let pc = self.st.regs[15];
-            if self.thumb() {
-                let op = self.bus.fetch16(pc);
-                self.exec_thumb(op);
-                if self.st.regs[15] == pc {
-                    self.st.regs[15] = pc.wrapping_add(2);
+            let is_thumb = self.thumb();
+            if let Some((page_idx, page_gen, page_ptr, off)) = self.bus.code_page_info(pc) {
+                let slot = block_slot(pc);
+                let hit = {
+                    let b = &self.block_cache[slot];
+                    b.page_idx == page_idx
+                        && b.start_pc == pc
+                        && b.page_gen == page_gen
+                        && ((b.flags & 1) != 0) == is_thumb
+                        && b.len > 0
+                };
+                if !hit {
+                    let decoded = if is_thumb {
+                        self.decode_thumb_block(pc, page_idx, page_gen, page_ptr, off)
+                    } else {
+                        self.decode_arm_block(pc, page_idx, page_gen, page_ptr, off)
+                    };
+                    self.block_cache[slot] = decoded;
                 }
+                let blk_ptr = &self.block_cache[slot] as *const CachedBlock;
+                self.exec_cached_block(blk_ptr, &mut remaining);
             } else {
-                let op = self.bus.fetch32(pc);
-                let c = op >> 28;
-                if c == 0xE {
-                    self.exec_arm(op);
-                } else if c == 0xF {
-                    if self.st.arm9 {
-                        self.exec_arm_uncond(op);
+                // Non-RAM execution (BIOS/IRQ stub): single-step fast path.
+                if is_thumb {
+                    let op = self.bus.fetch16(pc);
+                    self.exec_thumb(op);
+                    if self.st.regs[15] == pc {
+                        self.st.regs[15] = pc.wrapping_add(2);
                     }
-                } else if self.cond(c) {
-                    self.exec_arm(op);
+                } else {
+                    let op = self.bus.fetch32(pc);
+                    let c = op >> 28;
+                    if c == 0xE {
+                        self.exec_arm(op);
+                    } else if c == 0xF {
+                        if B::IS_ARM9 {
+                            self.exec_arm_uncond(op);
+                        }
+                    } else if self.cond(c) {
+                        self.exec_arm(op);
+                    }
+                    if self.st.regs[15] == pc {
+                        self.st.regs[15] = pc.wrapping_add(4);
+                    }
                 }
-                if self.st.regs[15] == pc {
-                    self.st.regs[15] = pc.wrapping_add(4);
-                }
+                remaining -= 1;
             }
 
+            if self.st.spin > 0 {
+                if self.st.spin >= remaining {
+                    self.st.spin -= remaining;
+                    return;
+                }
+                remaining -= self.st.spin;
+                self.st.spin = 0;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn run_slice_uncached(&mut self, mut remaining: u32) {
+        while remaining > 0 {
+            self.step();
             remaining -= 1;
             if self.st.spin > 0 {
                 if self.st.spin >= remaining {
@@ -525,6 +2195,9 @@ impl<B: Bus> Cpu<B> {
                 }
                 remaining -= self.st.spin;
                 self.st.spin = 0;
+            }
+            if self.st.halted && !self.bus.irq_pending() {
+                return;
             }
         }
     }
@@ -1899,5 +3572,222 @@ impl<B: Bus> Cpu<B> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::bus::{Machine, MachineHandle, View};
+    use super::*;
+
+    fn write_u32(m: &mut Machine, addr: u32, val: u32) {
+        let off = (addr & 0x3F_FFFF) as usize;
+        m.main_ram[off..off + 4].copy_from_slice(&val.to_le_bytes());
+    }
+
+    fn write_u16(m: &mut Machine, addr: u32, val: u16) {
+        let off = (addr & 0x3F_FFFF) as usize;
+        m.main_ram[off..off + 2].copy_from_slice(&val.to_le_bytes());
+    }
+
+    #[test]
+    fn cached_interpreter_matches_uncached_across_arm_and_thumb_programs() {
+        let setup = || -> (MachineHandle, Cpu<View<0>>) {
+            let mut mh = MachineHandle::new(Machine::new());
+            {
+                let mut m = mh.borrow_mut();
+                // ARM program at 0x0200_0000:
+                //   00: movs r0, #0x80, ror #2  -> 0x2000_0000 (sets C=0, N=0, Z=0)
+                //   04: mov  r1, #0x10          -> 0x10
+                //   08: add  r2, r1, #0x25      -> 0x35
+                //   0C: sub  r3, r2, r1, lsl #1 -> 0x15
+                //   10: orrs r4, r3, #0x80000000 -> sets N=1, C=1
+                //   14: ldr  r5, [pc, #0x24]    -> loads literal at 0x40 (0x0200_1000)
+                //   18: str  r4, [r5, #4]!      -> writes r4 to 0x0200_1004, r5 = 0x0200_1004
+                //   1C: ldr  r6, [r5, #0]       -> loads 0x8000_0015
+                //   20: ldr  r7, [pc, #0x1C]    -> loads Thumb entry 0x0200_0101 from 0x44
+                //   24: bx   r7                 -> switch to Thumb at 0x0200_0100
+                //   28: add  r8, r0, r6         -> reached after Thumb returns
+                //   2C: b    .                  -> idle loop
+                let arm_code: [u32; 12] = [
+                    0xE3B0_0180, // movs r0, #0x80, ror #2
+                    0xE3A0_1010, // mov r1, #0x10
+                    0xE281_2025, // add r2, r1, #0x25
+                    0xE042_3081, // sub r3, r2, r1, lsl #1
+                    0xE393_4102, // orrs r4, r3, #0x8000_0000 (rot=2 of 2 -> 0x8000_0000, C=1)
+                    0xE59F_5024, // ldr r5, [pc, #0x24] -> 0x14+8+0x24 = 0x40
+                    0xE5A5_4004, // str r4, [r5, #4]!
+                    0xE595_6000, // ldr r6, [r5]
+                    0xE59F_701C, // ldr r7, [pc, #0x1C] -> 0x20+8+0x1C = 0x44
+                    0xE12F_FF17, // bx r7
+                    0xE080_8006, // add r8, r0, r6
+                    0xEAFF_FFFE, // b .
+                ];
+                for (i, &w) in arm_code.iter().enumerate() {
+                    write_u32(&mut m, 0x0200_0000 + (i as u32) * 4, w);
+                }
+                write_u32(&mut m, 0x0200_0040, 0x0200_1000);
+                write_u32(&mut m, 0x0200_0044, 0x0200_0101); // Thumb bit set
+
+                // Thumb program at 0x0200_0100:
+                //   00: mov r0, #7
+                //   02: lsl r1, r0, #3          -> 56
+                //   04: add r1, r1, #4          -> 60
+                //   06: str r1, [r5, #4]        -> write 60 at 0x0200_1008
+                //   08: bl  0x0200_0120         -> fused Thumb BL (+0x14 from 0x10C)
+                //   0C: ldr r2, [r5, #4]        -> 60
+                //   0E: add r0, r0, r2          -> 7 + 13 + 60 = 80
+                //   10: ldr r3, [pc, #4]        -> literal at 0x118 (0x0200_0028, ARM)
+                //   12: bx  r3                  -> return to ARM at 0x0200_0028
+                //   14: nop (mov r8, r8)
+                //   16: nop
+                //   18: .word 0x0200_0028
+                // Subroutine at 0x0200_0120:
+                //   20: add r0, #13
+                //   22: bx  lr
+                let thumb_code: [u16; 10] = [
+                    0x2007, // mov r0, #7
+                    0x00C1, // lsl r1, r0, #3
+                    0x3104, // add r1, #4
+                    0x6069, // str r1, [r5, #4]
+                    0xF000, // bl prefix (hi=0)
+                    0xF80A, // bl suffix: (0x108+4) + 0x14 = 0x120
+                    0x686A, // ldr r2, [r5, #4]
+                    0x1880, // add r0, r0, r2
+                    0x4B01, // ldr r3, [pc, #4] -> ((0x110+4)&!3)+4 = 0x118
+                    0x4718, // bx r3
+                ];
+                for (i, &h) in thumb_code.iter().enumerate() {
+                    write_u16(&mut m, 0x0200_0100 + (i as u32) * 2, h);
+                }
+                write_u32(&mut m, 0x0200_0118, 0x0200_0028);
+                write_u16(&mut m, 0x0200_0120, 0x300D); // add r0, #13
+                write_u16(&mut m, 0x0200_0122, 0x4770); // bx lr
+            }
+            let cpu = Cpu::new(
+                View::<0>::new(mh.ptr()),
+                true,
+                0x0200_0000,
+                0x0200_2000,
+                0x0200_3000,
+                0x0200_3800,
+            );
+            (mh, cpu)
+        };
+
+        let (mh_cached, mut cpu_cached) = setup();
+        let (mh_uncached, mut cpu_uncached) = setup();
+
+        // Execute exact 23-instruction ARM -> Thumb -> BL -> ARM sequence across odd slice boundaries.
+        for slice in [5u32, 7, 10, 1] {
+            cpu_cached.run_slice(slice);
+            cpu_uncached.run_slice_uncached(slice);
+        }
+
+        assert_eq!(cpu_cached.st.regs, cpu_uncached.st.regs);
+        assert_eq!(cpu_cached.st.cpsr, cpu_uncached.st.cpsr);
+        assert_eq!(cpu_cached.st.regs[0], 80);
+        assert_eq!(cpu_cached.st.regs[8], 0x8000_0015u32.wrapping_add(80));
+        assert_eq!(cpu_cached.st.regs[15], 0x0200_002C);
+        assert_eq!(
+            mh_cached.borrow().main_ram[0x1000..0x1010],
+            mh_uncached.borrow().main_ram[0x1000..0x1010]
+        );
+
+        // Next instruction at 0x0200_002C is `B .`: cached interpreter stays pinned and folds idle slice.
+        cpu_cached.run_slice(64);
+        assert_eq!(cpu_cached.st.regs[15], 0x0200_002C);
+        assert_ne!(cpu_cached.block_cache[block_slot(0x0200_002C)].flags & 2, 0);
+    }
+
+    #[test]
+    fn self_modifying_code_invalidates_cached_block_immediately() {
+        let mut mh = MachineHandle::new(Machine::new());
+        {
+            let mut m = mh.borrow_mut();
+            // Function at 0x0200_0200:
+            //   00: mov r0, #11
+            //   04: bx  lr
+            write_u32(&mut m, 0x0200_0200, 0xE3A0_000B); // mov r0, #11
+            write_u32(&mut m, 0x0200_0204, 0xE12F_FF1E); // bx lr
+        }
+        let mut cpu = Cpu::new(
+            View::<0>::new(mh.ptr()),
+            true,
+            0x0200_0200,
+            0x0200_2000,
+            0x0200_3000,
+            0x0200_3800,
+        );
+        cpu.st.regs[14] = 0x0200_0200; // loop back to start on bx lr
+
+        cpu.run_slice(2);
+        assert_eq!(cpu.st.regs[0], 11);
+        assert_eq!(cpu.st.regs[15], 0x0200_0200);
+
+        // Patch instruction at 0x0200_0200 in-place via bus (simulating AR DS 60 FPS patch / dynamic overlay)
+        cpu.bus.write32(0x0200_0200, 0xE3A0_002A); // mov r0, #42
+
+        cpu.run_slice(2);
+        assert_eq!(
+            cpu.st.regs[0], 42,
+            "code-page generation invalidation must re-decode patched RAM immediately"
+        );
+    }
+
+    #[test]
+    fn poll_loop_folds_readonly_wait_without_affecting_counter_loops() {
+        let mut mh = MachineHandle::new(Machine::new());
+        {
+            let mut m = mh.borrow_mut();
+            // Pure read-only poll loop at 0x0200_0400:
+            //   00: ldr r0, [r1]
+            //   04: cmp r0, #0
+            //   08: beq 0x0200_0400
+            write_u32(&mut m, 0x0200_0400, 0xE591_0000);
+            write_u32(&mut m, 0x0200_0404, 0xE350_0000);
+            write_u32(&mut m, 0x0200_0408, 0x0AFF_FFFC);
+            write_u32(&mut m, 0x0200_0500, 0); // flag = 0
+
+            // Counter loop at 0x0200_0600 (MUST NOT fold):
+            //   00: subs r2, r2, #1
+            //   04: bne  0x0200_0600
+            //   08: mov  r3, #99
+            write_u32(&mut m, 0x0200_0600, 0xE252_2001);
+            write_u32(&mut m, 0x0200_0604, 0x1AFF_FFFD);
+            write_u32(&mut m, 0x0200_0608, 0xE3A0_3063);
+        }
+        let mut cpu = Cpu::new(
+            View::<0>::new(mh.ptr()),
+            true,
+            0x0200_0400,
+            0x0200_2000,
+            0x0200_3000,
+            0x0200_3800,
+        );
+        cpu.st.regs[1] = 0x0200_0500;
+        cpu.run_slice(100);
+        assert_eq!(cpu.st.regs[15], 0x0200_0400);
+        let slot = block_slot(0x0200_0400);
+        assert_ne!(
+            cpu.block_cache[slot].flags & 4,
+            0,
+            "read-only poll loop must be flagged for slice folding"
+        );
+
+        // Once flag becomes non-zero, poll loop exits cleanly on next slice
+        cpu.bus.write32(0x0200_0500, 1);
+        cpu.run_slice(3);
+        assert_eq!(cpu.st.regs[0], 1);
+        assert_eq!(cpu.st.regs[15], 0x0200_040C);
+
+        // Counter loop executes exact count without folding
+        cpu.st.regs[15] = 0x0200_0600;
+        cpu.st.regs[2] = 10;
+        cpu.run_slice(25);
+        assert_eq!(cpu.st.regs[2], 0);
+        assert_eq!(cpu.st.regs[3], 99);
+        let cslot = block_slot(0x0200_0600);
+        assert_eq!(cpu.block_cache[cslot].flags & 6, 0);
     }
 }

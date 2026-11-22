@@ -5,8 +5,8 @@
  */
 
 const RING_FLOATS = 16384; // 8192 stereo pairs (~170 ms @ 48 kHz)
-const MAX_LATENCY_FLOATS = 9216; // 4608 stereo pairs (~96 ms @ 48 kHz)
-const TARGET_LATENCY_FLOATS = 4096; // 2048 stereo pairs (~42 ms @ 48 kHz)
+const MAX_LATENCY_FLOATS = 6144; // 3072 stereo pairs (~64 ms @ 48 kHz)
+const TARGET_LATENCY_FLOATS = 2560; // 1280 stereo pairs (~26.7 ms @ 48 kHz)
 const TRIM_FADE_FRAMES = 32;
 
 class ZaimulePcmWorklet extends AudioWorkletProcessor {

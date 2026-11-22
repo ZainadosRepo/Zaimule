@@ -162,6 +162,30 @@ impl EmulatorBackend for NdsCore {
         }
     }
 
+    fn encode_rgb565_into(&self, dst: &mut Vec<u8>) -> (u16, u16) {
+        if let Some(ref nds) = self.inner {
+            nds.encode_rgb565_into(dst)
+        } else {
+            let w = NDS_SCREEN_WIDTH as u16;
+            let h = NDS_SCREEN_HEIGHT as u16;
+            dst.reserve(NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2);
+            for px in self.standby_rgba.as_chunks::<4>().0 {
+                let r5 = u16::from(px[0] >> 3);
+                let g6 = u16::from(px[1] >> 2);
+                let b5 = u16::from(px[2] >> 3);
+                dst.extend_from_slice(&((r5 << 11) | (g6 << 5) | b5).to_le_bytes());
+            }
+            (w, h)
+        }
+    }
+
+    fn save_state_raw_for_rewind(&self) -> Result<Option<Vec<u8>>, String> {
+        let Some(ref nds) = self.inner else {
+            return Ok(None);
+        };
+        nds.save_state_raw_bytes().map(Some)
+    }
+
     fn step_frame(&mut self, buttons_mask: u16) -> FrameStepResult {
         let mut audio_samples = Vec::with_capacity(1664);
         let meta = self.step_frame_borrowed(buttons_mask, false, &mut audio_samples);
@@ -325,6 +349,12 @@ impl EmulatorBackend for NdsCore {
             if offset < self.ram_cache.len() {
                 self.ram_cache[offset] = val;
             }
+        }
+    }
+
+    fn apply_nds_ar_cheat(&mut self, ops: &[(u32, u32)]) {
+        if let Some(ref mut nds) = self.inner {
+            nds.apply_action_replay_code(ops);
         }
     }
 
@@ -523,5 +553,53 @@ mod tests {
         let resumed = core.step_frame(0);
         assert!(resumed.audio_level > 0.01);
         assert!((430..=450).contains(&resumed.audio_freq_hz));
+    }
+
+    #[test]
+    fn action_replay_ds_patches_live_arm9_code_and_conditionals() {
+        // ARM9 loop at 0x0200_0800:
+        //   0x0800: mov r0, #0x11          (0xE3A0_0011) -> AR DS will patch this to mov r0, #0x60!
+        //   0x0804: mov r1, #0x02000000    (0xE3A0_1402)
+        //   0x0808: str r0, [r1, #0x10]    (0xE581_0010) -> writes r0 to 0x0200_0010
+        //   0x080C: b   0x0200_0800        (0xEAFF_FFFB)
+        let mut rom = minimal_nds_nitro_rom();
+        let prog: [u32; 4] = [0xE3A0_0011, 0xE3A0_1402, 0xE581_0010, 0xEAFF_FFFB];
+        for (i, w) in prog.iter().enumerate() {
+            rom[0x200 + i * 4..0x200 + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+
+        let mut core = NdsCore::new_empty();
+        core.load_rom(&rom).unwrap();
+        let _ = core.step_frame(0);
+        core.sync_debug_caches();
+        assert_eq!(core.read_ram_slice()[0x10], 0x11);
+
+        // Apply multi-line Action Replay DS code (like HeartGold 60 FPS):
+        //   52000800 E3A00011  (if *(u32*)0x02000800 == 0xE3A00011)
+        //   02000800 E3A00060  (patch instruction to mov r0, #0x60)
+        //   D2000000 00000000  (end all)
+        //   02000020 02000040  (store pointer at 0x02000020 -> 0x02000040)
+        //   B2000020 00000000  (offset = *(u32*)0x02000020)
+        //   10000004 0000BEEF  (*(u16*)(offset + 4) = 0xBEEF)
+        //   D2000000 00000000
+        let ar_ops = [
+            (0x5200_0800, 0xE3A0_0011),
+            (0x0200_0800, 0xE3A0_0060),
+            (0xD200_0000, 0x0000_0000),
+            (0x0200_0020, 0x0200_0040),
+            (0xB200_0020, 0x0000_0000),
+            (0x1000_0004, 0x0000_BEEF),
+            (0xD200_0000, 0x0000_0000),
+        ];
+        core.apply_nds_ar_cheat(&ar_ops);
+
+        // Step frame: cached CPU must re-decode patched 0x0200_0800 and write 0x60 to 0x0200_0010!
+        let _ = core.step_frame(0);
+        core.sync_debug_caches();
+        assert_eq!(core.read_ram_slice()[0x10], 0x60);
+        assert_eq!(
+            u16::from_le_bytes([core.read_ram_slice()[0x44], core.read_ram_slice()[0x45]]),
+            0xBEEF
+        );
     }
 }

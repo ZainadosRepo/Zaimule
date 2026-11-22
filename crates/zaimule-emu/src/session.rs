@@ -27,7 +27,7 @@ use zaimule_core::catalog::{
 };
 use zaimule_core::cheats::{
     parse_cheat_code, parse_watchpoint_address, scan_ram_for_exact_byte, AchievementEntry,
-    CheatCodeEntry, MemoryWatchpoint,
+    CheatCodeEntry, CheatKind, MemoryWatchpoint,
 };
 use zaimule_core::external::{
     clear_switch_shader_cache as core_clear_switch_shader_cache,
@@ -337,6 +337,72 @@ fn normalize_nds_layout(raw: &str) -> String {
     }
 }
 
+/// Per-tick options controlling `"ZMFR"` binary viewport serialization and smart frameskip.
+#[derive(Debug, Clone, Copy)]
+pub struct BinaryStepOptions {
+    pub include_debug_meta: bool,
+    pub prefer_rgb565: bool,
+    pub skip_render: bool,
+}
+
+impl Default for BinaryStepOptions {
+    fn default() -> Self {
+        Self {
+            include_debug_meta: true,
+            prefer_rgb565: false,
+            skip_render: false,
+        }
+    }
+}
+
+struct RewindJob {
+    generation: u64,
+    frame_number: u64,
+    raw: Vec<u8>,
+}
+
+struct RewindResult {
+    generation: u64,
+    frame_number: u64,
+    encoded: Vec<u8>,
+}
+
+/// Persistent background thread compressing ~6 MiB NDS rewind snapshots (`RLE + CRC32`)
+/// off the emulation frame loop so periodic rewind captures never stall audio or video.
+struct BackgroundRewindWorker {
+    tx: std::sync::mpsc::SyncSender<RewindJob>,
+    rx: std::sync::mpsc::Receiver<RewindResult>,
+}
+
+impl BackgroundRewindWorker {
+    fn spawn() -> Option<Self> {
+        let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<RewindJob>(1);
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<RewindResult>();
+        let spawned = std::thread::Builder::new()
+            .name("zaimule-rewind".into())
+            .spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    if let Ok(encoded) = crate::nds_core::state::compress_raw_zmnd(&job.raw) {
+                        if res_tx
+                            .send(RewindResult {
+                                generation: job.generation,
+                                frame_number: job.frame_number,
+                                encoded,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            });
+        spawned.ok().map(|_| Self {
+            tx: job_tx,
+            rx: res_rx,
+        })
+    }
+}
+
 pub struct EmulatorSession {
     pub settings: GlobalSettings,
     pub catalog: Vec<GameEntry>,
@@ -363,11 +429,14 @@ pub struct EmulatorSession {
     bios_entries_cache: Vec<BiosEntry>,
     pcm_scratch: Vec<f32>,
     merged_pcm_scratch: Vec<f32>,
+    rgb565_scratch: Vec<u8>,
     pub last_scan_report: Option<DirectoryScanReport>,
     pub active_launched_rom_path: Option<PathBuf>,
     pub active_disasm_rom: Vec<u8>,
     pub link_telemetry: LinkCableTelemetry,
     pub rewind_buffer: RewindBuffer,
+    rewind_worker: Option<BackgroundRewindWorker>,
+    rewind_generation: u64,
     pub save_states_ram: HashMap<(String, u8), (SaveStateSlotInfo, Vec<u8>)>,
     pub custom_roms: HashMap<String, Vec<u8>>,
     pub breakpoints: Vec<u32>,
@@ -434,11 +503,14 @@ impl EmulatorSession {
             bios_entries_cache,
             pcm_scratch: Vec::with_capacity(2048),
             merged_pcm_scratch: Vec::with_capacity(2048),
+            rgb565_scratch: Vec::new(),
             last_scan_report: None,
             active_launched_rom_path: None,
             active_disasm_rom: Vec::new(),
             link_telemetry: LinkCableTelemetry::default(),
             rewind_buffer: RewindBuffer::new(240),
+            rewind_worker: None,
+            rewind_generation: 0,
             save_states_ram: HashMap::new(),
             custom_roms: HashMap::new(),
             breakpoints: Vec::new(),
@@ -608,10 +680,56 @@ impl EmulatorSession {
         if let Some(rewind_on) = rewind_enabled {
             self.settings.rewind_enabled = rewind_on;
             if !rewind_on {
-                self.rewind_buffer.clear();
+                self.clear_rewind_history();
             }
         }
         self.bootstrap_snapshot()
+    }
+
+    fn clear_rewind_history(&mut self) {
+        self.rewind_generation = self.rewind_generation.wrapping_add(1);
+        self.rewind_buffer.clear();
+        if let Some(ref worker) = self.rewind_worker {
+            while worker.rx.try_recv().is_ok() {}
+        }
+    }
+
+    /// Moves any asynchronously compressed `"ZMND"` rewind snapshots into `rewind_buffer` (non-blocking).
+    pub fn drain_completed_rewind_snapshots(&mut self) {
+        let generation = self.rewind_generation;
+        if let Some(ref worker) = self.rewind_worker {
+            while let Ok(done) = worker.rx.try_recv() {
+                if done.generation == generation && self.settings.rewind_enabled {
+                    self.rewind_buffer
+                        .push_snapshot_owned(done.frame_number, done.encoded);
+                }
+            }
+        }
+    }
+
+    fn capture_rewind_snapshot(&mut self, frame_number: u64) {
+        if let Ok(Some(raw)) = self.core_p1.save_state_raw_for_rewind() {
+            if self.rewind_worker.is_none() {
+                self.rewind_worker = BackgroundRewindWorker::spawn();
+            }
+            if let Some(ref worker) = self.rewind_worker {
+                let _ = worker.tx.try_send(RewindJob {
+                    generation: self.rewind_generation,
+                    frame_number,
+                    raw,
+                });
+                return;
+            }
+            if let Ok(encoded) = crate::nds_core::state::compress_raw_zmnd(&raw) {
+                self.rewind_buffer
+                    .push_snapshot_owned(frame_number, encoded);
+            }
+            return;
+        }
+        if let Ok(raw_state) = self.core_p1.save_state() {
+            self.rewind_buffer
+                .push_snapshot_owned(frame_number, raw_state);
+        }
     }
 
     /// Captures the current active SRAM CRC as the clean on-disk baseline and clears `sram_dirty`.
@@ -1031,7 +1149,7 @@ impl EmulatorSession {
             self.active_game_id.clear();
             self.active_launched_rom_path = None;
             self.active_disasm_rom.clear();
-            self.rewind_buffer.clear();
+            self.clear_rewind_history();
             self.frame_counter = 0;
             self.playtime_frame_accum = 0.0;
             self.last_sram_crc = None;
@@ -1184,7 +1302,7 @@ impl EmulatorSession {
         self.active_game_id = game.id.clone();
         self.active_launched_rom_path = game.rom_path.as_ref().map(PathBuf::from);
         self.active_disasm_rom.clear();
-        self.rewind_buffer.clear();
+        self.clear_rewind_history();
         self.frame_counter = 0;
         self.playtime_frame_accum = 0.0;
         self.last_sram_crc = None;
@@ -1648,6 +1766,31 @@ impl EmulatorSession {
         speed_mult: u8,
         include_debug_meta: bool,
     ) -> Vec<u8> {
+        self.step_viewport_binary_bytes_with_options(
+            raw_buttons_p1,
+            raw_buttons_p2,
+            turbo_active,
+            speed_mult,
+            BinaryStepOptions {
+                include_debug_meta,
+                prefer_rgb565: false,
+                skip_render: false,
+            },
+        )
+    }
+
+    /// Executes `step_viewport_with_speed` and serializes to `"ZMFR"` v1 binary bytes with
+    /// optional RGB565 pixel packing (`flags & 0x10`) and smart frameskip (`skip_render`,
+    /// emitting `view_count = 0` with full 48 kHz PCM audio).
+    pub fn step_viewport_binary_bytes_with_options(
+        &mut self,
+        raw_buttons_p1: u16,
+        raw_buttons_p2: u16,
+        turbo_active: bool,
+        speed_mult: u8,
+        opts: BinaryStepOptions,
+    ) -> Vec<u8> {
+        self.drain_completed_rewind_snapshots();
         if self.link_telemetry.enabled {
             let resp = self.step_viewport_with_speed(
                 raw_buttons_p1,
@@ -1658,7 +1801,7 @@ impl EmulatorSession {
             return encode_viewport_binary_packet_with_meta(
                 &resp,
                 self.sram_dirty,
-                include_debug_meta,
+                opts.include_debug_meta,
             );
         }
 
@@ -1698,7 +1841,14 @@ impl EmulatorSession {
 
             for cheat in &self.cheat_codes {
                 if cheat.enabled {
-                    self.core_p1.apply_ram_cheat(cheat.addr, cheat.value);
+                    match cheat.kind {
+                        CheatKind::ActionReplayDs => {
+                            self.core_p1.apply_nds_ar_cheat(&cheat.ar_ops);
+                        }
+                        CheatKind::GameSharkGb => {
+                            self.core_p1.apply_ram_cheat(cheat.addr, cheat.value);
+                        }
+                    }
                 }
             }
 
@@ -1721,7 +1871,7 @@ impl EmulatorSession {
                 let _ = self.udp_node.poll_incoming_packet();
             }
 
-            let skip_render = s + 1 < steps;
+            let skip_render = (s + 1 < steps) || opts.skip_render;
             self.pcm_scratch.clear();
             let meta =
                 self.core_p1
@@ -1782,10 +1932,7 @@ impl EmulatorSession {
                 && self.settings.rewind_enabled
                 && meta.frame_number.is_multiple_of(rewind_stride)
             {
-                if let Ok(raw_state) = self.core_p1.save_state() {
-                    self.rewind_buffer
-                        .push_snapshot_owned(meta.frame_number, raw_state);
-                }
+                self.capture_rewind_snapshot(meta.frame_number);
             }
             if self.recent_inputs_trace.len() >= 120 {
                 self.recent_inputs_trace.remove(0);
@@ -1822,7 +1969,7 @@ impl EmulatorSession {
             }
         }
 
-        let emit_meta = include_debug_meta
+        let emit_meta = opts.include_debug_meta
             || newly_unlocked_achievement.is_some()
             || self.active_macro_id.is_some();
         let meta_json = if emit_meta {
@@ -1840,9 +1987,22 @@ impl EmulatorSession {
             Vec::new()
         };
 
-        let (width, height, rgba) = self.core_p1.rgba_frame();
+        let emit_video = !opts.skip_render;
+        let use_rgb565 = emit_video && opts.prefer_rgb565;
+        let (width, height, pixel_bytes_len) = if !emit_video {
+            (0u16, 0u16, 0usize)
+        } else if use_rgb565 {
+            self.rgb565_scratch.clear();
+            let (w, h) = self.core_p1.encode_rgb565_into(&mut self.rgb565_scratch);
+            (w, h, self.rgb565_scratch.len())
+        } else {
+            let (w, h, rgba) = self.core_p1.rgba_frame();
+            (w, h, rgba.len())
+        };
+
         let pcm_bytes_len = self.merged_pcm_scratch.len() * 4;
-        let total_cap = 35 + 8 + rgba.len() + 4 + pcm_bytes_len + 4 + meta_json.len();
+        let view_overhead = if emit_video { 8 + pixel_bytes_len } else { 0 };
+        let total_cap = 35 + view_overhead + 4 + pcm_bytes_len + 4 + meta_json.len();
         let mut out = Vec::with_capacity(total_cap);
 
         let mut flags = 0u8;
@@ -1851,6 +2011,9 @@ impl EmulatorSession {
         }
         if self.active_macro_id.is_some() {
             flags |= 0x08;
+        }
+        if use_rgb565 {
+            flags |= 0x10;
         }
 
         out.extend_from_slice(&VIEWPORT_BINARY_MAGIC);
@@ -1863,12 +2026,19 @@ impl EmulatorSession {
         out.extend_from_slice(&0u16.to_le_bytes()); // reserved
         out.extend_from_slice(&(self.rewind_buffer.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.rewind_buffer.memory_usage_bytes() as u32).to_le_bytes());
-        out.push(1u8); // view count = 1
+        out.push(u8::from(emit_video));
 
-        out.extend_from_slice(&width.to_le_bytes());
-        out.extend_from_slice(&height.to_le_bytes());
-        out.extend_from_slice(&(rgba.len() as u32).to_le_bytes());
-        out.extend_from_slice(rgba);
+        if emit_video {
+            out.extend_from_slice(&width.to_le_bytes());
+            out.extend_from_slice(&height.to_le_bytes());
+            out.extend_from_slice(&(pixel_bytes_len as u32).to_le_bytes());
+            if use_rgb565 {
+                out.extend_from_slice(&self.rgb565_scratch);
+            } else {
+                let (_, _, rgba) = self.core_p1.rgba_frame();
+                out.extend_from_slice(rgba);
+            }
+        }
 
         out.extend_from_slice(&(self.merged_pcm_scratch.len() as u32).to_le_bytes());
         for &sample in &self.merged_pcm_scratch {
@@ -1912,7 +2082,14 @@ impl EmulatorSession {
 
         for cheat in &self.cheat_codes {
             if cheat.enabled {
-                self.core_p1.apply_ram_cheat(cheat.addr, cheat.value);
+                match cheat.kind {
+                    CheatKind::ActionReplayDs => {
+                        self.core_p1.apply_nds_ar_cheat(&cheat.ar_ops);
+                    }
+                    CheatKind::GameSharkGb => {
+                        self.core_p1.apply_ram_cheat(cheat.addr, cheat.value);
+                    }
+                }
             }
         }
 
@@ -2001,6 +2178,7 @@ impl EmulatorSession {
             }
         }
 
+        self.drain_completed_rewind_snapshots();
         let rewind_stride = if primary.console == ConsoleKind::Nds {
             90
         } else {
@@ -2010,10 +2188,7 @@ impl EmulatorSession {
             && self.settings.rewind_enabled
             && primary.frame_number.is_multiple_of(rewind_stride)
         {
-            if let Ok(raw_state) = self.core_p1.save_state() {
-                self.rewind_buffer
-                    .push_snapshot_owned(primary.frame_number, raw_state);
-            }
+            self.capture_rewind_snapshot(primary.frame_number);
         }
         self.last_score = primary.cpu.score;
         if self.recent_inputs_trace.len() >= 120 {
@@ -2197,10 +2372,12 @@ impl EmulatorSession {
     }
 
     pub fn rewind(&mut self, steps_back: usize) -> Result<u64, String> {
+        self.drain_completed_rewind_snapshots();
         let Some((frame, raw_state)) = self.rewind_buffer.rewind_steps(steps_back)? else {
             return Err("tampon de rembobinage vide".into());
         };
         self.core_p1.load_state(&raw_state)?;
+        self.rewind_generation = self.rewind_generation.wrapping_add(1);
         self.refresh_sram_dirty_flag();
         Ok(frame)
     }
@@ -3202,5 +3379,97 @@ mod tests {
         assert!(session.remove_memory_watchpoint(&wp_id).is_err());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nds_binary_rgb565_skip_render_and_background_rewind_worker() {
+        let mut session = EmulatorSession::new();
+        session
+            .import_custom_rom("heartgold_smoke.nds", &test_nds_rom())
+            .unwrap();
+
+        // 1. RGB565 binary packet halves pixel payload vs RGBA8888 and sets flags bit 0x10
+        let rgba_pkt = session.step_viewport_binary_bytes_with_options(
+            0,
+            0,
+            false,
+            1,
+            BinaryStepOptions {
+                include_debug_meta: false,
+                prefer_rgb565: false,
+                skip_render: false,
+            },
+        );
+        let rgb565_pkt = session.step_viewport_binary_bytes_with_options(
+            0,
+            0,
+            false,
+            1,
+            BinaryStepOptions {
+                include_debug_meta: false,
+                prefer_rgb565: true,
+                skip_render: false,
+            },
+        );
+        assert_eq!(&rgb565_pkt[0..4], b"ZMFR");
+        assert_eq!(rgba_pkt[5] & 0x10, 0);
+        assert_ne!(rgb565_pkt[5] & 0x10, 0);
+        assert_eq!(rgb565_pkt[34], 1, "view_count should be 1");
+        let w = u16::from_le_bytes([rgb565_pkt[35], rgb565_pkt[36]]) as usize;
+        let h = u16::from_le_bytes([rgb565_pkt[37], rgb565_pkt[38]]) as usize;
+        let rgba_px_len = u32::from_le_bytes(rgba_pkt[39..43].try_into().unwrap()) as usize;
+        let rgb565_px_len = u32::from_le_bytes(rgb565_pkt[39..43].try_into().unwrap()) as usize;
+        assert_eq!(rgba_px_len, w * h * 4);
+        assert_eq!(rgb565_px_len, w * h * 2);
+
+        // 2. skip_render emits view_count == 0 (no pixel payload) while keeping full PCM audio
+        let skipped_pkt = session.step_viewport_binary_bytes_with_options(
+            0,
+            0,
+            false,
+            1,
+            BinaryStepOptions {
+                include_debug_meta: false,
+                prefer_rgb565: true,
+                skip_render: true,
+            },
+        );
+        assert_eq!(&skipped_pkt[0..4], b"ZMFR");
+        assert_eq!(skipped_pkt[5] & 0x10, 0);
+        assert_eq!(skipped_pkt[34], 0, "skip_render must emit view_count = 0");
+        let pcm_samples = u32::from_le_bytes(skipped_pkt[35..39].try_into().unwrap());
+        assert!(
+            pcm_samples > 0,
+            "skip_render must still emit 48 kHz PCM audio"
+        );
+
+        // 3. Stepping past NDS rewind stride (90 frames) dispatches background ZMND compression
+        //    and populates the rewind buffer without stalling the emulation thread
+        for _ in 0..90 {
+            let _ = session.step_viewport_binary_bytes_with_options(
+                0,
+                0,
+                false,
+                1,
+                BinaryStepOptions {
+                    include_debug_meta: false,
+                    prefer_rgb565: true,
+                    skip_render: true,
+                },
+            );
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while session.rewind_buffer.is_empty() && std::time::Instant::now() < deadline {
+            session.drain_completed_rewind_snapshots();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            !session.rewind_buffer.is_empty(),
+            "background rewind worker should push a compressed ZMND snapshot"
+        );
+        let rewound_frame = session
+            .rewind(1)
+            .expect("rewind(1) should restore ZMND snapshot");
+        assert!(rewound_frame >= 90);
     }
 }

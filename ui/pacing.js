@@ -33,6 +33,22 @@ export class FramePacer {
   }
 
   /**
+   * Non-mutating check reporting whether another emulation step is already due at `nowMs`
+   * (used by the pipelined loop to avoid sitting idle for a full VSync interval after a late frame).
+   */
+  isReady(nowMs, targetFps = 60.0) {
+    if (this.lastTimestampMs === null) return true;
+    const fps = Math.max(15, Math.min(240, Number(targetFps) || 60.0));
+    const framePeriodMs = 1000 / fps;
+    const ts = Number(nowMs);
+    if (!Number.isFinite(ts)) return false;
+    const rawDelta = ts - this.lastTimestampMs;
+    if (rawDelta < 0) return false;
+    const clampedDelta = rawDelta > this.maxDeltaMs ? framePeriodMs : rawDelta;
+    return this.accumulatorMs + clampedDelta + 0.0001 >= framePeriodMs;
+  }
+
+  /**
    * Advances the pacing accumulator to `nowMs` (in milliseconds, e.g. from rAF)
    * against `targetFps` and reports whether the emulation core should step on this tick.
    */
@@ -44,6 +60,7 @@ export class FramePacer {
     if (!Number.isFinite(ts)) {
       return {
         shouldStep: true,
+        behindFrames: 0,
         measuredFps: this.measuredFps || fps,
         frameTimeMs: this.frameTimeMs || framePeriodMs
       };
@@ -57,6 +74,7 @@ export class FramePacer {
       this._recordStep(ts, fps, framePeriodMs);
       return {
         shouldStep: true,
+        behindFrames: 0,
         measuredFps: this.measuredFps,
         frameTimeMs: this.frameTimeMs
       };
@@ -70,6 +88,7 @@ export class FramePacer {
       this.accumulatorMs = 0;
       return {
         shouldStep: false,
+        behindFrames: 0,
         measuredFps: this.measuredFps || fps,
         frameTimeMs: this.frameTimeMs || framePeriodMs
       };
@@ -82,12 +101,14 @@ export class FramePacer {
     if (this.accumulatorMs + 0.0001 < framePeriodMs) {
       return {
         shouldStep: false,
+        behindFrames: 0,
         measuredFps: this.measuredFps || fps,
         frameTimeMs: this.frameTimeMs || framePeriodMs
       };
     }
 
     this.accumulatorMs -= framePeriodMs;
+    const behindFrames = spiked ? 0 : Math.floor(this.accumulatorMs / framePeriodMs);
     // Prevent catch-up burst / spiral of death after a long stall or tab switch.
     if (spiked) {
       this.accumulatorMs = 0;
@@ -98,6 +119,7 @@ export class FramePacer {
     this._recordStep(ts, fps, framePeriodMs);
     return {
       shouldStep: true,
+      behindFrames,
       measuredFps: this.measuredFps,
       frameTimeMs: this.frameTimeMs
     };

@@ -304,14 +304,14 @@
                 <div class="section-title">
                   <span>Codes de triche</span>
                 </div>
-                <div style="display:flex; gap:6px; margin-bottom:8px;">
-                  <input
-                    type="text"
+                <div style="display:flex; gap:6px; margin-bottom:8px; align-items:stretch;">
+                  <textarea
                     id="cheat-input"
                     class="field-inline mono"
-                    placeholder="Ex: 016404A0 ou C104:01"
-                    style="flex:1;"
-                  />
+                    rows="2"
+                    placeholder="GB: 016404A0 · C104:01&#10;NDS AR: 12005F54 00000001"
+                    style="flex:1; resize:vertical; min-height:38px; line-height:1.35;"
+                  ></textarea>
                   <button class="btn" id="btn-add-cheat" style="padding:4px 10px;">Ajouter</button>
                 </div>
                 <div id="cheats-list"></div>

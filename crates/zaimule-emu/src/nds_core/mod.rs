@@ -66,8 +66,8 @@ impl NdsBiosAssets {
 }
 
 pub struct NdsMachine {
-    cpu9: Cpu<View>,
-    cpu7: Cpu<View>,
+    cpu9: Cpu<View<0>>,
+    cpu7: Cpu<View<1>>,
     ppu: Ppu,
     rom: Vec<u8>,
     frame_count: u32,
@@ -135,11 +135,7 @@ impl NdsMachine {
         let machine = MachineHandle::new(machine_inner);
 
         let mut cpu9 = Cpu::new(
-            View {
-                m: machine.ptr(),
-                cpu: 0,
-                in_dma: false,
-            },
+            View::<0>::new(machine.ptr()),
             true,
             arm9_entry,
             0x0300_2F7C,
@@ -147,11 +143,7 @@ impl NdsMachine {
             0x0300_3FC0,
         );
         let mut cpu7 = Cpu::new(
-            View {
-                m: machine.ptr(),
-                cpu: 1,
-                in_dma: false,
-            },
+            View::<1>::new(machine.ptr()),
             false,
             arm7_entry,
             0x0380_FD80,
@@ -334,7 +326,7 @@ impl NdsMachine {
                 self.cpu7.run_slice(ARM7_SLICE_QUANTUM);
             }
             // Enter HBlank: assert DISPSTAT bit 1, fire HBlank IRQ (if enabled), and service ARM9 HBlank DMA on visible lines.
-            {
+            let hblank_dma = {
                 let mut mm = self.machine.borrow_mut();
                 for cpu in 0..2 {
                     mm.dispstat[cpu] |= 2;
@@ -342,8 +334,9 @@ impl NdsMachine {
                         mm.if_[cpu] |= IRQ_HBLANK;
                     }
                 }
-            }
-            if line < 192 {
+                line < 192 && mm.dma_hblank_armed
+            };
+            if hblank_dma {
                 self.cpu9.bus.dma_service(DMA_HBLANK);
             }
             // HBlank phase (~26% of scanline)
@@ -454,6 +447,88 @@ impl NdsMachine {
         &self.framebuffer_rgba
     }
 
+    /// Packs the latest rendered dual-screen frame directly into little-endian RGB565 bytes
+    /// (2 bytes/pixel, lossless for NDS 15-bit colors and half the IPC/GPU upload bandwidth).
+    pub fn encode_rgb565_into(&self, dst: &mut Vec<u8>) -> (u16, u16) {
+        #[inline(always)]
+        fn pack_rgb24_to_565(px: u32) -> [u8; 2] {
+            let r5 = (px >> 19) & 0x1F;
+            let g6 = (px >> 10) & 0x3F;
+            let b5 = (px >> 3) & 0x1F;
+            (((r5 << 11) | (g6 << 5) | b5) as u16).to_le_bytes()
+        }
+
+        if self.frame_count == 0 {
+            let w = self.frame_width as u16;
+            let h = self.frame_height as u16;
+            dst.reserve(self.frame_width * self.frame_height * 2);
+            for px in self.framebuffer_rgba.as_chunks::<4>().0 {
+                let r5 = u16::from(px[0] >> 3);
+                let g6 = u16::from(px[1] >> 2);
+                let b5 = u16::from(px[2] >> 3);
+                dst.extend_from_slice(&((r5 << 11) | (g6 << 5) | b5).to_le_bytes());
+            }
+            return (w, h);
+        }
+
+        let a_on_top = self.machine.borrow().powcnt1 & 0x8000 != 0;
+        if self.ppu.hd_active {
+            const HD_W: usize = ppu::WIDTH * 2;
+            const HD_H_SINGLE: usize = ppu::HEIGHT * 2;
+            let total_bytes = HD_W * (HD_H_SINGLE * 2) * 2;
+            let start = dst.len();
+            dst.resize(start + total_bytes, 0);
+            let half_bytes = HD_W * HD_H_SINGLE * 2;
+            let (top_dst, bot_dst) = dst[start..].split_at_mut(half_bytes);
+            let (a_dst, b_dst) = if a_on_top {
+                (top_dst, bot_dst)
+            } else {
+                (bot_dst, top_dst)
+            };
+            for (slot, &px) in a_dst
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(self.ppu.fb_a_hd.iter())
+            {
+                *slot = pack_rgb24_to_565(px);
+            }
+            let b_chunks = b_dst.as_chunks_mut::<2>().0;
+            for y in 0..ppu::HEIGHT {
+                let src_row = &self.ppu.fb_b[y * ppu::WIDTH..(y + 1) * ppu::WIDTH];
+                let dst_row0 = (y * 2) * HD_W;
+                let dst_row1 = (y * 2 + 1) * HD_W;
+                for (x, &px) in src_row.iter().enumerate() {
+                    let c = pack_rgb24_to_565(px);
+                    let x2 = x * 2;
+                    b_chunks[dst_row0 + x2] = c;
+                    b_chunks[dst_row0 + x2 + 1] = c;
+                    b_chunks[dst_row1 + x2] = c;
+                    b_chunks[dst_row1 + x2 + 1] = c;
+                }
+            }
+            (HD_W as u16, (HD_H_SINGLE * 2) as u16)
+        } else {
+            let total_bytes = NDS_WIDTH * NDS_HEIGHT * 2;
+            let start = dst.len();
+            dst.resize(start + total_bytes, 0);
+            let half_bytes = ppu::WIDTH * ppu::HEIGHT * 2;
+            let (top_dst, bot_dst) = dst[start..].split_at_mut(half_bytes);
+            let [upper, lower] = if a_on_top {
+                [&self.ppu.fb_a, &self.ppu.fb_b]
+            } else {
+                [&self.ppu.fb_b, &self.ppu.fb_a]
+            };
+            for (slot, &px) in top_dst.as_chunks_mut::<2>().0.iter_mut().zip(upper.iter()) {
+                *slot = pack_rgb24_to_565(px);
+            }
+            for (slot, &px) in bot_dst.as_chunks_mut::<2>().0.iter_mut().zip(lower.iter()) {
+                *slot = pack_rgb24_to_565(px);
+            }
+            (NDS_WIDTH as u16, NDS_HEIGHT as u16)
+        }
+    }
+
     pub fn load_sram(&mut self, data: &[u8]) {
         let mut mm = self.machine.borrow_mut();
         mm.save.fill(0xFF);
@@ -472,6 +547,16 @@ impl NdsMachine {
 
     pub fn clear_sram_dirty(&mut self) {
         self.machine.borrow_mut().save_dirty = false;
+    }
+
+    pub fn save_state_raw_bytes(&self) -> Result<Vec<u8>, String> {
+        state::save_snapshot_raw(
+            &self.machine,
+            &self.cpu9,
+            &self.cpu7,
+            &self.ppu,
+            self.frame_count,
+        )
     }
 
     pub fn save_state_bytes(&self) -> Result<Vec<u8>, String> {
@@ -534,6 +619,12 @@ impl NdsMachine {
                 mm.io2d[0][off]
             } else if (0x1000..0x1070).contains(&off) {
                 mm.io2d[1][off - 0x1000]
+            } else if off == 0x0130 {
+                mm.keyinput as u8
+            } else if off == 0x0131 {
+                (mm.keyinput >> 8) as u8
+            } else if off == 0x0136 {
+                mm.extkeyin as u8
             } else {
                 0
             };
@@ -541,11 +632,183 @@ impl NdsMachine {
         self.cpu9.bus.read8(addr)
     }
 
+    pub fn read_mem16(&mut self, addr: u32) -> u16 {
+        let a = addr & !1;
+        if a >> 24 == 0x04 {
+            let mm = self.machine.borrow();
+            return match a & 0xFFFF {
+                0x0130 => mm.keyinput,
+                0x0136 => mm.extkeyin,
+                _ => 0,
+            };
+        }
+        self.cpu9.bus.read16(a)
+    }
+
+    pub fn read_mem32(&mut self, addr: u32) -> u32 {
+        let a = addr & !3;
+        if a >> 24 == 0x04 {
+            let lo = u32::from(self.read_mem16(a));
+            let hi = u32::from(self.read_mem16(a.wrapping_add(2)));
+            return lo | (hi << 16);
+        }
+        self.cpu9.bus.read32(a)
+    }
+
     pub fn write_mem8(&mut self, addr: u32, val: u8) {
         if addr >> 24 == 0x04 {
             return;
         }
         self.cpu9.bus.write8(addr, val);
+    }
+
+    pub fn write_mem16(&mut self, addr: u32, val: u16) {
+        if addr >> 24 == 0x04 {
+            return;
+        }
+        self.cpu9.bus.write16(addr & !1, val);
+    }
+
+    pub fn write_mem32(&mut self, addr: u32, val: u32) {
+        if addr >> 24 == 0x04 {
+            return;
+        }
+        self.cpu9.bus.write32(addr & !3, val);
+    }
+
+    /// Executes a 32-bit Nintendo DS Action Replay code list (`[(w0, w1), ...]`).
+    ///
+    /// Supports standard AR DS opcodes `0..=A` (32/16/8-bit writes & conditionals including
+    /// keypad checks at `0x0400_0130`), `B` (pointer offset), `C`/`D1` (loops), `D0`/`D2`
+    /// (end-if/reset), `D3..=DC` (offset/data register ops), and `E` (block patch).
+    /// All RAM writes go through `cpu9.bus`, automatically invalidating cached code pages.
+    pub fn apply_action_replay_code(&mut self, ops: &[(u32, u32)]) {
+        let mut offset: u32 = 0;
+        let mut data_reg: u32 = 0;
+        let mut cond_stack: Vec<bool> = Vec::with_capacity(8);
+        let mut loop_stack: Vec<(usize, u32)> = Vec::with_capacity(4);
+        let mut pc: usize = 0;
+        let mut steps: usize = 0;
+        const MAX_AR_STEPS: usize = 1024;
+
+        while pc < ops.len() && steps < MAX_AR_STEPS {
+            steps += 1;
+            let (w0, w1) = ops[pc];
+            pc += 1;
+            let op_type = (w0 >> 28) as u8;
+            let addr28 = w0 & 0x0FFF_FFFF;
+            let active = cond_stack.iter().all(|&b| b);
+
+            if !active {
+                match op_type {
+                    0x3..=0xA => cond_stack.push(false),
+                    0xD => match (w0 >> 24) & 0xF {
+                        0x0 => {
+                            cond_stack.pop();
+                        }
+                        0x2 => {
+                            cond_stack.clear();
+                            loop_stack.clear();
+                            offset = 0;
+                            data_reg = 0;
+                        }
+                        _ => {}
+                    },
+                    0xE => {
+                        let skip_lines = (w1 as usize).div_ceil(8);
+                        pc = pc.saturating_add(skip_lines);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            let cond_addr = if addr28 == 0 { offset } else { addr28 };
+            match op_type {
+                0x0 => self.write_mem32(addr28.wrapping_add(offset), w1),
+                0x1 => self.write_mem16(addr28.wrapping_add(offset), w1 as u16),
+                0x2 => self.write_mem8(addr28.wrapping_add(offset), w1 as u8),
+                0x3 => cond_stack.push(w1 > self.read_mem32(cond_addr)),
+                0x4 => cond_stack.push(w1 < self.read_mem32(cond_addr)),
+                0x5 => cond_stack.push(w1 == self.read_mem32(cond_addr)),
+                0x6 => cond_stack.push(w1 != self.read_mem32(cond_addr)),
+                0x7..=0xA => {
+                    let mask = !((w1 >> 16) as u16);
+                    let target = (w1 & 0xFFFF) as u16;
+                    let cur = self.read_mem16(cond_addr) & mask;
+                    let pass = match op_type {
+                        0x7 => target > cur,
+                        0x8 => target < cur,
+                        0x9 => target == cur,
+                        _ => target != cur,
+                    };
+                    cond_stack.push(pass);
+                }
+                0xB => offset = self.read_mem32(addr28.wrapping_add(offset)),
+                0xC => {
+                    loop_stack.push((pc, w1));
+                }
+                0xD => match (w0 >> 24) & 0xF {
+                    0x0 => {
+                        cond_stack.pop();
+                    }
+                    0x1 => {
+                        if let Some((start_pc, rem)) = loop_stack.last_mut() {
+                            if *rem > 0 {
+                                *rem -= 1;
+                                pc = *start_pc;
+                            } else {
+                                loop_stack.pop();
+                            }
+                        }
+                    }
+                    0x2 => {
+                        cond_stack.clear();
+                        loop_stack.clear();
+                        offset = 0;
+                        data_reg = 0;
+                    }
+                    0x3 => offset = w1,
+                    0x4 => data_reg = data_reg.wrapping_add(w1),
+                    0x5 => data_reg = w1,
+                    0x6 => {
+                        self.write_mem32(w1.wrapping_add(offset), data_reg);
+                        offset = offset.wrapping_add(4);
+                    }
+                    0x7 => {
+                        self.write_mem16(w1.wrapping_add(offset), data_reg as u16);
+                        offset = offset.wrapping_add(2);
+                    }
+                    0x8 => {
+                        self.write_mem8(w1.wrapping_add(offset), data_reg as u8);
+                        offset = offset.wrapping_add(1);
+                    }
+                    0x9 => data_reg = self.read_mem32(w1.wrapping_add(offset)),
+                    0xA => data_reg = u32::from(self.read_mem16(w1.wrapping_add(offset))),
+                    0xB => data_reg = u32::from(self.read_mem8(w1.wrapping_add(offset))),
+                    0xC => offset = offset.wrapping_add(w1),
+                    _ => {}
+                },
+                0xE => {
+                    let byte_count = (w1 as usize).min(4096);
+                    let mut dst = addr28.wrapping_add(offset);
+                    let mut written = 0usize;
+                    while written < byte_count && pc < ops.len() {
+                        let (p0, p1) = ops[pc];
+                        pc += 1;
+                        for b in p0.to_le_bytes().into_iter().chain(p1.to_le_bytes()) {
+                            if written >= byte_count {
+                                break;
+                            }
+                            self.write_mem8(dst, b);
+                            dst = dst.wrapping_add(1);
+                            written += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     pub fn vram_bank_copy(&self, bank: usize, offset: usize, len: usize) -> Vec<u8> {

@@ -881,13 +881,16 @@ fn rle_decompress(compressed: &[u8], expected_len: usize) -> Result<Vec<u8>, Str
     Ok(out)
 }
 
-pub fn encode_binary<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
+pub fn serialize_raw<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
     let mut ser = BinarySerializer::new();
     value.serialize(&mut ser).map_err(|e| e.to_string())?;
-    let raw = ser.buf;
+    Ok(ser.buf)
+}
+
+pub fn compress_raw_zmnd(raw: &[u8]) -> Result<Vec<u8>, String> {
     let raw_len = u32::try_from(raw.len()).map_err(|_| "état NDS trop grand".to_string())?;
-    let crc = crc32_ieee(&raw);
-    let compressed = rle_compress(&raw);
+    let crc = crc32_ieee(raw);
+    let compressed = rle_compress(raw);
     let mut out = Vec::with_capacity(13 + compressed.len());
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
@@ -895,6 +898,11 @@ pub fn encode_binary<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
     out.extend_from_slice(&crc.to_le_bytes());
     out.extend_from_slice(&compressed);
     Ok(out)
+}
+
+pub fn encode_binary<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
+    let raw = serialize_raw(value)?;
+    compress_raw_zmnd(&raw)
 }
 
 pub fn decode_binary<T: DeserializeOwned>(packet: &[u8]) -> Result<T, String> {
@@ -922,10 +930,10 @@ pub fn decode_binary<T: DeserializeOwned>(packet: &[u8]) -> Result<T, String> {
     Ok(value)
 }
 
-pub fn save_snapshot<B: Bus>(
+pub fn save_snapshot_raw<B9: Bus, B7: Bus>(
     machine: &MachineHandle,
-    cpu9: &Cpu<B>,
-    cpu7: &Cpu<B>,
+    cpu9: &Cpu<B9>,
+    cpu7: &Cpu<B7>,
     ppu: &Ppu,
     frame: u32,
 ) -> Result<Vec<u8>, String> {
@@ -937,14 +945,25 @@ pub fn save_snapshot<B: Bus>(
         ppu,
         frame,
     };
-    encode_binary(&snap)
+    serialize_raw(&snap)
 }
 
-pub fn restore_snapshot<B: Bus>(
+pub fn save_snapshot<B9: Bus, B7: Bus>(
+    machine: &MachineHandle,
+    cpu9: &Cpu<B9>,
+    cpu7: &Cpu<B7>,
+    ppu: &Ppu,
+    frame: u32,
+) -> Result<Vec<u8>, String> {
+    let raw = save_snapshot_raw(machine, cpu9, cpu7, ppu, frame)?;
+    compress_raw_zmnd(&raw)
+}
+
+pub fn restore_snapshot<B9: Bus, B7: Bus>(
     bytes: &[u8],
     machine: &mut MachineHandle,
-    cpu9: &mut Cpu<B>,
-    cpu7: &mut Cpu<B>,
+    cpu9: &mut Cpu<B9>,
+    cpu7: &mut Cpu<B7>,
     ppu: &mut Ppu,
     rom: &[u8],
 ) -> Result<u32, String> {
@@ -974,7 +993,11 @@ pub fn restore_snapshot<B: Bus>(
             .or(touch_cal);
         mm.save_dirty = false;
         mm.rebuild_vram_lut();
+        mm.recompute_dma_hblank();
+        mm.invalidate_all_code_pages();
     }
+    cpu9.bus.refresh_ptrs();
+    cpu7.bus.refresh_ptrs();
     cpu9.restore(c9);
     cpu7.restore(c7);
     *ppu = p;
@@ -1001,11 +1024,7 @@ mod tests {
             mm.fifo_to7.push_back(0x1234_5678);
         }
         let mut cpu9 = Cpu::new(
-            View {
-                m: machine.ptr(),
-                cpu: 0,
-                in_dma: false,
-            },
+            View::<0>::new(machine.ptr()),
             true,
             0x0200_0800,
             0x0300_2F7C,
@@ -1013,11 +1032,7 @@ mod tests {
             0x0300_3FC0,
         );
         let mut cpu7 = Cpu::new(
-            View {
-                m: machine.ptr(),
-                cpu: 1,
-                in_dma: false,
-            },
+            View::<1>::new(machine.ptr()),
             false,
             0x0238_0000,
             0x0380_FD80,

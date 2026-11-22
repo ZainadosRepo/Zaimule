@@ -469,6 +469,11 @@ export class WebGlViewportRenderer {
     this.uniforms = {};
     this.texWidth = 0;
     this.texHeight = 0;
+    this.texFormat = "rgba";
+    this.unpackAlignment = 4;
+    this.cachedClientW = 0;
+    this.cachedClientH = 0;
+    this._resizeObserver = null;
     this.lastFrame = null;
     this.lastOptions = {
       upscalerMode: "XBRZ",
@@ -478,10 +483,34 @@ export class WebGlViewportRenderer {
       integerScale: false,
     };
     this._initWebGl2();
+    this._attachResizeObserver();
   }
 
   isSupported() {
     return Boolean(this.gl && this.program);
+  }
+
+  _attachResizeObserver() {
+    if (!this.canvas || typeof ResizeObserver !== "function") {
+      return;
+    }
+    try {
+      this.cachedClientW = this.canvas.clientWidth || 0;
+      this.cachedClientH = this.canvas.clientHeight || 0;
+      const obs = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          const box = entry.contentRect;
+          if (box && box.width > 0 && box.height > 0) {
+            this.cachedClientW = Math.round(box.width);
+            this.cachedClientH = Math.round(box.height);
+          }
+        }
+      });
+      obs.observe(this.canvas);
+      this._resizeObserver = obs;
+    } catch {
+      this._resizeObserver = null;
+    }
   }
 
   _initWebGl2() {
@@ -495,7 +524,7 @@ export class WebGlViewportRenderer {
         antialias: false,
         depth: false,
         stencil: false,
-        preserveDrawingBuffer: true,
+        preserveDrawingBuffer: false,
         powerPreference: "high-performance",
       });
     } catch {
@@ -560,8 +589,8 @@ export class WebGlViewportRenderer {
    */
   _syncCanvasResolution(srcW, srcH, isNds, ndsLayout, integerScale) {
     const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
-    const rectW = this.canvas.clientWidth || srcW;
-    const rectH = this.canvas.clientHeight || srcH;
+    const rectW = this.cachedClientW || this.canvas.clientWidth || srcW;
+    const rectH = this.cachedClientH || this.canvas.clientHeight || srcH;
     let targetW = Math.max(srcW, Math.round(rectW * dpr));
     let targetH = Math.max(srcH, Math.round(rectH * dpr));
 
@@ -592,54 +621,107 @@ export class WebGlViewportRenderer {
   }
 
   /**
-   * Uploads and renders a frame `{ width, height, rgba }` directly on the GPU.
-   * If `frame` is omitted, re-renders the most recently uploaded texture with new shader/layout options.
+   * Uploads and renders a frame `{ width, height, rgba }` or `{ width, height, pixelFormat: "rgb565", rgb565 }`
+   * directly on the GPU. If `frame` is omitted, re-renders the most recently uploaded texture.
    */
   renderFrame(frame, options = {}) {
     if (!this.isSupported()) return false;
     const gl = this.gl;
 
-    if (frame && frame.rgba && frame.width > 0 && frame.height > 0) {
+    if (frame && frame.width > 0 && frame.height > 0 && (frame.rgb565 || frame.rgba)) {
       const w = frame.width | 0;
       const h = frame.height | 0;
-      const expectedBytes = w * h * 4;
-      const raw = frame.rgba;
-      const u8 =
-        raw instanceof Uint8Array
-          ? raw
-          : new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
-      if (u8.byteLength < expectedBytes) {
-        return false;
-      }
-      const uploadSlice = u8.byteLength === expectedBytes ? u8 : u8.subarray(0, expectedBytes);
+      const isRgb565 = frame.pixelFormat === "rgb565" && frame.rgb565;
 
-      gl.bindTexture(gl.TEXTURE_2D, this.texture);
-      if (this.texWidth !== w || this.texHeight !== h) {
-        this.texWidth = w;
-        this.texHeight = h;
-        gl.texImage2D(
-          gl.TEXTURE_2D,
-          0,
-          gl.RGBA8,
-          w,
-          h,
-          0,
-          gl.RGBA,
-          gl.UNSIGNED_BYTE,
-          uploadSlice
-        );
+      if (isRgb565) {
+        const expectedPixels = w * h;
+        const u16 =
+          frame.rgb565 instanceof Uint16Array
+            ? frame.rgb565
+            : new Uint16Array(frame.rgb565.buffer, frame.rgb565.byteOffset, frame.rgb565.byteLength >>> 1);
+        if (u16.length < expectedPixels) {
+          return false;
+        }
+        const uploadSlice = u16.length === expectedPixels ? u16 : u16.subarray(0, expectedPixels);
+
+        if (this.unpackAlignment !== 2) {
+          gl.pixelStorei(gl.UNPACK_ALIGNMENT, 2);
+          this.unpackAlignment = 2;
+        }
+        gl.bindTexture(gl.TEXTURE_2D, this.texture);
+        if (this.texWidth !== w || this.texHeight !== h || this.texFormat !== "rgb565") {
+          this.texWidth = w;
+          this.texHeight = h;
+          this.texFormat = "rgb565";
+          gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            gl.RGB565,
+            w,
+            h,
+            0,
+            gl.RGB,
+            gl.UNSIGNED_SHORT_5_6_5,
+            uploadSlice
+          );
+        } else {
+          gl.texSubImage2D(
+            gl.TEXTURE_2D,
+            0,
+            0,
+            0,
+            w,
+            h,
+            gl.RGB,
+            gl.UNSIGNED_SHORT_5_6_5,
+            uploadSlice
+          );
+        }
       } else {
-        gl.texSubImage2D(
-          gl.TEXTURE_2D,
-          0,
-          0,
-          0,
-          w,
-          h,
-          gl.RGBA,
-          gl.UNSIGNED_BYTE,
-          uploadSlice
-        );
+        const expectedBytes = w * h * 4;
+        const raw = frame.rgba;
+        const u8 =
+          raw instanceof Uint8Array
+            ? raw
+            : new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+        if (u8.byteLength < expectedBytes) {
+          return false;
+        }
+        const uploadSlice = u8.byteLength === expectedBytes ? u8 : u8.subarray(0, expectedBytes);
+
+        if (this.unpackAlignment !== 4) {
+          gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+          this.unpackAlignment = 4;
+        }
+        gl.bindTexture(gl.TEXTURE_2D, this.texture);
+        if (this.texWidth !== w || this.texHeight !== h || this.texFormat !== "rgba") {
+          this.texWidth = w;
+          this.texHeight = h;
+          this.texFormat = "rgba";
+          gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            gl.RGBA8,
+            w,
+            h,
+            0,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            uploadSlice
+          );
+        } else {
+          gl.texSubImage2D(
+            gl.TEXTURE_2D,
+            0,
+            0,
+            0,
+            w,
+            h,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            uploadSlice
+          );
+        }
       }
       this.lastFrame = { width: w, height: h };
     }

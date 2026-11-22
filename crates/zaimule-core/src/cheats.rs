@@ -3,7 +3,16 @@
 
 use serde::{Deserialize, Serialize};
 
-/// A parsed GameShark / Action Replay / Raw RAM cheat code (`01VVAAAA` or `AAAA:VV`).
+/// Supported cheat code execution engines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CheatKind {
+    #[default]
+    GameSharkGb,
+    ActionReplayDs,
+}
+
+/// A parsed GameShark / Action Replay / Raw RAM cheat code (`01VVAAAA`, `AAAA:VV`, or NDS AR `XXXXXXXX YYYYYYYY`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheatCodeEntry {
@@ -13,6 +22,10 @@ pub struct CheatCodeEntry {
     pub addr: u16,
     pub value: u8,
     pub enabled: bool,
+    #[serde(default)]
+    pub kind: CheatKind,
+    #[serde(default)]
+    pub ar_ops: Vec<(u32, u32)>,
 }
 
 /// RetroAchievement definition evaluated against live emulator state.
@@ -28,9 +41,75 @@ pub struct AchievementEntry {
     pub badge_symbol: String,
 }
 
-/// Parses a Game Boy GameShark code (`01VVLLHH`, e.g. `016300C1` -> write `0x63` to `0xC100`)
-/// or a direct `AAAA:VV` / `0xAAAA=0xVV` hex expression.
+fn parse_action_replay_ds_ops(raw_code: &str) -> Option<Vec<(u32, u32)>> {
+    let mut words: Vec<u32> = Vec::new();
+    for raw_tok in raw_code.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '|')) {
+        let tok = raw_tok
+            .trim()
+            .trim_start_matches("0x")
+            .trim_start_matches("0X");
+        if tok.is_empty() {
+            continue;
+        }
+        if tok.len() == 8 && tok.chars().all(|c| c.is_ascii_hexdigit()) {
+            words.push(u32::from_str_radix(tok, 16).ok()?);
+        } else if tok.len() == 16 && tok.chars().all(|c| c.is_ascii_hexdigit()) {
+            words.push(u32::from_str_radix(&tok[0..8], 16).ok()?);
+            words.push(u32::from_str_radix(&tok[8..16], 16).ok()?);
+        } else {
+            return None;
+        }
+    }
+    if words.len() < 2 || !words.len().is_multiple_of(2) {
+        return None;
+    }
+    let ops: Vec<(u32, u32)> = words
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[a, b]| (a, b))
+        .collect();
+    Some(ops)
+}
+
+/// Parses a Game Boy GameShark code (`01VVLLHH`, e.g. `016300C1` -> write `0x63` to `0xC100`),
+/// a direct `AAAA:VV` / `0xAAAA=0xVV` hex expression, or a single/multi-line 32-bit
+/// Nintendo DS Action Replay code (`XXXXXXXX YYYYYYYY`).
 pub fn parse_cheat_code(raw_code: &str, label: &str) -> Result<CheatCodeEntry, String> {
+    if let Some(ar_ops) = parse_action_replay_ds_ops(raw_code) {
+        let (first_hi, first_lo) = ar_ops[0];
+        let mut fingerprint = 0x811C_9DC5u32;
+        for &(a, b) in &ar_ops {
+            fingerprint ^= a;
+            fingerprint = fingerprint.wrapping_mul(0x0100_0193);
+            fingerprint ^= b;
+            fingerprint = fingerprint.wrapping_mul(0x0100_0193);
+        }
+        let formatted_lines: Vec<String> = ar_ops
+            .iter()
+            .map(|(a, b)| format!("{a:08X} {b:08X}"))
+            .collect();
+        let default_label = if ar_ops.len() == 1 {
+            format!("Action Replay DS {first_hi:08X}")
+        } else {
+            format!("Action Replay DS ({} lignes)", ar_ops.len())
+        };
+        return Ok(CheatCodeEntry {
+            id: format!("ar-nds-{fingerprint:08x}"),
+            label: if label.trim().is_empty() {
+                default_label
+            } else {
+                label.trim().to_string()
+            },
+            code_text: formatted_lines.join("\n"),
+            addr: (first_hi & 0xFFFF) as u16,
+            value: (first_lo & 0xFF) as u8,
+            enabled: true,
+            kind: CheatKind::ActionReplayDs,
+            ar_ops,
+        });
+    }
+
     let cleaned: String = raw_code
         .chars()
         .filter(|c| !c.is_whitespace() && *c != '-')
@@ -60,6 +139,8 @@ pub fn parse_cheat_code(raw_code: &str, label: &str) -> Result<CheatCodeEntry, S
             addr,
             value,
             enabled: true,
+            kind: CheatKind::GameSharkGb,
+            ar_ops: Vec::new(),
         });
     }
 
@@ -81,10 +162,12 @@ pub fn parse_cheat_code(raw_code: &str, label: &str) -> Result<CheatCodeEntry, S
             addr,
             value,
             enabled: true,
+            kind: CheatKind::GameSharkGb,
+            ar_ops: Vec::new(),
         });
     }
 
-    Err("format de code invalide (utilisez GameShark '01FF00C1' ou 'C100:FF')".into())
+    Err("format de code invalide (utilisez GameShark '01FF00C1', 'C100:FF' ou Action Replay DS '12005F54 00000001')".into())
 }
 
 /// Scans a RAM slice for all offsets matching `target_value` (up to `max_results` hits).
@@ -194,5 +277,34 @@ mod tests {
         assert!(default_cheat_codes().is_empty());
         assert!(default_achievements().is_empty());
         assert!(default_memory_watchpoints().is_empty());
+    }
+
+    #[test]
+    fn parses_action_replay_ds_multiline_and_legacy_json() {
+        let ar = parse_cheat_code(
+            "52005F54 E12FFF1E\n12005F54 00000001\nD2000000 00000000",
+            "60 FPS HeartGold",
+        )
+        .unwrap();
+        assert_eq!(ar.kind, CheatKind::ActionReplayDs);
+        assert_eq!(ar.label, "60 FPS HeartGold");
+        assert_eq!(
+            ar.ar_ops,
+            vec![
+                (0x5200_5F54, 0xE12F_FF1E),
+                (0x1200_5F54, 0x0000_0001),
+                (0xD200_0000, 0x0000_0000),
+            ]
+        );
+
+        let single_glued = parse_cheat_code("02001000DEADBEEF", "").unwrap();
+        assert_eq!(single_glued.kind, CheatKind::ActionReplayDs);
+        assert_eq!(single_glued.ar_ops, vec![(0x0200_1000, 0xDEAD_BEEF)]);
+
+        // Backward-compatible deserialization of pre-1.6.3 settings.json entries
+        let legacy_json = r#"{"id":"cheat-c100-63","label":"Inf","codeText":"016300C1","addr":49408,"value":99,"enabled":true}"#;
+        let legacy: CheatCodeEntry = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy.kind, CheatKind::GameSharkGb);
+        assert!(legacy.ar_ops.is_empty());
     }
 }

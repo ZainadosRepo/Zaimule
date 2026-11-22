@@ -48,6 +48,25 @@ function readLittleEndianFloat32Array(bytes, dv, offset, floatCount) {
   return out;
 }
 
+function readLittleEndianUint16Array(bytes, dv, offset, count) {
+  if (count === 0) {
+    return new Uint16Array(0);
+  }
+  const byteLen = count * 2;
+  if (IS_LITTLE_ENDIAN) {
+    if (((bytes.byteOffset + offset) & 1) === 0) {
+      return new Uint16Array(bytes.buffer, bytes.byteOffset + offset, count);
+    }
+    const alignedCopy = bytes.slice(offset, offset + byteLen);
+    return new Uint16Array(alignedCopy.buffer);
+  }
+  const out = new Uint16Array(count);
+  for (let i = 0; i < count; i += 1) {
+    out[i] = dv.getUint16(offset + i * 2, true);
+  }
+  return out;
+}
+
 /**
  * Decodes a raw `"ZMFR"` v1 binary response into typed views, owned PCM Float32Array, and metadata.
  */
@@ -74,6 +93,7 @@ export function decodeViewportBinaryPacket(input) {
 
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const flags = bytes[5];
+  const isRgb565 = (flags & 0x10) !== 0;
   const sampleRateHz = dv.getUint32(6, true);
   const frameLo = dv.getUint32(10, true);
   const frameHi = dv.getUint32(14, true);
@@ -93,15 +113,20 @@ export function decodeViewportBinaryPacket(input) {
     }
     const width = dv.getUint16(offset, true);
     const height = dv.getUint16(offset + 2, true);
-    const rgbaLen = dv.getUint32(offset + 4, true);
+    const pixelLen = dv.getUint32(offset + 4, true);
     offset += 8;
 
-    if (offset + rgbaLen > bytes.byteLength) {
-      throw new Error(`Tampon RGBA vue #${i} tronqué (${rgbaLen} octets attendus)`);
+    if (offset + pixelLen > bytes.byteLength) {
+      throw new Error(`Tampon RGBA vue #${i} tronqué (${pixelLen} octets attendus)`);
     }
-    const rgba = new Uint8ClampedArray(bytes.buffer, bytes.byteOffset + offset, rgbaLen);
-    views.push({ width, height, rgba });
-    offset += rgbaLen;
+    if (isRgb565) {
+      const rgb565 = readLittleEndianUint16Array(bytes, dv, offset, pixelLen >>> 1);
+      views.push({ width, height, pixelFormat: "rgb565", rgb565 });
+    } else {
+      const rgba = new Uint8ClampedArray(bytes.buffer, bytes.byteOffset + offset, pixelLen);
+      views.push({ width, height, pixelFormat: "rgba", rgba });
+    }
+    offset += pixelLen;
   }
 
   if (offset + 4 > bytes.byteLength) {
@@ -138,6 +163,7 @@ export function decodeViewportBinaryPacket(input) {
     quadMode: (flags & 0x02) !== 0,
     sramDirty: (flags & 0x04) !== 0,
     macroActive: (flags & 0x08) !== 0,
+    rgb565: isRgb565,
     sampleRateHz,
     frameNumber,
     audioLevel,

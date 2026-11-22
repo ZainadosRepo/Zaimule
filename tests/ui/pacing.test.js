@@ -71,5 +71,20 @@ test("FramePacer does not stutter on frame 2 on a 60 Hz display against 59.7275 
   for (let i = 0; i < 10; i++) {
     const res = pacer.advance(i * tick60Hz, gbaFps);
     assert.equal(res.shouldStep, true, `60Hz tick #${i} should step smoothly without early drop`);
+    assert.equal(res.behindFrames, 0);
   }
+});
+
+test("FramePacer tracks behindFrames after heavy frames and reports non-mutating isReady()", () => {
+  const pacer = new FramePacer();
+  const ndsFps = targetFpsForConsole("NDS");
+  assert.equal(pacer.isReady(0, ndsFps), true);
+  assert.equal(pacer.advance(0, ndsFps).shouldStep, true);
+  assert.equal(pacer.isReady(8, ndsFps), false);
+  assert.equal(pacer.isReady(17, ndsFps), true);
+
+  // Simulate a heavy frame that missed a full VSync (~38 ms elapsed)
+  const late = pacer.advance(38, ndsFps);
+  assert.equal(late.shouldStep, true);
+  assert.ok(late.behindFrames >= 1, `expected behindFrames >= 1, got ${late.behindFrames}`);
 });

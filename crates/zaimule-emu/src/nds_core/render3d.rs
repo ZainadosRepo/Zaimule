@@ -59,6 +59,17 @@ struct V {
     rw: f64, // 1/w
 }
 
+#[derive(Clone, Copy)]
+struct PreparedPoly {
+    pi: usize,
+    vs: usize,
+    ve: usize,
+    avg_d: f64,
+    py_min: usize,
+    py_max: usize,
+    depth_equal: bool,
+}
+
 /// Reusable scratch buffers owned by [`super::ppu::Ppu`] so 3D rasterization
 /// performs zero heap allocations per frame.
 pub struct Render3dScratch {
@@ -67,10 +78,11 @@ pub struct Render3dScratch {
     poly_id: Vec<u8>,
     stencil: Vec<bool>,
     prep_verts: Vec<V>,
-    prepared: Vec<(usize, usize, usize, f64)>,
+    prepared: Vec<PreparedPoly>,
     clip_a: Vec<V>,
     clip_b: Vec<V>,
-    order: Vec<usize>,
+    order_pass0: Vec<usize>,
+    order_pass1: Vec<usize>,
 }
 
 impl Default for Render3dScratch {
@@ -90,8 +102,143 @@ impl Render3dScratch {
             prepared: Vec::with_capacity(1024),
             clip_a: Vec::with_capacity(12),
             clip_b: Vec::with_capacity(12),
-            order: Vec::with_capacity(1024),
+            order_pass0: Vec::with_capacity(1024),
+            order_pass1: Vec::with_capacity(256),
         }
+    }
+}
+
+// ---- Persistent zero-dependency scanline-band worker pool ------------------
+
+struct BandJob {
+    ctx_ptr: usize,
+    run: fn(usize, usize),
+    band_count: usize,
+}
+
+struct PoolShared {
+    generation: u64,
+    job: Option<BandJob>,
+}
+
+struct BandWorkerPool {
+    dispatch_lock: std::sync::Mutex<()>,
+    shared: std::sync::Arc<(
+        std::sync::Mutex<PoolShared>,
+        std::sync::Condvar,
+        std::sync::atomic::AtomicUsize,
+        std::sync::Mutex<()>,
+        std::sync::Condvar,
+    )>,
+    max_bands: usize,
+}
+
+impl BandWorkerPool {
+    fn global() -> &'static Self {
+        static POOL: std::sync::OnceLock<BandWorkerPool> = std::sync::OnceLock::new();
+        POOL.get_or_init(Self::new)
+    }
+
+    fn new() -> Self {
+        let hw = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let max_bands = hw.clamp(1, 6);
+        let shared = std::sync::Arc::new((
+            std::sync::Mutex::new(PoolShared {
+                generation: 0,
+                job: None,
+            }),
+            std::sync::Condvar::new(),
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::Mutex::new(()),
+            std::sync::Condvar::new(),
+        ));
+        let mut actual_bands = 1usize;
+        for _ in 1..max_bands {
+            let worker_band = actual_bands;
+            let shared_clone = std::sync::Arc::clone(&shared);
+            let spawned = std::thread::Builder::new()
+                .name(format!("zaimule-3d-{worker_band}"))
+                .spawn(move || {
+                    let mut seen_gen = 0u64;
+                    loop {
+                        let (job_ctx, job_fn, band_count) = {
+                            let mut guard = shared_clone.0.lock().unwrap();
+                            while guard.generation == seen_gen {
+                                guard = shared_clone.1.wait(guard).unwrap();
+                            }
+                            seen_gen = guard.generation;
+                            match guard.job {
+                                Some(ref j) => (j.ctx_ptr, j.run, j.band_count),
+                                None => continue,
+                            }
+                        };
+                        if worker_band < band_count {
+                            let _ = std::panic::catch_unwind(|| {
+                                job_fn(job_ctx, worker_band);
+                            });
+                            if shared_clone
+                                .2
+                                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+                                == 1
+                            {
+                                let _done_guard = shared_clone.3.lock().unwrap();
+                                shared_clone.4.notify_one();
+                            }
+                        }
+                    }
+                });
+            if spawned.is_ok() {
+                actual_bands += 1;
+            }
+        }
+        Self {
+            dispatch_lock: std::sync::Mutex::new(()),
+            shared,
+            max_bands: actual_bands,
+        }
+    }
+
+    /// Executes `run(ctx_ptr, band_idx)` for `band_idx in 0..bands`, running band 0 on the
+    /// caller thread and bands `1..bands` on persistent workers, blocking until all bands finish.
+    fn execute_bands(&self, bands: usize, ctx_ptr: usize, run: fn(usize, usize)) {
+        let bands = bands.min(self.max_bands).max(1);
+        if bands == 1 {
+            run(ctx_ptr, 0);
+            return;
+        }
+        let _dispatch = self.dispatch_lock.lock().unwrap();
+        let worker_count = bands - 1;
+        self.shared
+            .2
+            .store(worker_count, std::sync::atomic::Ordering::Release);
+        {
+            let mut guard = self.shared.0.lock().unwrap();
+            guard.job = Some(BandJob {
+                ctx_ptr,
+                run,
+                band_count: bands,
+            });
+            guard.generation = guard.generation.wrapping_add(1);
+            self.shared.1.notify_all();
+        }
+
+        // Guard guarantees all worker threads finish reading `ctx_ptr` even if band 0 panics.
+        struct WaitGuard<'a>(&'a BandWorkerPool);
+        impl Drop for WaitGuard<'_> {
+            fn drop(&mut self) {
+                if self.0.shared.2.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                    let mut done_guard = self.0.shared.3.lock().unwrap();
+                    while self.0.shared.2.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                        done_guard = self.0.shared.4.wait(done_guard).unwrap();
+                    }
+                }
+                self.0.shared.0.lock().unwrap().job = None;
+            }
+        }
+        let _wait = WaitGuard(self);
+        run(ctx_ptr, 0);
     }
 }
 
@@ -301,10 +448,91 @@ impl<'a> TexVramCache<'a> {
     }
 }
 
+/// Tiny per-polygon cache for Format 5 (4×4 compressed) texture blocks. Adjacent
+/// horizontal pixels stay inside the same 4×4 block 75%+ of the time, so caching
+/// the 4 decoded palette entries avoids redundant palette/blend work per texel.
+#[derive(Clone, Copy)]
+struct Format5BlockCache {
+    last_block_addr: u32,
+    entries: [u32; 4], // RGB555 or u32::MAX for transparent
+}
+
+impl Default for Format5BlockCache {
+    fn default() -> Self {
+        Self {
+            last_block_addr: u32::MAX,
+            entries: [u32::MAX; 4],
+        }
+    }
+}
+
+impl Format5BlockCache {
+    #[inline(always)]
+    fn sample(
+        &mut self,
+        cache: &TexVramCache<'_>,
+        tex: &TexInfo,
+        x: i32,
+        y: i32,
+    ) -> Option<(u16, u32)> {
+        let bw = tex.tw >> 2;
+        let blk = ((y >> 2) * bw + (x >> 2)) as u32;
+        let block_addr = (tex.base + blk * 4) & 0x7_FFFF;
+        let row = cache.tex_read8(block_addr + (y & 3) as u32);
+        let v = ((row >> ((x & 3) * 2)) as usize) & 3;
+        if block_addr != self.last_block_addr {
+            self.last_block_addr = block_addr;
+            let idx_addr =
+                0x2_0000 + ((block_addr & 0x1_FFFF) >> 1) + ((block_addr & 0x4_0000) >> 2);
+            let info =
+                cache.tex_read8(idx_addr) as u32 | ((cache.tex_read8(idx_addr + 1) as u32) << 8);
+            let pal = (tex.pltt << 4) + (info & 0x3FFF) * 4;
+            let c0 = cache.texpal_read16(pal);
+            let c1 = cache.texpal_read16(pal + 2);
+            let mix = |a: u16, b: u16, wa: u32, wb: u32, sh_div: u32| -> u32 {
+                let r = (((a as u32 & 0x1F) * wa + (b as u32 & 0x1F) * wb) >> sh_div) & 0x1F;
+                let g = ((((a as u32 >> 5) & 0x1F) * wa + ((b as u32 >> 5) & 0x1F) * wb) >> sh_div)
+                    & 0x1F;
+                let bl = ((((a as u32 >> 10) & 0x1F) * wa + ((b as u32 >> 10) & 0x1F) * wb)
+                    >> sh_div)
+                    & 0x1F;
+                r | (g << 5) | (bl << 10)
+            };
+            self.entries[0] = c0 as u32;
+            self.entries[1] = c1 as u32;
+            match info >> 14 {
+                0 => {
+                    self.entries[2] = cache.texpal_read16(pal + 4) as u32;
+                    self.entries[3] = u32::MAX;
+                }
+                1 => {
+                    self.entries[2] = mix(c0, c1, 1, 1, 1);
+                    self.entries[3] = u32::MAX;
+                }
+                2 => {
+                    self.entries[2] = cache.texpal_read16(pal + 4) as u32;
+                    self.entries[3] = cache.texpal_read16(pal + 6) as u32;
+                }
+                _ => {
+                    self.entries[2] = mix(c0, c1, 5, 3, 3);
+                    self.entries[3] = mix(c0, c1, 3, 5, 3);
+                }
+            }
+        }
+        let col = self.entries[v];
+        if col == u32::MAX {
+            None
+        } else {
+            Some((col as u16, 31))
+        }
+    }
+}
+
 /// Sample a texture using pre-resolved VRAM slices; `None` = transparent texel, `Some((rgb15, alpha 0..=31))`.
 #[inline(always)]
 fn sample_tex_cached(
     cache: &TexVramCache<'_>,
+    f5_cache: &mut Format5BlockCache,
     tex: &TexInfo,
     s: f64,
     t: f64,
@@ -323,6 +551,9 @@ fn sample_tex_cached(
         tex.repeat_t,
         tex.flip_t,
     );
+    if tex.format == 5 {
+        return f5_cache.sample(cache, tex, x, y);
+    }
     let base = tex.base;
     let i = (y * tex.tw + x) as u32;
     match tex.format {
@@ -379,38 +610,70 @@ fn sample_tex_cached(
             }
             Some((c & 0x7FFF, 31))
         }
-        5 => {
-            // 4x4-texel compressed:
-            // - Slot 0 (`0x0_0000..0x1_FFFF`) keeps palette-index pairs in `0x2_0000..0x2_FFFF`
-            // - Slot 2 (`0x4_0000..0x5_FFFF`) keeps palette-index pairs in `0x3_0000..0x3_FFFF`
-            let bw = tex.tw >> 2;
-            let blk = ((y >> 2) * bw + (x >> 2)) as u32;
-            let block_addr = (base + blk * 4) & 0x7_FFFF;
-            let row = cache.tex_read8(block_addr + (y & 3) as u32);
-            let v = ((row >> ((x & 3) * 2)) as u32) & 3;
-            let idx_addr =
-                0x2_0000 + ((block_addr & 0x1_FFFF) >> 1) + ((block_addr & 0x4_0000) >> 2);
-            let info =
-                cache.tex_read8(idx_addr) as u32 | ((cache.tex_read8(idx_addr + 1) as u32) << 8);
-            let pal = (tex.pltt << 4) + (info & 0x3FFF) * 4;
-            let c = |n: u32| cache.texpal_read16(pal + n * 2);
-            let mix = |a: u16, b: u16, wa: u32, wb: u32, sh_div: u32| -> u16 {
-                let ch = |sh: u32| {
-                    ((((a as u32 >> sh) & 0x1F) * wa + ((b as u32 >> sh) & 0x1F) * wb) >> sh_div)
-                        & 0x1F
-                };
-                (ch(0) | (ch(5) << 5) | (ch(10) << 10)) as u16
-            };
-            match (info >> 14, v) {
-                (_, 0) => Some((c(0), 31)),
-                (_, 1) => Some((c(1), 31)),
-                (0 | 2, 2) => Some((c(2), 31)),
-                (1, 2) => Some((mix(c(0), c(1), 1, 1, 1), 31)),
-                (3, 2) => Some((mix(c(0), c(1), 5, 3, 3), 31)),
-                (2, 3) => Some((c(3), 31)),
-                (3, 3) => Some((mix(c(0), c(1), 3, 5, 3), 31)),
-                _ => None, // modes 0/1 value 3 = transparent
+        _ => None,
+    }
+}
+
+/// Format-specialized opaque texel sampler (eliminates `match tex.format` inside hot loops).
+#[inline(always)]
+fn sample_opaque_fmt<const FMT: u32>(
+    cache: &TexVramCache<'_>,
+    f5_cache: &mut Format5BlockCache,
+    tex: &TexInfo,
+    s: f64,
+    t: f64,
+) -> Option<u16> {
+    let x = wrap_texcoord(
+        fast_floor(s + tex.bias),
+        tex.tw,
+        tex.tw_mask,
+        tex.repeat_s,
+        tex.flip_s,
+    );
+    let y = wrap_texcoord(
+        fast_floor(t + tex.bias),
+        tex.th,
+        tex.th_mask,
+        tex.repeat_t,
+        tex.flip_t,
+    );
+    if FMT == 5 {
+        return f5_cache.sample(cache, tex, x, y).map(|(c, _)| c);
+    }
+    let base = tex.base;
+    let i = (y * tex.tw + x) as u32;
+    match FMT {
+        2 => {
+            let b = cache.tex_read8(base + (i >> 2));
+            let idx = ((b >> ((i & 3) * 2)) & 3) as u32;
+            if idx == 0 && tex.color0_clear {
+                return None;
             }
+            Some(cache.texpal_read16((tex.pltt << 3) + idx * 2))
+        }
+        3 => {
+            let b = cache.tex_read8(base + (i >> 1));
+            let idx = (if i & 1 == 0 { b & 0xF } else { b >> 4 }) as u32;
+            if idx == 0 && tex.color0_clear {
+                return None;
+            }
+            Some(cache.texpal_read16((tex.pltt << 4) + idx * 2))
+        }
+        4 => {
+            let idx = cache.tex_read8(base + i) as u32;
+            if idx == 0 && tex.color0_clear {
+                return None;
+            }
+            Some(cache.texpal_read16((tex.pltt << 4) + idx * 2))
+        }
+        7 => {
+            let lo = cache.tex_read8(base + i * 2) as u16;
+            let hi = cache.tex_read8(base + i * 2 + 1) as u16;
+            let c = lo | (hi << 8);
+            if c & 0x8000 == 0 {
+                return None;
+            }
+            Some(c & 0x7FFF)
         }
         _ => None,
     }
@@ -421,7 +684,8 @@ fn sample_tex_cached(
 #[inline]
 fn sample_tex(m: &Machine, tex: &TexInfo, s: f64, t: f64) -> Option<(u16, u32)> {
     let cache = TexVramCache::new(m);
-    sample_tex_cached(&cache, tex, s, t)
+    let mut f5 = Format5BlockCache::default();
+    sample_tex_cached(&cache, &mut f5, tex, s, t)
 }
 
 #[inline(always)]
@@ -464,6 +728,15 @@ pub fn render_into(m: &Machine, scratch: &mut Render3dScratch) {
 /// Render the latched 3D frame at `scale`× internal resolution (`1` = `256×192`, `2` = `512×384` HD)
 /// into reusable `scratch.fb` without per-frame heap allocations.
 pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usize) {
+    render_into_scaled_impl(m, scratch, scale, false);
+}
+
+fn render_into_scaled_impl(
+    m: &Machine,
+    scratch: &mut Render3dScratch,
+    scale: usize,
+    force_single_band: bool,
+) {
     let scale = scale.clamp(1, 2);
     let out_w = WIDTH * scale;
     let out_h = HEIGHT * scale;
@@ -507,9 +780,10 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
 
     scratch.prep_verts.clear();
     scratch.prepared.clear();
+    scratch.order_pass0.clear();
+    scratch.order_pass1.clear();
     let mut has_pass1 = false;
     let mut has_shadows = false;
-    let mut has_poly_translucent = false;
 
     for (pi, poly) in gx.disp_polys.iter().enumerate() {
         scratch.clip_a.clear();
@@ -568,11 +842,25 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
         // lands on a whole 1x pixel and a polygon's texture is re-fitted to that
         // integer outline. Locking to the 1x integer grid before multiplying by `sf`
         // prevents outdoor buildings and ground tiles from wobbling while walking.
+        let mut ymin_f = f64::MAX;
+        let mut ymax_f = f64::MIN;
         for v in pv.iter_mut() {
             v.rw = 1.0 / v.w;
             v.sx = (vx0 + (v.x * v.rw * 0.5 + 0.5) * vw).floor() * sf;
             v.sy = ((HEIGHT as f64) - (vy0 + (v.y * v.rw * 0.5 + 0.5) * vh)).floor() * sf;
             v.d = if wbuffer { v.w } else { v.z * v.rw * 0.5 + 0.5 };
+            if v.sy < ymin_f {
+                ymin_f = v.sy;
+            }
+            if v.sy > ymax_f {
+                ymax_f = v.sy;
+            }
+        }
+
+        let py_min = ((ymin_f.floor() as i64).clamp(0, out_h as i64)) as usize;
+        let py_max = (((ymax_f.ceil() as i64) + 1).clamp(0, out_h as i64)) as usize;
+        if py_min >= py_max {
+            continue;
         }
 
         // Face culling: signed area in screen space (y down).
@@ -592,13 +880,13 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
         let poly_mode = (poly.attr >> 4) & 3;
         let raw_alpha = (poly.attr >> 16) & 0x1F;
         let format = (poly.texparam >> 26) & 7;
-        if poly_mode == 3 {
+        let shadow = poly_mode == 3;
+        let poly_alpha = if raw_alpha == 0 { 31 } else { raw_alpha };
+        let can_translucent = poly_alpha < 31 || (poly_mode != 1 && (format == 1 || format == 6));
+        if shadow {
             has_shadows = true;
             has_pass1 = true;
-        } else if raw_alpha != 0 && raw_alpha < 31 {
-            has_poly_translucent = true;
-            has_pass1 = true;
-        } else if poly_mode != 1 && (format == 1 || format == 6) {
+        } else if can_translucent {
             has_pass1 = true;
         }
 
@@ -606,7 +894,22 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
         let v_start = scratch.prep_verts.len();
         scratch.prep_verts.extend_from_slice(pv);
         let v_end = scratch.prep_verts.len();
-        scratch.prepared.push((pi, v_start, v_end, avg_d));
+        let pidx = scratch.prepared.len();
+        scratch.prepared.push(PreparedPoly {
+            pi,
+            vs: v_start,
+            ve: v_end,
+            avg_d,
+            py_min,
+            py_max,
+            depth_equal: poly.attr & (1 << 14) != 0,
+        });
+        if !shadow {
+            scratch.order_pass0.push(pidx);
+        }
+        if shadow || can_translucent {
+            scratch.order_pass1.push(pidx);
+        }
     }
 
     if scratch.prepared.is_empty() {
@@ -616,14 +919,13 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
     if has_shadows {
         scratch.stencil.fill(false);
     }
-    let _ = has_poly_translucent;
 
     if *POLYSTATS {
         let mut modes = [0usize; 4];
         let mut fmts = [0usize; 8];
         let mut translucent = 0usize;
-        for &(pi, _, _, _) in scratch.prepared.iter() {
-            let p = &gx.disp_polys[pi];
+        for pp in scratch.prepared.iter() {
+            let p = &gx.disp_polys[pp.pi];
             modes[(p.attr >> 4 & 3) as usize] += 1;
             fmts[(p.texparam >> 26 & 7) as usize] += 1;
             let a = p.attr >> 16 & 0x1F;
@@ -641,8 +943,8 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
     }
 
     if let Some(want) = *TEXDBG {
-        for &(pi, vs, ve, _) in scratch.prepared.iter() {
-            let p = &gx.disp_polys[pi];
+        for pp in scratch.prepared.iter() {
+            let p = &gx.disp_polys[pp.pi];
             if p.texparam != want {
                 continue;
             }
@@ -660,7 +962,7 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
                 p.pltt << shift,
                 p.texparam & 1 << 29 != 0
             );
-            let vc: Vec<String> = scratch.prep_verts[vs..ve]
+            let vc: Vec<String> = scratch.prep_verts[pp.vs..pp.ve]
                 .iter()
                 .map(|v| format!("({:.0},{:.0},{:.0})", v.r, v.g, v.b))
                 .collect();
@@ -695,69 +997,148 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
         }
     }
 
+    // Sort Pass 0 opaque polygons front-to-back (keeping `depth_equal` overlays after standard
+    // `<` polygons in original submission order) to maximize early-Z rejection before `1/w` & texel decode.
+    {
+        let prep = &scratch.prepared;
+        scratch.order_pass0.sort_by(|&a, &b| {
+            let pa = &prep[a];
+            let pb = &prep[b];
+            pa.depth_equal.cmp(&pb.depth_equal).then_with(|| {
+                if pa.depth_equal {
+                    std::cmp::Ordering::Equal
+                } else {
+                    pa.avg_d
+                        .partial_cmp(&pb.avg_d)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }
+            })
+        });
+    }
+    if has_pass1 {
+        let prep = &scratch.prepared;
+        scratch.order_pass1.sort_by(|&a, &b| {
+            prep[b]
+                .avg_d
+                .partial_cmp(&prep[a].avg_d)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
     let tex_bias = *TEXBIAS;
     let highlight_mode = m.io2d[0][0x60] & 2 != 0;
     let pixdbg = *PIXDBG;
 
-    let passes = if has_pass1 { 2 } else { 1 };
-    scratch.order.clear();
-    scratch.order.extend(0..scratch.prepared.len());
+    let want_bands = if force_single_band || pixdbg.is_some() || scratch.prepared.len() < 24 {
+        1
+    } else if scale >= 2 {
+        6
+    } else {
+        4
+    };
+    let pool = BandWorkerPool::global();
+    let bands = want_bands.min(pool.max_bands).max(1);
 
-    for pass in 0..passes {
-        if pass == 1 {
-            let prep = &scratch.prepared;
-            scratch.order.sort_by(|&a, &b| {
-                prep[b]
-                    .3
-                    .partial_cmp(&prep[a].3)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+    if bands <= 1 {
+        raster_band(
+            m,
+            &tex_cache,
+            &scratch.prepared,
+            &scratch.prep_verts,
+            &scratch.order_pass0,
+            if has_pass1 { &scratch.order_pass1 } else { &[] },
+            wbuffer,
+            highlight_mode,
+            tex_bias,
+            pixdbg,
+            out_w,
+            out_h,
+            0,
+            out_h,
+            &mut scratch.fb,
+            &mut scratch.depth,
+            &mut scratch.poly_id,
+            &mut scratch.stencil,
+        );
+    } else {
+        struct BandCtx<'a> {
+            m: &'a Machine,
+            tex_cache: &'a TexVramCache<'a>,
+            prepared: &'a [PreparedPoly],
+            prep_verts: &'a [V],
+            order_pass0: &'a [usize],
+            order_pass1: &'a [usize],
+            wbuffer: bool,
+            highlight_mode: bool,
+            tex_bias: f64,
+            out_w: usize,
+            out_h: usize,
+            bands: usize,
+            fb_ptr: *mut u32,
+            depth_ptr: *mut f64,
+            poly_id_ptr: *mut u8,
+            stencil_ptr: *mut bool,
         }
-        for oi in 0..scratch.order.len() {
-            let pidx = scratch.order[oi];
-            let (pi, vs, ve, _) = scratch.prepared[pidx];
-            let poly = &gx.disp_polys[pi];
-            let poly_alpha = {
-                let a = (poly.attr >> 16) & 0x1F;
-                if a == 0 {
-                    31
-                } else {
-                    a
-                }
+        // SAFETY: Every band `b` exclusively accesses disjoint scanlines `[y0..y1) * out_w`.
+        let ctx = BandCtx {
+            m,
+            tex_cache: &tex_cache,
+            prepared: &scratch.prepared,
+            prep_verts: &scratch.prep_verts,
+            order_pass0: &scratch.order_pass0,
+            order_pass1: if has_pass1 { &scratch.order_pass1 } else { &[] },
+            wbuffer,
+            highlight_mode,
+            tex_bias,
+            out_w,
+            out_h,
+            bands,
+            fb_ptr: scratch.fb.as_mut_ptr(),
+            depth_ptr: scratch.depth.as_mut_ptr(),
+            poly_id_ptr: scratch.poly_id.as_mut_ptr(),
+            stencil_ptr: scratch.stencil.as_mut_ptr(),
+        };
+        fn run_band_ctx(ctx_addr: usize, b: usize) {
+            // SAFETY: `ctx_addr` points to live stack `BandCtx` guarded by `WaitGuard` in `execute_bands`.
+            let c = unsafe { &*(ctx_addr as *const BandCtx<'_>) };
+            let y0 = (b * c.out_h) / c.bands;
+            let y1 = ((b + 1) * c.out_h) / c.bands;
+            if y0 >= y1 {
+                return;
+            }
+            let off = y0 * c.out_w;
+            let len = (y1 - y0) * c.out_w;
+            // SAFETY: Bands `[y0, y1)` are strictly disjoint across `b in 0..c.bands`.
+            let (fb_band, depth_band, pid_band, stencil_band) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(c.fb_ptr.add(off), len),
+                    std::slice::from_raw_parts_mut(c.depth_ptr.add(off), len),
+                    std::slice::from_raw_parts_mut(c.poly_id_ptr.add(off), len),
+                    std::slice::from_raw_parts_mut(c.stencil_ptr.add(off), len),
+                )
             };
-            let format = (poly.texparam >> 26) & 7;
-            let poly_mode = (poly.attr >> 4) & 3;
-            let shadow = poly_mode == 3;
-            let can_translucent =
-                poly_alpha < 31 || (poly_mode != 1 && (format == 1 || format == 6));
-            if pass == 0 && shadow {
-                continue;
-            }
-            if pass == 1 && !can_translucent && !shadow {
-                continue;
-            }
-            if shadow && (poly.attr >> 24) & 0x3F == 0 {
-                scratch.stencil.fill(false);
-            }
-            raster_poly(
-                m,
-                &tex_cache,
-                poly,
-                &scratch.prep_verts[vs..ve],
-                poly_alpha,
-                pass,
-                wbuffer,
-                highlight_mode,
-                tex_bias,
-                pixdbg,
-                out_w,
-                out_h,
-                &mut scratch.fb,
-                &mut scratch.depth,
-                &mut scratch.poly_id,
-                &mut scratch.stencil,
+            raster_band(
+                c.m,
+                c.tex_cache,
+                c.prepared,
+                c.prep_verts,
+                c.order_pass0,
+                c.order_pass1,
+                c.wbuffer,
+                c.highlight_mode,
+                c.tex_bias,
+                None,
+                c.out_w,
+                c.out_h,
+                y0,
+                y1,
+                fb_band,
+                depth_band,
+                pid_band,
+                stencil_band,
             );
         }
+        pool.execute_bands(bands, (&ctx as *const BandCtx<'_>) as usize, run_band_ctx);
     }
 
     // Close single-pixel pinholes between adjacent fixed-point tile edges when clear is transparent.
@@ -796,6 +1177,94 @@ pub fn render_into_scaled(m: &Machine, scratch: &mut Render3dScratch, scale: usi
             out.extend_from_slice(&[r, g, b]);
         }
         let _ = std::fs::write(p, out);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn raster_band(
+    m: &Machine,
+    tex_cache: &TexVramCache<'_>,
+    prepared: &[PreparedPoly],
+    prep_verts: &[V],
+    order_pass0: &[usize],
+    order_pass1: &[usize],
+    wbuffer: bool,
+    highlight_mode: bool,
+    tex_bias: f64,
+    pixdbg: Option<(usize, usize)>,
+    out_w: usize,
+    out_h: usize,
+    band_y0: usize,
+    band_y1: usize,
+    fb_band: &mut [u32],
+    depth_band: &mut [f64],
+    poly_id_band: &mut [u8],
+    stencil_band: &mut [bool],
+) {
+    let gx = &m.gx;
+    for &pidx in order_pass0 {
+        let pp = &prepared[pidx];
+        if pp.py_max <= band_y0 || pp.py_min >= band_y1 {
+            continue;
+        }
+        let poly = &gx.disp_polys[pp.pi];
+        let raw_alpha = (poly.attr >> 16) & 0x1F;
+        let poly_alpha = if raw_alpha == 0 { 31 } else { raw_alpha };
+        raster_poly(
+            m,
+            tex_cache,
+            poly,
+            &prep_verts[pp.vs..pp.ve],
+            poly_alpha,
+            0,
+            wbuffer,
+            highlight_mode,
+            tex_bias,
+            pixdbg,
+            out_w,
+            out_h,
+            band_y0,
+            band_y1,
+            fb_band,
+            depth_band,
+            poly_id_band,
+            stencil_band,
+        );
+    }
+
+    for &pidx in order_pass1 {
+        let pp = &prepared[pidx];
+        let poly = &gx.disp_polys[pp.pi];
+        let poly_mode = (poly.attr >> 4) & 3;
+        let shadow = poly_mode == 3;
+        if shadow && (poly.attr >> 24) & 0x3F == 0 {
+            stencil_band.fill(false);
+        }
+        if pp.py_max <= band_y0 || pp.py_min >= band_y1 {
+            continue;
+        }
+        let raw_alpha = (poly.attr >> 16) & 0x1F;
+        let poly_alpha = if raw_alpha == 0 { 31 } else { raw_alpha };
+        raster_poly(
+            m,
+            tex_cache,
+            poly,
+            &prep_verts[pp.vs..pp.ve],
+            poly_alpha,
+            1,
+            wbuffer,
+            highlight_mode,
+            tex_bias,
+            pixdbg,
+            out_w,
+            out_h,
+            band_y0,
+            band_y1,
+            fb_band,
+            depth_band,
+            poly_id_band,
+            stencil_band,
+        );
     }
 }
 
@@ -849,6 +1318,92 @@ fn row_span_k(
     Some((k_lo, k_hi))
 }
 
+/// Format-specialized opaque white-vertex scanline span rasterizer with adaptive 8-pixel
+/// affine subdivision: eliminates ~87% of per-pixel `f64` divisions while automatically
+/// falling back to exact per-pixel `1/w` under steep near-plane perspective foreshortening.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn raster_opaque_white_span<const FMT: u32>(
+    tex_cache: &TexVramCache<'_>,
+    f5_cache: &mut Format5BlockCache,
+    tex: &TexInfo,
+    pid: u8,
+    row_base: usize,
+    x_start: usize,
+    x_end: usize,
+    mut d: f64,
+    dd_dx: f64,
+    mut rw: f64,
+    drw_dx: f64,
+    mut s_acc: f64,
+    ds_dx: f64,
+    mut t_acc: f64,
+    dt_dx: f64,
+    fb: &mut [u32],
+    depth: &mut [f64],
+    poly_id: &mut [u8],
+) {
+    const SUBSPAN: usize = 8;
+    let mut k_px = x_start;
+    while k_px <= x_end {
+        let seg_end = (k_px + SUBSPAN - 1).min(x_end);
+        let seg_steps = seg_end - k_px;
+        let rw_end = rw + drw_dx * (seg_steps as f64);
+        // Use linear (s, t) across up to 8 pixels only when 1/w varies by <= 2% across the segment.
+        if seg_steps >= 2 && (rw_end - rw).abs() <= rw.abs() * 0.02 {
+            let inv0 = 1.0 / rw;
+            let inv1 = 1.0 / rw_end;
+            let mut s = s_acc * inv0;
+            let mut t = t_acc * inv0;
+            let s_end = (s_acc + ds_dx * (seg_steps as f64)) * inv1;
+            let t_end = (t_acc + dt_dx * (seg_steps as f64)) * inv1;
+            let inv_steps = 1.0 / (seg_steps as f64);
+            let ds = (s_end - s) * inv_steps;
+            let dt = (t_end - t) * inv_steps;
+            for cur in k_px..=seg_end {
+                let i = row_base + cur;
+                if d < depth[i] {
+                    if let Some(tc) = sample_opaque_fmt::<FMT>(tex_cache, f5_cache, tex, s, t) {
+                        depth[i] = d;
+                        fb[i] = rgb555_to_rgb(tc);
+                        poly_id[i] = pid;
+                    }
+                }
+                d += dd_dx;
+                s += ds;
+                t += dt;
+            }
+            let adv = (seg_steps + 1) as f64;
+            rw += drw_dx * adv;
+            s_acc += ds_dx * adv;
+            t_acc += dt_dx * adv;
+        } else {
+            for cur in k_px..=seg_end {
+                let i = row_base + cur;
+                if d < depth[i] {
+                    let inv_rw = 1.0 / rw;
+                    if let Some(tc) = sample_opaque_fmt::<FMT>(
+                        tex_cache,
+                        f5_cache,
+                        tex,
+                        s_acc * inv_rw,
+                        t_acc * inv_rw,
+                    ) {
+                        depth[i] = d;
+                        fb[i] = rgb555_to_rgb(tc);
+                        poly_id[i] = pid;
+                    }
+                }
+                d += dd_dx;
+                rw += drw_dx;
+                s_acc += ds_dx;
+                t_acc += dt_dx;
+            }
+        }
+        k_px = seg_end + 1;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn raster_poly(
     m: &Machine,
@@ -863,6 +1418,8 @@ fn raster_poly(
     pixdbg: Option<(usize, usize)>,
     out_w: usize,
     out_h: usize,
+    band_y0: usize,
+    band_y1: usize,
     fb: &mut [u32],
     depth: &mut [f64],
     poly_id: &mut [u8],
@@ -878,6 +1435,7 @@ fn raster_poly(
     let tex = TexInfo::from_poly(poly.texparam, poly.pltt, tex_bias);
     let textured = tex.format != 0;
     let fast_opaque_mod = pass == 0 && poly_mode == 0 && poly_alpha >= 31 && pixdbg.is_none();
+    let mut f5_cache = Format5BlockCache::default();
 
     for k in 1..pv.len() - 1 {
         let mut tri = [&pv[0], &pv[k], &pv[k + 1]];
@@ -908,8 +1466,10 @@ fn raster_poly(
         let ymax = p0.1.max(p1.1).max(p2.1);
         let px0 = (((xmin - 8) + 15).div_euclid(16)).max(0) as usize;
         let px1 = (((xmax - 8).div_euclid(16)) + 1).clamp(0, out_w as i64) as usize;
-        let py0 = (((ymin - 8) + 15).div_euclid(16)).max(0) as usize;
-        let py1 = (((ymax - 8).div_euclid(16)) + 1).clamp(0, out_h as i64) as usize;
+        let py0_full = (((ymin - 8) + 15).div_euclid(16)).max(0) as usize;
+        let py1_full = (((ymax - 8).div_euclid(16)) + 1).clamp(0, out_h as i64) as usize;
+        let py0 = py0_full.max(band_y0);
+        let py1 = py1_full.min(band_y1);
         if px0 >= px1 || py0 >= py1 {
             continue;
         }
@@ -972,7 +1532,7 @@ fn raster_poly(
                     let l1 = (w1_row + k_lo * dx1) as f64 * inv;
                     let l2 = (w2_row + k_lo * dx2) as f64 * inv;
                     let mut d = l0 * d0 + l1 * d1 + l2 * d2;
-                    let row_base = py * out_w + px0;
+                    let row_base = (py - band_y0) * out_w + px0;
                     let x_start = k_lo as usize;
                     let x_end = k_hi as usize;
                     if depth_equal {
@@ -1008,45 +1568,56 @@ fn raster_poly(
         if fast_opaque_mod && textured {
             let has_tex_alpha = tex.format == 1 || tex.format == 6;
             if flat_white && !has_tex_alpha && !depth_equal {
-                // Hottest DS 3D path: opaque unlit/white-vertex textured triangle with `<` depth test.
-                for py in py0..py1 {
-                    if let Some((k_lo, k_hi)) =
-                        row_span_k(w0_row + b0, dx0, w1_row + b1, dx1, w2_row + b2, dx2, max_k)
-                    {
-                        let l0 = (w0_row + k_lo * dx0) as f64 * inv;
-                        let l1 = (w1_row + k_lo * dx1) as f64 * inv;
-                        let l2 = (w2_row + k_lo * dx2) as f64 * inv;
-                        let mut d = l0 * d0 + l1 * d1 + l2 * d2;
-                        let mut rw = l0 * rw0 + l1 * rw1 + l2 * rw2;
-                        let mut s_acc = l0 * s0 + l1 * s1 + l2 * s2;
-                        let mut t_acc = l0 * t0 + l1 * t1 + l2 * t2;
-                        let row_base = py * out_w + px0;
-                        let x_start = k_lo as usize;
-                        let x_end = k_hi as usize;
-                        for k_px in x_start..=x_end {
-                            let i = row_base + k_px;
-                            if d < depth[i] {
-                                let inv_rw = 1.0 / rw;
-                                if let Some((tc, _)) = sample_tex_cached(
+                // Hottest DS 3D path: format-specialized + adaptive 8px spans + Format 5 block cache.
+                macro_rules! run_fmt_rows {
+                    ($fmt:expr) => {
+                        for py in py0..py1 {
+                            if let Some((k_lo, k_hi)) = row_span_k(
+                                w0_row + b0,
+                                dx0,
+                                w1_row + b1,
+                                dx1,
+                                w2_row + b2,
+                                dx2,
+                                max_k,
+                            ) {
+                                let l0 = (w0_row + k_lo * dx0) as f64 * inv;
+                                let l1 = (w1_row + k_lo * dx1) as f64 * inv;
+                                let l2 = (w2_row + k_lo * dx2) as f64 * inv;
+                                raster_opaque_white_span::<$fmt>(
                                     tex_cache,
+                                    &mut f5_cache,
                                     &tex,
-                                    s_acc * inv_rw,
-                                    t_acc * inv_rw,
-                                ) {
-                                    depth[i] = d;
-                                    fb[i] = rgb555_to_rgb(tc);
-                                    poly_id[i] = pid;
-                                }
+                                    pid,
+                                    (py - band_y0) * out_w + px0,
+                                    k_lo as usize,
+                                    k_hi as usize,
+                                    l0 * d0 + l1 * d1 + l2 * d2,
+                                    dd_dx,
+                                    l0 * rw0 + l1 * rw1 + l2 * rw2,
+                                    drw_dx,
+                                    l0 * s0 + l1 * s1 + l2 * s2,
+                                    ds_dx,
+                                    l0 * t0 + l1 * t1 + l2 * t2,
+                                    dt_dx,
+                                    fb,
+                                    depth,
+                                    poly_id,
+                                );
                             }
-                            d += dd_dx;
-                            rw += drw_dx;
-                            s_acc += ds_dx;
-                            t_acc += dt_dx;
+                            w0_row += dy0;
+                            w1_row += dy1;
+                            w2_row += dy2;
                         }
-                    }
-                    w0_row += dy0;
-                    w1_row += dy1;
-                    w2_row += dy2;
+                    };
+                }
+                match tex.format {
+                    2 => run_fmt_rows!(2),
+                    3 => run_fmt_rows!(3),
+                    4 => run_fmt_rows!(4),
+                    5 => run_fmt_rows!(5),
+                    7 => run_fmt_rows!(7),
+                    _ => {}
                 }
                 continue;
             }
@@ -1065,7 +1636,7 @@ fn raster_poly(
                     let mut g_acc = l0 * g0 + l1 * g1 + l2 * g2;
                     let mut b_acc = l0 * b0c + l1 * b1c + l2 * b2c;
 
-                    let row_base = py * out_w + px0;
+                    let row_base = (py - band_y0) * out_w + px0;
                     let x_start = k_lo as usize;
                     let x_end = k_hi as usize;
                     for k_px in x_start..=x_end {
@@ -1079,7 +1650,9 @@ fn raster_poly(
                             let inv_rw = 1.0 / rw;
                             let s = s_acc * inv_rw;
                             let t = t_acc * inv_rw;
-                            if let Some((tc, ta)) = sample_tex_cached(tex_cache, &tex, s, t) {
+                            if let Some((tc, ta)) =
+                                sample_tex_cached(tex_cache, &mut f5_cache, &tex, s, t)
+                            {
                                 if !has_tex_alpha || ta >= 31 {
                                     let rgb15 = if flat_white {
                                         tc
@@ -1149,7 +1722,7 @@ fn raster_poly(
                 let mut s_acc = l0 * s0 + l1 * s1 + l2 * s2;
                 let mut t_acc = l0 * t0 + l1 * t1 + l2 * t2;
 
-                let row_base = py * out_w;
+                let row_base = (py - band_y0) * out_w;
                 let x_start = px0 + k_lo as usize;
                 let x_end = px0 + k_hi as usize;
 
@@ -1209,7 +1782,7 @@ fn raster_poly(
                             if textured {
                                 let s = cur_s * inv_rw;
                                 let t = cur_t * inv_rw;
-                                match sample_tex_cached(tex_cache, &tex, s, t) {
+                                match sample_tex_cached(tex_cache, &mut f5_cache, &tex, s, t) {
                                     None => (v_rgb, poly_alpha),
                                     Some((tc, ta)) if ta >= 31 => (tc, poly_alpha),
                                     Some((tc, ta)) => {
@@ -1243,7 +1816,8 @@ fn raster_poly(
                                 if textured {
                                     let s = cur_s * inv_rw;
                                     let t = cur_t * inv_rw;
-                                    let Some((tc, ta)) = sample_tex_cached(tex_cache, &tex, s, t)
+                                    let Some((tc, ta)) =
+                                        sample_tex_cached(tex_cache, &mut f5_cache, &tex, s, t)
                                     else {
                                         continue;
                                     };
@@ -1265,7 +1839,8 @@ fn raster_poly(
                                 let (base_r, base_g, base_b, ta) = if textured {
                                     let s = cur_s * inv_rw;
                                     let t = cur_t * inv_rw;
-                                    let Some((tc, ta)) = sample_tex_cached(tex_cache, &tex, s, t)
+                                    let Some((tc, ta)) =
+                                        sample_tex_cached(tex_cache, &mut f5_cache, &tex, s, t)
                                     else {
                                         continue;
                                     };
@@ -1290,7 +1865,7 @@ fn raster_poly(
                             if textured {
                                 let s = cur_s * inv_rw;
                                 let t = cur_t * inv_rw;
-                                match sample_tex_cached(tex_cache, &tex, s, t) {
+                                match sample_tex_cached(tex_cache, &mut f5_cache, &tex, s, t) {
                                     None => {
                                         if dbg {
                                             eprintln!(
@@ -1550,5 +2125,153 @@ mod tests {
         m.vramcnt[5] = 0x81;
         m.rebuild_vram_lut();
         assert_eq!(sample_tex(&m, &tex, 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn multiband_rasterization_matches_single_band_for_overlapping_format5_and_translucent_polys() {
+        let mut m = Machine::new();
+        m.vramcnt[0] = 0x83 | (0 << 3); // Slot 0 texture
+        m.vramcnt[1] = 0x83 | (1 << 3); // Slot 1 Format-5 index
+        m.vramcnt[4] = 0x83; // Palette
+        m.rebuild_vram_lut();
+
+        // Populate Format-5 4x4 block texture + palette
+        let pal = [31u16, 31 << 5, 31 << 10, 0x7FFF];
+        for (idx, &c) in pal.iter().enumerate() {
+            m.vram[4][idx * 2..idx * 2 + 2].copy_from_slice(&c.to_le_bytes());
+        }
+        for b in 0..16usize {
+            m.vram[0][b] = 0xE4;
+        }
+        for i in 0..4usize {
+            m.vram[1][i * 2..i * 2 + 2].copy_from_slice(&0x8000u16.to_le_bytes());
+        }
+
+        // Build 40 overlapping quads (>24 threshold) spanning all vertical bands:
+        // mix of opaque white-vertex Format-5, depth_equal overlay, and Pass-1 translucent quads.
+        m.gx.disp_verts.clear();
+        m.gx.disp_polys.clear();
+        for i in 0..40usize {
+            let base_v = m.gx.disp_verts.len() as u16;
+            let row = (i / 5) as i32;
+            let col = (i % 5) as i32;
+            let x0 = -0xE00 + col * 0x480;
+            let x1 = x0 + 0x700;
+            let y1 = 0xE00 - row * 0x360;
+            let y0 = y1 - 0x600;
+            let z = -0x800 + (i as i32) * 0x40;
+            let w0 = 0x1000 + ((i % 4) as i32) * 0x180;
+            let w1 = 0x1200 + ((i % 3) as i32) * 0x200;
+            let vcolor = if i % 4 == 0 {
+                0x7FFF // triggers white-vertex fast span path
+            } else {
+                ((i as u16 * 7) & 0x1F)
+                    | (((i as u16 * 11) & 0x1F) << 5)
+                    | (((i as u16 * 13) & 0x1F) << 10)
+            };
+            m.gx.disp_verts.push(Vertex {
+                clip: [x0, y1, z, w0],
+                color: vcolor,
+                tex: [0, 0],
+            });
+            m.gx.disp_verts.push(Vertex {
+                clip: [x1, y1, z, w1],
+                color: vcolor,
+                tex: [8 << 4, 0],
+            });
+            m.gx.disp_verts.push(Vertex {
+                clip: [x1, y0, z, w1],
+                color: vcolor,
+                tex: [8 << 4, 8 << 4],
+            });
+            m.gx.disp_verts.push(Vertex {
+                clip: [x0, y0, z, w0],
+                color: vcolor,
+                tex: [0, 8 << 4],
+            });
+
+            let (attr, texparam) = if i % 7 == 0 {
+                // Translucent Pass 1 quad (alpha = 16)
+                ((3 << 6) | (16 << 16) | (((i as u32) & 0x3F) << 24), 5 << 26)
+            } else if i % 5 == 0 {
+                // depth_equal opaque overlay
+                ((3 << 6) | (1 << 14) | (31 << 16), 5 << 26)
+            } else {
+                // Standard opaque Format-5 textured quad
+                ((3 << 6) | (31 << 16), 5 << 26)
+            };
+            m.gx.disp_polys.push(Polygon {
+                attr,
+                texparam,
+                pltt: 0,
+                verts: [base_v, base_v + 1, base_v + 2, base_v + 3],
+                nverts: 4,
+            });
+        }
+
+        for scale in [1usize, 2usize] {
+            let mut single = Render3dScratch::new();
+            let mut multi = Render3dScratch::new();
+            render_into_scaled_impl(&m, &mut single, scale, true);
+            render_into_scaled_impl(&m, &mut multi, scale, false);
+            assert_eq!(
+                single.fb, multi.fb,
+                "multi-band 3D output at {scale}x must match single-band bit-for-bit"
+            );
+            assert!(
+                multi.fb.iter().any(|&px| px != TRANSPARENT),
+                "scene at {scale}x must render visible pixels"
+            );
+        }
+    }
+
+    #[test]
+    fn box_test_culling_handles_visible_straddling_and_offscreen_boxes_conservatively() {
+        let mut gx = super::super::gpu3d::Gpu3d::new();
+        let run_box = |gx: &mut super::super::gpu3d::Gpu3d,
+                       x: i16,
+                       y: i16,
+                       z: i16,
+                       w: i16,
+                       h: i16,
+                       d: i16|
+         -> bool {
+            let p0 = (x as u16 as u32) | ((y as u16 as u32) << 16);
+            let p1 = (z as u16 as u32) | ((w as u16 as u32) << 16);
+            let p2 = (h as u16 as u32) | ((d as u16 as u32) << 16);
+            gx.write_port(0x70, p0);
+            gx.write_port(0x70, p1);
+            gx.write_port(0x70, p2);
+            (gx.gxstat_lo() & 2) != 0
+        };
+
+        // Identity clip matrix: clip = (x, y, z, 0x1000).
+        assert!(run_box(
+            &mut gx, -0x400, -0x400, -0x400, 0x800, 0x800, 0x800
+        ));
+        // Just outside frustum edge (x in [0x1020, 0x1080]) within 12.5% guard band -> kept visible.
+        assert!(run_box(&mut gx, 0x1020, 0, 0, 0x60, 0x100, 0x100));
+        // Clearly far off-screen to the right (x >= 0x2000 > 0x1200) -> culled.
+        assert!(!run_box(&mut gx, 0x2000, 0, 0, 0x400, 0x400, 0x400));
+
+        // Perspective-like matrix where clip.w = -z (row 2 col 3 = -1.0, row 3 col 3 = 0).
+        // Column-major 4x4 fixed 20.12: m[11] = -0x1000, m[15] = 0.
+        gx.write_port(0x10, 0); // MTX_MODE = PROJ
+        let mut persp = [0i32; 16];
+        persp[0] = 0x1000;
+        persp[5] = 0x1000;
+        persp[10] = -0x1000;
+        persp[11] = -0x1000; // w = -z
+        for word in persp {
+            gx.write_port(0x16, word as u32);
+        }
+        // Strictly behind camera (z in [+0x400, +0x800] -> w <= -0x400) -> culled.
+        assert!(!run_box(
+            &mut gx, -0x200, -0x200, 0x400, 0x400, 0x400, 0x400
+        ));
+        // Straddling camera near plane (z in [-0x400, +0x400] -> mixed w) -> conservatively visible.
+        assert!(run_box(
+            &mut gx, -0x200, -0x200, -0x400, 0x400, 0x400, 0x800
+        ));
     }
 }

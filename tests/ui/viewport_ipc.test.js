@@ -213,3 +213,42 @@ test("resampleInterleavedStereo converts sample rates cleanly while preserving s
   const empty = resampleInterleavedStereo(new Float32Array(0), 48000, 44100);
   assert.equal(empty.length, 0);
 });
+
+test("decodeViewportBinaryPacket decodes RGB565 views (flags & 0x10) and zero-view skip-render packets", () => {
+  // 2x2 RGB565: red (0xF800), green (0x07E0), blue (0x001F), white (0xFFFF)
+  const rgb565Bytes = new Uint8Array(8);
+  const dv = new DataView(rgb565Bytes.buffer);
+  dv.setUint16(0, 0xf800, true);
+  dv.setUint16(2, 0x07e0, true);
+  dv.setUint16(4, 0x001f, true);
+  dv.setUint16(6, 0xffff, true);
+
+  const pkt = buildZmfrPacket({
+    flags: 0x10,
+    frameNumber: 77,
+    views: [{ width: 2, height: 2, rgba: rgb565Bytes }],
+    pcmSamples: [0.25, -0.25],
+    meta: null
+  });
+
+  const decoded = decodeViewportBinaryPacket(pkt);
+  assert.equal(decoded.rgb565, true);
+  assert.equal(decoded.views.length, 1);
+  assert.equal(decoded.views[0].pixelFormat, "rgb565");
+  assert.ok(decoded.views[0].rgb565 instanceof Uint16Array);
+  assert.deepEqual(Array.from(decoded.views[0].rgb565), [0xf800, 0x07e0, 0x001f, 0xffff]);
+  assert.equal(decoded.pcmSamples.length, 2);
+
+  // Skip-render packet: viewCount = 0 with live PCM audio still present
+  const skipPkt = buildZmfrPacket({
+    flags: 0,
+    frameNumber: 78,
+    views: [],
+    pcmSamples: [0.5, -0.5, 0.25, -0.25],
+    meta: null
+  });
+  const decodedSkip = decodeViewportBinaryPacket(skipPkt);
+  assert.equal(decodedSkip.frameNumber, 78);
+  assert.equal(decodedSkip.views.length, 0);
+  assert.equal(decodedSkip.pcmSamples.length, 4);
+});

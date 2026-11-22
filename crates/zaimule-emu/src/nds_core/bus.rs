@@ -152,6 +152,7 @@ impl MachinePtr {
 /// One CPU's view of the machine. The two views share `Machine` and differ
 /// in memory map, I/O block, and interrupt state.
 pub trait Bus {
+    const IS_ARM9: bool;
     fn read8(&mut self, a: u32) -> u8;
     fn read16(&mut self, a: u32) -> u16;
     fn read32(&mut self, a: u32) -> u32;
@@ -179,6 +180,22 @@ pub trait Bus {
     fn fetch32(&mut self, pc: u32) -> u32 {
         self.read32(pc)
     }
+    /// Returns `(page_idx, page_gen, page_base_ptr, offset_in_page)` when `pc` lies in a cacheable
+    /// 4 KiB RAM code page (Main RAM, ARM9 ITCM, or ARM7 WRAM7) without DTCM/debug-hook aliasing.
+    #[inline(always)]
+    fn code_page_info(&self, _pc: u32) -> Option<(u16, u32, *const u8, usize)> {
+        None
+    }
+    /// Marks a 4 KiB RAM page as containing cached decoded instructions so writes invalidate it.
+    #[inline(always)]
+    fn mark_code_page(&mut self, _page_idx: u16) {}
+    /// Reads the current invalidation generation for `page_idx`.
+    #[inline(always)]
+    fn code_page_gen(&self, _page_idx: u16) -> u32 {
+        0
+    }
+    /// Refreshes cached raw memory pointers after savestate restoration.
+    fn refresh_ptrs(&mut self) {}
     /// Address of the BIOS interrupt-flag mirror word games' IRQ handlers
     /// update (top of DTCM on the ARM9, top of ARM7 WRAM on the ARM7).
     fn bios_flag_addr(&mut self) -> u32;
@@ -520,6 +537,29 @@ pub struct Machine {
     /// 16 KiB chunk (`0..8`) with `MST = 3` (`0x83`), preserved across temporary LCDC uploads.
     #[serde(skip)]
     pub last_pal_chunk: [Option<(u8, u8)>; 8],
+    /// 4 KiB RAM page flags indicating whether any CPU block cache currently holds decoded code
+    /// from that page (`0..1024` Main RAM, `1024..1032` ITCM, `1032..1048` WRAM7). Skipped in savestates.
+    #[serde(skip, default = "default_code_pages")]
+    pub code_pages: Box<[bool; CODE_PAGE_COUNT]>,
+    /// Monotonic generation counters per 4 KiB RAM page incremented on self-modifying/DMA writes.
+    #[serde(skip, default = "default_page_gen")]
+    pub page_gen: Box<[u32; CODE_PAGE_COUNT]>,
+    /// Fast guard indicating whether any ARM9 DMA channel is currently armed in HBlank trigger mode.
+    #[serde(skip)]
+    pub dma_hblank_armed: bool,
+}
+
+pub const CODE_PAGE_MAIN_BASE: usize = 0;
+pub const CODE_PAGE_ITCM_BASE: usize = 1024;
+pub const CODE_PAGE_WRAM7_BASE: usize = 1032;
+pub const CODE_PAGE_COUNT: usize = 1048;
+
+fn default_code_pages() -> Box<[bool; CODE_PAGE_COUNT]> {
+    Box::new([false; CODE_PAGE_COUNT])
+}
+
+fn default_page_gen() -> Box<[u32; CODE_PAGE_COUNT]> {
+    Box::new([1u32; CODE_PAGE_COUNT])
 }
 
 /// Two-point touchscreen ADC calibration derived from firmware user settings (`0x58..0x64`).
@@ -842,6 +882,9 @@ impl Machine {
             vram_lut_sig: [0; 9],
             last_tex_bank: [None; 4],
             last_pal_chunk: [None; 8],
+            code_pages: default_code_pages(),
+            page_gen: default_page_gen(),
+            dma_hblank_armed: false,
             wifi: vec![0; 0x1_0000],
             rtc_reg: 0,
             rtc_bit_n: 0,
@@ -859,6 +902,45 @@ impl Machine {
             last_pc: [0; 2],
             now: 0,
         }
+    }
+
+    #[inline(always)]
+    pub fn mark_code_write_page(&mut self, page: usize) {
+        if self.code_pages[page] {
+            self.page_gen[page] = self.page_gen[page].wrapping_add(1);
+            self.code_pages[page] = false;
+        }
+    }
+
+    #[inline]
+    pub fn mark_code_write_range(&mut self, base_page: usize, off: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let p0 = base_page + (off >> 12);
+        let p1 = base_page + ((off + len - 1) >> 12);
+        for p in p0..=p1 {
+            self.mark_code_write_page(p);
+        }
+    }
+
+    pub fn invalidate_all_code_pages(&mut self) {
+        for p in 0..CODE_PAGE_COUNT {
+            self.code_pages[p] = false;
+            self.page_gen[p] = self.page_gen[p].wrapping_add(1);
+        }
+    }
+
+    #[inline]
+    pub fn recompute_dma_hblank(&mut self) {
+        let mut armed = false;
+        for &cnt in &self.dma_cnt[0] {
+            if cnt & 0x8000_0000 != 0 && ((cnt >> 27) & 7) == 2 {
+                armed = true;
+                break;
+            }
+        }
+        self.dma_hblank_armed = armed;
     }
 
     /// Installs optional user-supplied `bios7.bin`, `bios9.bin`, and `firmware.bin` images.
@@ -1828,11 +1910,21 @@ impl Machine {
     }
 }
 
-pub struct View {
+pub struct View<const CPU: usize> {
     pub m: MachinePtr,
-    pub cpu: usize, // 0 = ARM9, 1 = ARM7
     pub in_dma: bool,
+    main_ram: *mut u8,
+    dtcm: *mut u8,
+    itcm: *mut u8,
+    wram7: *mut u8,
+    code_pages: *mut bool,
+    page_gen: *mut u32,
+    dtcm_base: u32,
+    debug_hooks: bool,
 }
+
+// SAFETY: `View` only points into the `MachineHandle` owned alongside it inside `NdsMachine`.
+unsafe impl<const CPU: usize> Send for View<CPU> {}
 
 /// Normalized DMA trigger kinds.
 pub const DMA_IMM: u8 = 0;
@@ -1840,10 +1932,52 @@ pub const DMA_VBLANK: u8 = 1;
 pub const DMA_CART: u8 = 2;
 pub const DMA_HBLANK: u8 = 4;
 
-impl View {
+impl<const CPU: usize> View<CPU> {
+    pub fn new(m: MachinePtr) -> Self {
+        let mut view = Self {
+            m,
+            in_dma: false,
+            main_ram: std::ptr::null_mut(),
+            dtcm: std::ptr::null_mut(),
+            itcm: std::ptr::null_mut(),
+            wram7: std::ptr::null_mut(),
+            code_pages: std::ptr::null_mut(),
+            page_gen: std::ptr::null_mut(),
+            dtcm_base: 0x0080_0000,
+            debug_hooks: false,
+        };
+        view.refresh_cached_ptrs();
+        view
+    }
+
+    pub fn refresh_cached_ptrs(&mut self) {
+        let mut mm = self.m.borrow_mut();
+        self.main_ram = mm.main_ram.as_mut_ptr();
+        self.dtcm = mm.dtcm.as_mut_ptr();
+        self.itcm = mm.itcm.as_mut_ptr();
+        self.wram7 = mm.wram7.as_mut_ptr();
+        self.code_pages = mm.code_pages.as_mut_ptr();
+        self.page_gen = mm.page_gen.as_mut_ptr();
+        self.dtcm_base = mm.dtcm_base;
+        self.debug_hooks = mm.debug_hooks;
+    }
+
+    #[inline(always)]
+    fn invalidate_code_page_ptr(&mut self, page: usize) {
+        // SAFETY: `page < CODE_PAGE_COUNT` for all masked RAM/ITCM/WRAM7 page indices.
+        unsafe {
+            if *self.code_pages.add(page) {
+                let g = self.page_gen.add(page);
+                *g = (*g).wrapping_add(1);
+                *self.code_pages.add(page) = false;
+            }
+        }
+    }
+
+    #[inline(always)]
     fn chan_mode(&self, cnt: u32) -> u8 {
         let cnt_h = (cnt >> 16) as u16;
-        if self.cpu == 0 {
+        if CPU == 0 {
             match cnt_h >> 11 & 7 {
                 0 => DMA_IMM,
                 1 => DMA_VBLANK,
@@ -1871,15 +2005,28 @@ impl View {
         if self.in_dma {
             return;
         }
+        let (cnts, cart_ready) = {
+            let m = self.m.borrow();
+            if kind == DMA_HBLANK && (CPU != 0 || !m.dma_hblank_armed) {
+                return;
+            }
+            (m.dma_cnt[CPU], m.romctrl & 0x8000_0000 != 0)
+        };
+        if (cnts[0] | cnts[1] | cnts[2] | cnts[3]) & 0x8000_0000 == 0 {
+            return;
+        }
+        if kind == DMA_CART && !cart_ready {
+            return;
+        }
         for ch in 0..4 {
-            let (cnt, cart_ready) = {
+            let cnt = {
                 let m = self.m.borrow();
-                (m.dma_cnt[self.cpu][ch], m.romctrl & 0x8000_0000 != 0)
+                m.dma_cnt[CPU][ch]
             };
             if cnt & 0x8000_0000 == 0 || self.chan_mode(cnt) != kind {
                 continue;
             }
-            if kind == DMA_CART && !cart_ready {
+            if kind == DMA_CART && (self.m.borrow().romctrl & 0x8000_0000 == 0) {
                 continue;
             }
             self.in_dma = true;
@@ -1889,7 +2036,7 @@ impl View {
     }
 
     fn dma_exec(&mut self, ch: usize, kind: u8) {
-        let cpu = self.cpu;
+        let cpu = CPU;
         let (mut src, mut dst, cnt) = {
             let m = self.m.borrow();
             (m.dma_src[cpu][ch], m.dma_dst[cpu][ch], m.dma_cnt[cpu][ch])
@@ -1930,6 +2077,7 @@ impl View {
                 let ca = m.cart_addr;
                 let Machine { rom, main_ram, .. } = &mut *m;
                 main_ram[dst_off..dst_off + byte_len].copy_from_slice(&rom[ca..ca + byte_len]);
+                m.mark_code_write_range(CODE_PAGE_MAIN_BASE, dst_off, byte_len);
                 m.cart_addr = (ca & !0xFFF) | ((ca + byte_len) & 0xFFF);
                 m.cart_left = 0;
                 m.romctrl &= !0x8080_0000;
@@ -2030,6 +2178,9 @@ impl View {
         let repeat = cnt_h & 0x0200 != 0 && kind != DMA_IMM;
         if !repeat {
             m.dma_cnt[cpu][ch] &= !0x8000_0000;
+            if CPU == 0 {
+                m.recompute_dma_hblank();
+            }
         }
     }
 
@@ -2060,6 +2211,7 @@ impl View {
                     }
                     if doff <= so || doff >= so + byte_len {
                         m.main_ram.copy_within(so..so + byte_len, doff);
+                        m.mark_code_write_range(CODE_PAGE_MAIN_BASE, doff, byte_len);
                         return true;
                     }
                 }
@@ -2117,12 +2269,14 @@ impl View {
         {
             return false;
         }
+        let mut main_ram_write: Option<usize> = None;
         let target: &mut [u8] = match dst >> 24 {
             0x02 => {
                 let doff = (dst & 0x3F_FFFF) as usize;
                 if doff + byte_len > m.main_ram.len() {
                     return false;
                 }
+                main_ram_write = Some(doff);
                 &mut m.main_ram[doff..doff + byte_len]
             }
             0x05 if cpu == 0 => {
@@ -2167,14 +2321,17 @@ impl View {
                 chunk.copy_from_slice(&pat);
             }
         }
+        if let Some(doff) = main_ram_write {
+            m.mark_code_write_range(CODE_PAGE_MAIN_BASE, doff, byte_len);
+        }
         true
     }
 }
 
-impl View {
+impl<const CPU: usize> View<CPU> {
     fn io_read16(&mut self, a: u32) -> u16 {
         let mut m = self.m.borrow_mut();
-        let cpu = self.cpu;
+        let cpu = CPU;
         let off = a & 0xFFFF;
         if let Some(log) = m.io_log.as_mut() {
             *log.entry((cpu, off, false)).or_insert(0) += 1;
@@ -2325,7 +2482,7 @@ impl View {
 
     fn io_write16(&mut self, a: u32, v: u16) {
         let mut m = self.m.borrow_mut();
-        let cpu = self.cpu;
+        let cpu = CPU;
         let off = a & 0xFFFF;
         if let Some(log) = m.io_log.as_mut() {
             *log.entry((cpu, off, true)).or_insert(0) += 1;
@@ -2478,6 +2635,9 @@ impl View {
                             m.dma_src[cpu][ch] = m.dma_sad[cpu][ch];
                             m.dma_dst[cpu][ch] = m.dma_dad[cpu][ch];
                         }
+                        if CPU == 0 {
+                            m.recompute_dma_hblank();
+                        }
                     }
                 }
             }
@@ -2550,13 +2710,12 @@ impl View {
         }
         if a & 0xFF_FFFF == 0x10_0010 {
             // Cartridge data window.
-            let cpu = self.cpu;
-            return self.m.borrow_mut().cart_read_word(cpu);
+            return self.m.borrow_mut().cart_read_word(CPU);
         }
         if a & 0xFF_FFFF == 0x10_0000 {
             // IPCFIFORECV
             let mut m = self.m.borrow_mut();
-            let cpu = self.cpu;
+            let cpu = CPU;
             let enabled = m.ipcfifocnt[cpu] & 0x8000 != 0;
             let (recv, last) = if cpu == 0 {
                 (&mut m.fifo_to9, 0)
@@ -2595,8 +2754,7 @@ impl View {
                 }
                 v
             } else {
-                let cpu = self.cpu;
-                m.ipcfifocnt[cpu] |= 0x4000; // error: read on empty
+                m.ipcfifocnt[CPU] |= 0x4000; // error: read on empty
                 m.fifo_last[last]
             }
         } else {
@@ -2612,15 +2770,14 @@ impl View {
                 let mut m = self.m.borrow_mut();
                 m.romctrl = v & !0x0080_0000;
                 if v & 0x8000_0000 != 0 {
-                    let cpu = self.cpu;
-                    m.cart_start(cpu);
+                    m.cart_start(CPU);
                 }
             }
             // Geometry engine: GXFIFO packed port at 0x400 (mirrored to
             // 0x43F) and per-command register ports at 0x440-0x5FF where
             // cmd = (addr >> 2) & 0x7F. Executes instantly; gx_cmds stays as
             // the NDS_VIDLOG diagnostic counter.
-            off @ 0x0400..=0x05FF if self.cpu == 0 => {
+            off @ 0x0400..=0x05FF if CPU == 0 => {
                 let mut m = self.m.borrow_mut();
                 m.gx_cmds += 1;
                 if off < 0x0440 {
@@ -2638,7 +2795,7 @@ impl View {
             0x0188 => {
                 // IPCFIFOSEND
                 let mut m = self.m.borrow_mut();
-                let cpu = self.cpu;
+                let cpu = CPU;
                 if m.io_log.is_some() {
                     static COUNT: std::sync::atomic::AtomicU32 =
                         std::sync::atomic::AtomicU32::new(0);
@@ -2669,43 +2826,40 @@ impl View {
                 }
             }
             0x0208 => {
-                let cpu = self.cpu;
-                self.m.borrow_mut().ime[cpu] = v & 1 != 0;
+                self.m.borrow_mut().ime[CPU] = v & 1 != 0;
             }
             0x0210 => {
-                let cpu = self.cpu;
-                self.m.borrow_mut().ie[cpu] = v;
+                self.m.borrow_mut().ie[CPU] = v;
             }
             0x0214 => {
-                let cpu = self.cpu;
-                self.m.borrow_mut().if_[cpu] &= !v;
+                self.m.borrow_mut().if_[CPU] &= !v;
             }
-            0x0290 if self.cpu == 0 => {
+            0x0290 if CPU == 0 => {
                 let mut m = self.m.borrow_mut();
                 m.div_num = (m.div_num & 0xFFFF_FFFF_0000_0000) | v as u64;
                 m.div_execute();
             }
-            0x0294 if self.cpu == 0 => {
+            0x0294 if CPU == 0 => {
                 let mut m = self.m.borrow_mut();
                 m.div_num = (m.div_num & 0xFFFF_FFFF) | (v as u64) << 32;
                 m.div_execute();
             }
-            0x0298 if self.cpu == 0 => {
+            0x0298 if CPU == 0 => {
                 let mut m = self.m.borrow_mut();
                 m.div_den = (m.div_den & 0xFFFF_FFFF_0000_0000) | v as u64;
                 m.div_execute();
             }
-            0x029C if self.cpu == 0 => {
+            0x029C if CPU == 0 => {
                 let mut m = self.m.borrow_mut();
                 m.div_den = (m.div_den & 0xFFFF_FFFF) | (v as u64) << 32;
                 m.div_execute();
             }
-            0x02B8 if self.cpu == 0 => {
+            0x02B8 if CPU == 0 => {
                 let mut m = self.m.borrow_mut();
                 m.sqrt_param = (m.sqrt_param & 0xFFFF_FFFF_0000_0000) | v as u64;
                 m.sqrt_execute();
             }
-            0x02BC if self.cpu == 0 => {
+            0x02BC if CPU == 0 => {
                 let mut m = self.m.borrow_mut();
                 m.sqrt_param = (m.sqrt_param & 0xFFFF_FFFF) | (v as u64) << 32;
                 m.sqrt_execute();
@@ -2730,12 +2884,49 @@ impl View {
     /// Bypassed entirely while NDS_WATCH is set, so the watch tool still sees
     /// every access.
     #[inline(always)]
+    unsafe fn ptr_read<const BYTES: usize>(base: *const u8, off: usize) -> u32 {
+        match BYTES {
+            4 => u32::from_le(std::ptr::read_unaligned(base.add(off) as *const u32)),
+            2 => u16::from_le(std::ptr::read_unaligned(base.add(off) as *const u16)) as u32,
+            _ => *base.add(off) as u32,
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn ptr_write<const BYTES: usize>(base: *mut u8, off: usize, v: u32) {
+        match BYTES {
+            4 => std::ptr::write_unaligned(base.add(off) as *mut u32, v.to_le()),
+            2 => std::ptr::write_unaligned(base.add(off) as *mut u16, (v as u16).to_le()),
+            _ => *base.add(off) = v as u8,
+        }
+    }
+
+    #[inline(always)]
     fn fast_read<const BYTES: usize>(&self, a: u32) -> Option<u32> {
-        let m = self.m.borrow();
-        if m.debug_hooks {
+        if self.debug_hooks {
             return None;
         }
-        let cpu = self.cpu;
+        // SAFETY: `a` is `BYTES`-aligned; all linear RAM buffers are power-of-two multiples >= 16 KiB
+        // and `self.dtcm_base` is 4 KiB-aligned, so `off + BYTES` is strictly within bounds.
+        if CPU == 0 {
+            let dtcm_off = a.wrapping_sub(self.dtcm_base);
+            if dtcm_off < 0x4000 {
+                return Some(unsafe { Self::ptr_read::<BYTES>(self.dtcm, dtcm_off as usize) });
+            }
+            if a < 0x0200_0000 {
+                return Some(unsafe { Self::ptr_read::<BYTES>(self.itcm, (a & 0x7FFF) as usize) });
+            }
+        }
+        let region = a >> 24;
+        if region == 0x02 {
+            return Some(unsafe {
+                Self::ptr_read::<BYTES>(self.main_ram, (a & 0x3F_FFFF) as usize)
+            });
+        }
+        if CPU == 1 && region == 0x03 && a >= 0x0380_0000 {
+            return Some(unsafe { Self::ptr_read::<BYTES>(self.wram7, (a & 0xFFFF) as usize) });
+        }
+        let m = self.m.borrow();
         let get = |buf: &[u8], off: usize| -> Option<u32> {
             let slice = buf.get(off..off + BYTES)?;
             Some(match BYTES {
@@ -2744,31 +2935,15 @@ impl View {
                 _ => slice[0] as u32,
             })
         };
-        if cpu == 0 {
-            let dtcm_off = a.wrapping_sub(m.dtcm_base);
-            if dtcm_off < 0x4000 {
-                return get(&m.dtcm, dtcm_off as usize);
-            }
-            if a < 0x0200_0000 {
-                return get(&m.itcm, (a & 0x7FFF) as usize);
-            }
-        }
-        match a >> 24 {
-            0x02 => get(&m.main_ram, (a & 0x3F_FFFF) as usize),
-            0x03 => {
-                if cpu == 1 && a >= 0x0380_0000 {
-                    get(&m.wram7, (a & 0xFFFF) as usize)
-                } else {
-                    match m.swram_off(cpu, a) {
-                        Some(off) => get(&m.swram, off),
-                        None if cpu == 1 => get(&m.wram7, (a & 0xFFFF) as usize),
-                        None => Some(0),
-                    }
-                }
-            }
-            0x05 if cpu == 0 => get(&m.pal, (a & 0x7FF) as usize),
+        match region {
+            0x03 => match m.swram_off(CPU, a) {
+                Some(off) => get(&m.swram, off),
+                None if CPU == 1 => get(&m.wram7, (a & 0xFFFF) as usize),
+                None => Some(0),
+            },
+            0x05 if CPU == 0 => get(&m.pal, (a & 0x7FF) as usize),
             0x06 => {
-                let slot = if cpu == 0 {
+                let slot = if CPU == 0 {
                     m.vram_slot(a)
                 } else {
                     m.vram_arm7_slot(a)
@@ -2778,7 +2953,7 @@ impl View {
                     None => Some(0),
                 }
             }
-            0x07 if cpu == 0 => get(&m.oam, (a & 0x7FF) as usize),
+            0x07 if CPU == 0 => get(&m.oam, (a & 0x7FF) as usize),
             _ => None,
         }
     }
@@ -2786,11 +2961,38 @@ impl View {
     /// Write counterpart of `fast_read`.
     #[inline(always)]
     fn fast_write<const BYTES: usize>(&mut self, a: u32, v: u32) -> bool {
-        let mut m = self.m.borrow_mut();
-        if m.debug_hooks {
+        if self.debug_hooks {
             return false;
         }
-        let cpu = self.cpu;
+        // SAFETY: `a` is `BYTES`-aligned; all linear RAM buffers are power-of-two multiples >= 16 KiB
+        // and `self.dtcm_base` is 4 KiB-aligned, so `off + BYTES` is strictly within bounds.
+        if CPU == 0 {
+            let dtcm_off = a.wrapping_sub(self.dtcm_base);
+            if dtcm_off < 0x4000 {
+                unsafe { Self::ptr_write::<BYTES>(self.dtcm, dtcm_off as usize, v) };
+                return true;
+            }
+            if a < 0x0200_0000 {
+                let off = (a & 0x7FFF) as usize;
+                unsafe { Self::ptr_write::<BYTES>(self.itcm, off, v) };
+                self.invalidate_code_page_ptr(CODE_PAGE_ITCM_BASE + (off >> 12));
+                return true;
+            }
+        }
+        let region = a >> 24;
+        if region == 0x02 {
+            let off = (a & 0x3F_FFFF) as usize;
+            unsafe { Self::ptr_write::<BYTES>(self.main_ram, off, v) };
+            self.invalidate_code_page_ptr(CODE_PAGE_MAIN_BASE + (off >> 12));
+            return true;
+        }
+        if CPU == 1 && region == 0x03 && a >= 0x0380_0000 {
+            let off = (a & 0xFFFF) as usize;
+            unsafe { Self::ptr_write::<BYTES>(self.wram7, off, v) };
+            self.invalidate_code_page_ptr(CODE_PAGE_WRAM7_BASE + (off >> 12));
+            return true;
+        }
+        let mut m = self.m.borrow_mut();
         let put = |buf: &mut [u8], off: usize| -> bool {
             let Some(slice) = buf.get_mut(off..off + BYTES) else {
                 return false;
@@ -2802,41 +3004,25 @@ impl View {
             }
             true
         };
-        if cpu == 0 {
-            let dtcm_off = a.wrapping_sub(m.dtcm_base);
-            if dtcm_off < 0x4000 {
-                return put(&mut m.dtcm, dtcm_off as usize);
-            }
-            if a < 0x0200_0000 {
-                return put(&mut m.itcm, (a & 0x7FFF) as usize);
-            }
-        }
-        match a >> 24 {
-            0x02 => {
-                let off = (a & 0x3F_FFFF) as usize;
-                put(&mut m.main_ram, off)
-            }
-            0x03 => {
-                if cpu == 1 && a >= 0x0380_0000 {
+        match region {
+            0x03 => match m.swram_off(CPU, a) {
+                Some(off) => put(&mut m.swram, off),
+                None if CPU == 1 => {
                     let off = (a & 0xFFFF) as usize;
-                    put(&mut m.wram7, off)
-                } else {
-                    match m.swram_off(cpu, a) {
-                        Some(off) => put(&mut m.swram, off),
-                        None if cpu == 1 => {
-                            let off = (a & 0xFFFF) as usize;
-                            put(&mut m.wram7, off)
-                        }
-                        None => true,
+                    let ok = put(&mut m.wram7, off);
+                    if ok {
+                        m.mark_code_write_page(CODE_PAGE_WRAM7_BASE + (off >> 12));
                     }
+                    ok
                 }
-            }
-            0x05 if cpu == 0 => {
+                None => true,
+            },
+            0x05 if CPU == 0 => {
                 let off = (a & 0x7FF) as usize;
                 put(&mut m.pal, off)
             }
             0x06 => {
-                let slot = if cpu == 0 {
+                let slot = if CPU == 0 {
                     m.vram_slot(a)
                 } else {
                     m.vram_arm7_slot(a)
@@ -2846,7 +3032,7 @@ impl View {
                     None => true,
                 }
             }
-            0x07 if cpu == 0 => {
+            0x07 if CPU == 0 => {
                 let off = (a & 0x7FF) as usize;
                 put(&mut m.oam, off)
             }
@@ -2968,7 +3154,7 @@ impl View {
     }
 
     fn mem_read8(&mut self, a: u32) -> u8 {
-        if a >> 16 == 0x027F && self.cpu == 1 {
+        if a >> 16 == 0x027F && CPU == 1 {
             let mut m = self.m.borrow_mut();
             if let Some(log) = m.io_log.as_mut() {
                 *log.entry((9, a & !3, false)).or_insert(0) += 1; // pseudo-cpu 9 = RAM watch
@@ -2981,13 +3167,13 @@ impl View {
                     "[t={}] watch READ {:#010X} by cpu{} pc={:#010X}",
                     m.now,
                     a,
-                    if self.cpu == 0 { 9 } else { 7 },
-                    m.last_pc[self.cpu]
+                    if CPU == 0 { 9 } else { 7 },
+                    m.last_pc[CPU]
                 );
             }
         }
         let m = self.m.borrow();
-        let cpu = self.cpu;
+        let cpu = CPU;
         if cpu == 0 {
             // TCMs first: they shadow everything else.
             if a >= m.dtcm_base && a < m.dtcm_base + 0x4000 {
@@ -3048,7 +3234,7 @@ impl View {
 
     fn mem_write8(&mut self, a: u32, v: u8) {
         let mut m = self.m.borrow_mut();
-        let cpu = self.cpu;
+        let cpu = CPU;
         if let Some((watch, len)) = *WATCH_ADDR {
             if a >= watch && a < watch + len {
                 eprintln!(
@@ -3070,18 +3256,29 @@ impl View {
             if a < 0x0200_0000 {
                 let off = (a & 0x7FFF) as usize;
                 m.itcm[off] = v;
+                m.mark_code_write_page(CODE_PAGE_ITCM_BASE + (off >> 12));
                 return;
             }
         }
         match a >> 24 {
-            0x02 => m.main_ram[(a & 0x3F_FFFF) as usize] = v,
+            0x02 => {
+                let off = (a & 0x3F_FFFF) as usize;
+                m.main_ram[off] = v;
+                m.mark_code_write_page(CODE_PAGE_MAIN_BASE + (off >> 12));
+            }
             0x03 => {
                 if cpu == 1 && a >= 0x0380_0000 {
-                    m.wram7[(a & 0xFFFF) as usize] = v;
+                    let off = (a & 0xFFFF) as usize;
+                    m.wram7[off] = v;
+                    m.mark_code_write_page(CODE_PAGE_WRAM7_BASE + (off >> 12));
                 } else {
                     match m.swram_off(cpu, a) {
                         Some(off) => m.swram[off] = v,
-                        None if cpu == 1 => m.wram7[(a & 0xFFFF) as usize] = v,
+                        None if cpu == 1 => {
+                            let off = (a & 0xFFFF) as usize;
+                            m.wram7[off] = v;
+                            m.mark_code_write_page(CODE_PAGE_WRAM7_BASE + (off >> 12));
+                        }
                         None => {}
                     }
                 }
@@ -3112,7 +3309,7 @@ impl View {
     }
 
     fn is_wifi(&self, a: u32) -> bool {
-        self.cpu == 1 && a >> 24 == 0x04 && a & 0x0080_0000 != 0
+        CPU == 1 && a >> 24 == 0x04 && a & 0x0080_0000 != 0
     }
 
     fn wifi_read16(&mut self, a: u32) -> u16 {
@@ -3158,7 +3355,9 @@ impl View {
     }
 }
 
-impl Bus for View {
+impl<const CPU: usize> Bus for View<CPU> {
+    const IS_ARM9: bool = CPU == 0;
+
     #[inline(always)]
     fn read8(&mut self, a: u32) -> u8 {
         if let Some(v) = self.fast_read::<1>(a) {
@@ -3214,21 +3413,17 @@ impl Bus for View {
     #[inline(always)]
     fn fetch16(&mut self, a: u32) -> u16 {
         let a = a & !1;
-        {
-            let m = self.m.borrow();
-            if !m.debug_hooks {
-                if a >> 24 == 0x02 && (self.cpu == 1 || a.wrapping_sub(m.dtcm_base) >= 0x4000) {
-                    let off = (a & 0x3F_FFFF) as usize;
-                    return u16::from_le_bytes([m.main_ram[off], m.main_ram[off + 1]]);
-                }
-                if self.cpu == 0 && a < 0x0200_0000 && a.wrapping_sub(m.dtcm_base) >= 0x4000 {
-                    let off = (a & 0x7FFF) as usize;
-                    return u16::from_le_bytes([m.itcm[off], m.itcm[off + 1]]);
-                }
-                if self.cpu == 1 && a >= 0x0380_0000 && a < 0x0400_0000 {
-                    let off = (a & 0xFFFF) as usize;
-                    return u16::from_le_bytes([m.wram7[off], m.wram7[off + 1]]);
-                }
+        if !self.debug_hooks {
+            if a >> 24 == 0x02 && (CPU == 1 || a.wrapping_sub(self.dtcm_base) >= 0x4000) {
+                return unsafe {
+                    Self::ptr_read::<2>(self.main_ram, (a & 0x3F_FFFF) as usize) as u16
+                };
+            }
+            if CPU == 0 && a < 0x0200_0000 && a.wrapping_sub(self.dtcm_base) >= 0x4000 {
+                return unsafe { Self::ptr_read::<2>(self.itcm, (a & 0x7FFF) as usize) as u16 };
+            }
+            if CPU == 1 && (0x0380_0000..0x0400_0000).contains(&a) {
+                return unsafe { Self::ptr_read::<2>(self.wram7, (a & 0xFFFF) as usize) as u16 };
             }
         }
         self.read16(a)
@@ -3237,91 +3432,128 @@ impl Bus for View {
     #[inline(always)]
     fn fetch32(&mut self, a: u32) -> u32 {
         let a = a & !3;
-        {
-            let m = self.m.borrow();
-            if !m.debug_hooks {
-                if a >> 24 == 0x02 && (self.cpu == 1 || a.wrapping_sub(m.dtcm_base) >= 0x4000) {
-                    let off = (a & 0x3F_FFFF) as usize;
-                    return u32::from_le_bytes([
-                        m.main_ram[off],
-                        m.main_ram[off + 1],
-                        m.main_ram[off + 2],
-                        m.main_ram[off + 3],
-                    ]);
-                }
-                if self.cpu == 0 && a < 0x0200_0000 && a.wrapping_sub(m.dtcm_base) >= 0x4000 {
-                    let off = (a & 0x7FFF) as usize;
-                    return u32::from_le_bytes([
-                        m.itcm[off],
-                        m.itcm[off + 1],
-                        m.itcm[off + 2],
-                        m.itcm[off + 3],
-                    ]);
-                }
-                if self.cpu == 1 && a >= 0x0380_0000 && a < 0x0400_0000 {
-                    let off = (a & 0xFFFF) as usize;
-                    return u32::from_le_bytes([
-                        m.wram7[off],
-                        m.wram7[off + 1],
-                        m.wram7[off + 2],
-                        m.wram7[off + 3],
-                    ]);
-                }
+        if !self.debug_hooks {
+            if a >> 24 == 0x02 && (CPU == 1 || a.wrapping_sub(self.dtcm_base) >= 0x4000) {
+                return unsafe { Self::ptr_read::<4>(self.main_ram, (a & 0x3F_FFFF) as usize) };
+            }
+            if CPU == 0 && a < 0x0200_0000 && a.wrapping_sub(self.dtcm_base) >= 0x4000 {
+                return unsafe { Self::ptr_read::<4>(self.itcm, (a & 0x7FFF) as usize) };
+            }
+            if CPU == 1 && (0x0380_0000..0x0400_0000).contains(&a) {
+                return unsafe { Self::ptr_read::<4>(self.wram7, (a & 0xFFFF) as usize) };
             }
         }
         self.read32(a)
     }
 
     #[inline(always)]
+    fn code_page_info(&self, pc: u32) -> Option<(u16, u32, *const u8, usize)> {
+        if self.debug_hooks {
+            return None;
+        }
+        if CPU == 0 && pc.wrapping_sub(self.dtcm_base) < 0x4000 {
+            return None;
+        }
+        if pc >> 24 == 0x02 {
+            let off = (pc & 0x3F_FFFF) as usize;
+            let page = CODE_PAGE_MAIN_BASE + (off >> 12);
+            // SAFETY: `page < CODE_PAGE_COUNT` and `(off & !0xFFF) + 0x1000 <= 0x40_0000`.
+            let (gen, base) =
+                unsafe { (*self.page_gen.add(page), self.main_ram.add(off & !0xFFF)) };
+            return Some((page as u16, gen, base, off & 0xFFF));
+        }
+        if CPU == 0 && pc < 0x0200_0000 {
+            let off = (pc & 0x7FFF) as usize;
+            let page = CODE_PAGE_ITCM_BASE + (off >> 12);
+            let (gen, base) = unsafe { (*self.page_gen.add(page), self.itcm.add(off & !0xFFF)) };
+            return Some((page as u16, gen, base, off & 0xFFF));
+        }
+        if CPU == 1 && (0x0380_0000..0x0400_0000).contains(&pc) {
+            let off = (pc & 0xFFFF) as usize;
+            let page = CODE_PAGE_WRAM7_BASE + (off >> 12);
+            let (gen, base) = unsafe { (*self.page_gen.add(page), self.wram7.add(off & !0xFFF)) };
+            return Some((page as u16, gen, base, off & 0xFFF));
+        }
+        None
+    }
+
+    #[inline(always)]
+    fn mark_code_page(&mut self, page_idx: u16) {
+        let page = page_idx as usize;
+        if page < CODE_PAGE_COUNT {
+            // SAFETY: bounds checked above.
+            unsafe {
+                *self.code_pages.add(page) = true;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn code_page_gen(&self, page_idx: u16) -> u32 {
+        let page = page_idx as usize;
+        if page < CODE_PAGE_COUNT {
+            // SAFETY: bounds checked above.
+            unsafe { *self.page_gen.add(page) }
+        } else {
+            0
+        }
+    }
+
+    fn refresh_ptrs(&mut self) {
+        self.refresh_cached_ptrs();
+    }
+
+    #[inline(always)]
     fn irq_pending(&mut self) -> bool {
         let m = self.m.borrow();
-        m.ie[self.cpu] & m.if_[self.cpu] != 0
+        m.ie[CPU] & m.if_[CPU] != 0
     }
 
     #[inline(always)]
     fn ime(&mut self) -> bool {
-        self.m.borrow().ime[self.cpu]
+        self.m.borrow().ime[CPU]
     }
 
     #[inline(always)]
     fn set_ime(&mut self, on: bool) {
-        let cpu = self.cpu;
-        self.m.borrow_mut().ime[cpu] = on;
+        self.m.borrow_mut().ime[CPU] = on;
     }
 
     #[inline(always)]
     fn irq_takeable(&mut self) -> bool {
         let m = self.m.borrow();
-        m.ime[self.cpu] && (m.ie[self.cpu] & m.if_[self.cpu]) != 0
+        m.ime[CPU] && (m.ie[CPU] & m.if_[CPU]) != 0
     }
 
     #[inline(always)]
     fn has_debug_hooks(&self) -> bool {
-        self.m.borrow().debug_hooks
+        self.debug_hooks
     }
 
     #[inline(always)]
     fn note_pc(&mut self, pc: u32) {
-        if !self.m.borrow().debug_hooks {
+        if !self.debug_hooks {
             return;
         }
-        let cpu = self.cpu;
-        self.m.borrow_mut().last_pc[cpu] = pc;
+        self.m.borrow_mut().last_pc[CPU] = pc;
     }
 
     fn bios_flag_addr(&mut self) -> u32 {
-        if self.cpu == 0 {
-            self.m.borrow().dtcm_base + 0x3FF8
+        if CPU == 0 {
+            self.dtcm_base + 0x3FF8
         } else {
             0x0380_FFF8
         }
     }
 
     fn set_dtcm(&mut self, base: u32) {
+        let aligned = base & 0xFFFF_F000;
+        self.dtcm_base = aligned;
         let mut m = self.m.borrow_mut();
-        m.dtcm_base = base;
+        m.dtcm_base = aligned;
+        m.invalidate_all_code_pages();
         // Re-point the IRQ stub's handler literal at the new DTCM top.
-        let lit = base.wrapping_add(0x4000);
+        let lit = aligned.wrapping_add(0x4000);
         m.stub9[0x30..0x34].copy_from_slice(&lit.to_le_bytes());
     }
 }

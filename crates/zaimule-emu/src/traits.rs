@@ -154,6 +154,25 @@ pub trait EmulatorBackend: Send {
     fn rgba_frame(&self) -> (u16, u16, &[u8]) {
         (0, 0, &[])
     }
+    /// Appends the latest frame packed as little-endian RGB565 bytes (`width * height * 2`)
+    /// into `dst`, returning `(width, height)`.
+    fn encode_rgb565_into(&self, dst: &mut Vec<u8>) -> (u16, u16) {
+        let (w, h, rgba) = self.rgba_frame();
+        dst.reserve((usize::from(w) * usize::from(h)) * 2);
+        for px in rgba.as_chunks::<4>().0 {
+            let r5 = u16::from(px[0] >> 3);
+            let g6 = u16::from(px[1] >> 2);
+            let b5 = u16::from(px[2] >> 3);
+            dst.extend_from_slice(&((r5 << 11) | (g6 << 5) | b5).to_le_bytes());
+        }
+        (w, h)
+    }
+    /// Captures an uncompressed raw NDS savestate payload for asynchronous background RLE+CRC32
+    /// rewind compression. Returns `Ok(None)` on lightweight cores (GB/GBC/GBA) that snapshot
+    /// synchronously in microseconds.
+    fn save_state_raw_for_rewind(&self) -> Result<Option<Vec<u8>>, String> {
+        Ok(None)
+    }
     fn save_state(&self) -> Result<Vec<u8>, String>;
     fn load_state(&mut self, data: &[u8]) -> Result<(), String>;
     fn sram(&self) -> &[u8];
@@ -161,6 +180,8 @@ pub trait EmulatorBackend: Send {
     fn exchange_serial_byte(&mut self, incoming: u8) -> u8;
     fn debug_snapshot(&self) -> CpuDebugSnapshot;
     fn apply_ram_cheat(&mut self, _addr: u16, _val: u8) {}
+    /// Applies a 32-bit Nintendo DS Action Replay cheat code (`[(w0, w1), ...]`) on NDS cores.
+    fn apply_nds_ar_cheat(&mut self, _ops: &[(u32, u32)]) {}
     fn read_ram_slice(&self) -> &[u8] {
         &[]
     }
