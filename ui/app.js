@@ -1,6 +1,8 @@
 import {
   filterCatalogEntries,
   computeConsoleCounts,
+  computeCollectionCounts,
+  formatGameSubtitle,
   sortCatalogEntries,
   formatPlaytime,
   formatFileSize,
@@ -222,6 +224,13 @@ function setAudioVolumePct(rawPct, persist = true) {
 let state = {
   activeGameId: "",
   catalog: [],
+  collections: [],
+  collectionFilter: "",
+  coverCache: new Map(),
+  isEditingMetadata: false,
+  autoRescanOnStartup: false,
+  cloudSyncDir: null,
+  lastCloudSyncReport: null,
   isEmulationRunning: false,
   currentFrame: 0,
   modLayers: [],
@@ -784,6 +793,7 @@ function getVisibleCatalog() {
       state.consoleFilter === "FAVORITES"
         ? "ALL"
         : state.consoleFilter,
+    collectionFilter: state.collectionFilter,
     onlyNativeRust: state.consoleFilter === "RUST_ONLY",
     onlyLinkReady: state.consoleFilter === "LINK_READY",
     onlyFavorites: state.consoleFilter === "FAVORITES",
@@ -1187,6 +1197,94 @@ function renderSidebarCounts() {
   setTxt("count-switch2", counts.SWITCH2);
   setTxt("count-rust", counts.RUST);
   setTxt("count-link", counts.LINK);
+  renderSidebarCollections();
+}
+
+function renderSidebarCollections() {
+  const container = document.getElementById("sidebar-collections-list");
+  if (!container) return;
+  const items = computeCollectionCounts(state.catalog, state.collections);
+  container.innerHTML = "";
+  if (items.length === 0) {
+    container.innerHTML = `<div class="sidebar-collections-empty">Aucune collection · cliquez sur + pour classer vos jeux</div>`;
+    return;
+  }
+
+  for (const item of items) {
+    const isActive =
+      Boolean(state.collectionFilter) &&
+      state.collectionFilter.toLowerCase() === item.name.toLowerCase();
+    const row = document.createElement("div");
+    row.className = "collection-nav-row";
+    row.innerHTML = `
+      <button class="console-btn collection-btn${isActive ? " active" : ""}" type="button" data-collection="${escapeHtml(item.name)}" title="Filtrer par ${escapeHtml(item.name)}">
+        <span class="console-btn-label">
+          <svg class="console-icon" viewBox="0 0 24 24">
+            <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z" />
+            <circle cx="7" cy="7" r="1.2" />
+          </svg>
+          <span class="collection-nav-label-text">${escapeHtml(item.name)}</span>
+        </span>
+        <span class="console-count mono">${item.count}</span>
+      </button>
+      <button class="collection-delete-btn" type="button" title="Supprimer la collection ${escapeHtml(item.name)}" aria-label="Supprimer la collection ${escapeHtml(item.name)}">✕</button>
+    `;
+
+    row.querySelector(".collection-btn")?.addEventListener("click", () => {
+      const same =
+        state.collectionFilter &&
+        state.collectionFilter.toLowerCase() === item.name.toLowerCase();
+      if (same) {
+        state.collectionFilter = "";
+        state.consoleFilter = "ALL";
+        document
+          .querySelectorAll(".sidebar-consoles .console-btn[data-console]")
+          .forEach((b) => b.classList.toggle("active", b.dataset.console === "ALL"));
+      } else {
+        state.collectionFilter = item.name;
+        state.consoleFilter = "ALL";
+        document
+          .querySelectorAll(".sidebar-consoles .console-btn[data-console]")
+          .forEach((b) => b.classList.remove("active"));
+      }
+      renderSidebarCollections();
+      renderCatalogGrid();
+    });
+
+    row.querySelector(".collection-delete-btn")?.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (
+        state.collectionFilter &&
+        state.collectionFilter.toLowerCase() === item.name.toLowerCase()
+      ) {
+        state.collectionFilter = "";
+        document
+          .querySelectorAll(".sidebar-consoles .console-btn[data-console]")
+          .forEach((b) => b.classList.toggle("active", b.dataset.console === "ALL"));
+      }
+      if (tauriInvoke) {
+        const boot = await invokeBackend("delete_collection", { name: item.name });
+        if (boot) {
+          applyBootstrap(boot);
+          showToast(`Collection « ${item.name} » supprimée.`, "info");
+        }
+      } else {
+        state.collections = state.collections.filter(
+          (c) => c.toLowerCase() !== item.name.toLowerCase()
+        );
+        for (const g of state.catalog) {
+          if (Array.isArray(g.collections)) {
+            g.collections = g.collections.filter(
+              (c) => c.toLowerCase() !== item.name.toLowerCase()
+            );
+          }
+        }
+        updateAllViews();
+      }
+    });
+
+    container.appendChild(row);
+  }
 }
 
 const EDITORIAL_COVER_PALETTE = {
@@ -1261,7 +1359,7 @@ function renderCatalogGrid() {
     } else {
       emptyEl.innerHTML = `
         <div class="empty-catalog-title">Aucun jeu ne correspond à votre recherche</div>
-        <div class="empty-catalog-desc">Modifiez votre filtre ou sélectionnez « Tous les jeux ».</div>
+        <div class="empty-catalog-desc">Modifiez votre filtre, collection ou sélectionnez « Tous les jeux ».</div>
       `;
     }
     grid.appendChild(emptyEl);
@@ -1277,6 +1375,17 @@ function renderCatalogGrid() {
       ? `<span class="core-tag mono core-external">${resolveTargetEngineForGame(game) === "fritchii" ? "FRITCHII" : "TORZU"}</span>`
       : "";
     const regionLabel = String(game.region || "").split("(")[0].trim();
+    const coverDataUrl = state.coverCache.get(game.id) || "";
+    const hasArtwork = Boolean(coverDataUrl);
+    const subtitle = formatGameSubtitle(game, consoleKey === "SWITCH2" ? "Switch 2" : consoleKey);
+    const gameCols = Array.isArray(game.collections) ? game.collections : [];
+    const tagsHtml =
+      gameCols.length > 0
+        ? `<div class="game-collection-dots">${gameCols
+            .slice(0, 2)
+            .map((c) => `<span class="game-collection-tag">${escapeHtml(c)}</span>`)
+            .join("")}${gameCols.length > 2 ? `<span class="game-collection-tag mono">+${gameCols.length - 2}</span>` : ""}</div>`
+        : "";
 
     const card = document.createElement("article");
     card.className = `game-card${game.id === state.activeGameId ? " selected" : ""}`;
@@ -1287,7 +1396,8 @@ function renderCatalogGrid() {
 
     card.innerHTML = `
       <div class="game-jacket-stage">
-        <div class="game-cover" style="--cover-bg: ${spec.bg};">
+        <div class="game-cover${hasArtwork ? " has-artwork" : ""}" style="--cover-bg: ${spec.bg};">
+          ${hasArtwork ? `<img class="cover-art-img" src="${coverDataUrl}" alt="" loading="lazy" />` : ""}
           <button class="game-fav-btn${game.favorite ? " active" : ""}" type="button" title="${game.favorite ? "Retirer des favoris" : "Ajouter aux favoris"}" aria-label="${game.favorite ? "Retirer" : "Ajouter"} ${escapeHtml(game.title)} ${game.favorite ? "des" : "aux"} favoris">${game.favorite ? "★" : "☆"}</button>
           <button class="game-remove-btn" type="button" title="Retirer de la bibliothèque" aria-label="Retirer ${escapeHtml(game.title)}">✕</button>
           ${
@@ -1299,7 +1409,7 @@ function renderCatalogGrid() {
             <span class="console-tag mono">${escapeHtml(consoleKey === "SWITCH2" ? "SWITCH 2" : consoleKey)}</span>
             ${switchBadge}
           </div>
-          <div class="cover-art-graphic" aria-hidden="true">${spec.svg}</div>
+          ${hasArtwork ? "" : `<div class="cover-art-graphic" aria-hidden="true">${spec.svg}</div>`}
           <span class="cover-action-prompt">Jouer</span>
           <div class="cover-bottom mono">
             <span>${escapeHtml(regionLabel || "Jeu")}</span>
@@ -1310,9 +1420,10 @@ function renderCatalogGrid() {
       <div class="game-body">
         <div class="game-title" title="${escapeHtml(game.title)}">${escapeHtml(game.title)}</div>
         <div class="game-meta">
-          <span>${escapeHtml(consoleKey === "SWITCH2" ? "Switch 2" : consoleKey)}</span>
+          <span>${escapeHtml(subtitle)}</span>
           <span class="mono">${escapeHtml(formatPlaytime(game.playtimeSeconds))}</span>
         </div>
+        ${tagsHtml}
       </div>
     `;
 
@@ -1333,6 +1444,7 @@ function renderCatalogGrid() {
       if (removingActive && state.isEmulationRunning) {
         stopEmulationPlayback();
       }
+      state.coverCache.delete(game.id);
       if (tauriInvoke) {
         const boot = await invokeBackend("remove_game_from_library", { gameId: game.id });
         if (boot) {
@@ -1353,6 +1465,9 @@ function renderCatalogGrid() {
         return selectGameInFlightPromise;
       }
       const alreadySelected = state.activeGameId === game.id;
+      if (!alreadySelected) {
+        state.isEditingMetadata = false;
+      }
       state.activeGameId = game.id;
       // Fast O(N) class toggle without destroying/recreating DOM nodes
       grid.querySelectorAll(".game-card").forEach((el) => {
@@ -1397,17 +1512,109 @@ function renderInspector() {
   const pathVal = document.getElementById("insp-path");
   const switchEngineRow = document.getElementById("insp-switch-engine-row");
   const switchEngineSel = document.getElementById("insp-switch-engine");
+  const coverPreviewEl = document.getElementById("insp-cover-preview");
+  const clearCoverBtn = document.getElementById("btn-insp-clear-cover");
+  const metaReadonlyEl = document.getElementById("insp-meta-readonly");
+  const metaFormEl = document.getElementById("insp-meta-form");
+  const metaDescEl = document.getElementById("insp-meta-desc");
+  const editMetaBtn = document.getElementById("btn-insp-edit-meta");
+  const chipsWrap = document.getElementById("insp-collections-chips");
 
   if (g) {
     const consoleKey = String(g.console || "").toUpperCase();
     const isSwitch = isSwitchGame(g);
     const targetEngine = resolveTargetEngineForGame(g);
+    const coverDataUrl = state.coverCache.get(g.id) || "";
 
     setText("insp-title", g.title);
     setText("insp-console", consoleKey === "SWITCH2" ? "SWITCH 2" : consoleKey);
     setText("insp-region", String(g.region || "—").split("(")[0].trim());
     setText("insp-playtime", formatPlaytime(g.playtimeSeconds));
     setText("active-emu-game", g.title);
+
+    if (coverPreviewEl) {
+      if (coverDataUrl) {
+        coverPreviewEl.innerHTML = `<img src="${coverDataUrl}" alt="Jaquette de ${escapeHtml(g.title)}" />`;
+      } else {
+        coverPreviewEl.innerHTML = `<div class="inspector-cover-placeholder mono">Aucune jaquette · cliquez sur Auto ou Image…</div>`;
+      }
+    }
+    if (clearCoverBtn) {
+      clearCoverBtn.style.display = coverDataUrl || g.coverPath ? "inline-flex" : "none";
+    }
+
+    setText("insp-meta-year", g.metadataReleaseYear || "—");
+    setText("insp-meta-genre", g.metadataGenre || "—");
+    setText("insp-meta-dev", g.metadataDeveloper || "—");
+    setText("insp-meta-pub", g.metadataPublisher || "—");
+    const idLabel = g.titleId ? `${g.titleId} · ${g.crc32Hex || "—"}` : g.crc32Hex || "—";
+    setText("insp-meta-id", idLabel);
+    if (metaDescEl) {
+      if (g.metadataDescription) {
+        metaDescEl.textContent = g.metadataDescription;
+        metaDescEl.style.display = "block";
+      } else {
+        metaDescEl.textContent = "";
+        metaDescEl.style.display = "none";
+      }
+    }
+
+    if (metaReadonlyEl && metaFormEl) {
+      metaReadonlyEl.style.display = state.isEditingMetadata ? "none" : "block";
+      metaFormEl.style.display = state.isEditingMetadata ? "flex" : "none";
+      if (editMetaBtn) {
+        editMetaBtn.textContent = state.isEditingMetadata ? "Fermer" : "Modifier";
+      }
+      if (state.isEditingMetadata) {
+        const setVal = (id, val) => {
+          const el = document.getElementById(id);
+          if (el && document.activeElement !== el) el.value = val || "";
+        };
+        setVal("meta-edit-title", g.title);
+        setVal("meta-edit-year", g.metadataReleaseYear);
+        setVal("meta-edit-genre", g.metadataGenre);
+        setVal("meta-edit-dev", g.metadataDeveloper);
+        setVal("meta-edit-pub", g.metadataPublisher);
+        setVal("meta-edit-desc", g.metadataDescription);
+      }
+    }
+
+    if (chipsWrap) {
+      chipsWrap.innerHTML = "";
+      const allCols = computeCollectionCounts(state.catalog, state.collections);
+      const gameCols = Array.isArray(g.collections) ? g.collections : [];
+      if (allCols.length === 0) {
+        chipsWrap.innerHTML = `<div class="empty-list-hint">Aucune collection créée. Ajoutez-en une ci-dessous.</div>`;
+      } else {
+        for (const col of allCols) {
+          const active = gameCols.some((c) => c.toLowerCase() === col.name.toLowerCase());
+          const chip = document.createElement("button");
+          chip.type = "button";
+          chip.className = `collection-chip${active ? " active" : ""}`;
+          chip.innerHTML = `<span>${active ? "✓" : "+"}</span><span>${escapeHtml(col.name)}</span>`;
+          chip.addEventListener("click", async () => {
+            if (tauriInvoke) {
+              const boot = await invokeBackend("toggle_game_collection", {
+                gameId: g.id,
+                collection: col.name
+              });
+              if (boot) applyBootstrap(boot);
+            } else {
+              if (!Array.isArray(g.collections)) g.collections = [];
+              if (active) {
+                g.collections = g.collections.filter(
+                  (c) => c.toLowerCase() !== col.name.toLowerCase()
+                );
+              } else {
+                g.collections.push(col.name);
+              }
+              updateAllViews();
+            }
+          });
+          chipsWrap.appendChild(chip);
+        }
+      }
+    }
 
     if (pathRow && pathVal) {
       if (g.romPath) {
@@ -1440,11 +1647,25 @@ function renderInspector() {
     }
     syncViewportScreenAspect(g);
   } else {
+    state.isEditingMetadata = false;
     setText("insp-title", "Aucun jeu sélectionné");
     setText("insp-console", "—");
     setText("insp-region", "—");
     setText("insp-playtime", "0m");
+    setText("insp-meta-year", "—");
+    setText("insp-meta-genre", "—");
+    setText("insp-meta-dev", "—");
+    setText("insp-meta-pub", "—");
+    setText("insp-meta-id", "—");
     setText("active-emu-game", "Aucun jeu lancé");
+    if (coverPreviewEl) {
+      coverPreviewEl.innerHTML = `<div class="inspector-cover-placeholder mono">Sélectionnez un jeu</div>`;
+    }
+    if (clearCoverBtn) clearCoverBtn.style.display = "none";
+    if (metaReadonlyEl) metaReadonlyEl.style.display = "block";
+    if (metaFormEl) metaFormEl.style.display = "none";
+    if (metaDescEl) metaDescEl.style.display = "none";
+    if (chipsWrap) chipsWrap.innerHTML = `<div class="empty-list-hint">Sélectionnez un jeu</div>`;
     if (pathRow) pathRow.style.display = "none";
     if (switchEngineRow) switchEngineRow.style.display = "none";
     if (playLabelEl) playLabelEl.textContent = "Jouer";
@@ -1952,6 +2173,13 @@ function renderNetplayAndCores() {
              </div>`
           : ""
       }
+      <label class="settings-toggle-row">
+        <span>
+          Actualiser automatiquement mes dossiers au démarrage
+          <small>Scanne uniquement les dossiers que vous avez ajoutés ci-dessus (jamais votre disque).</small>
+        </span>
+        <input type="checkbox" id="chk-auto-rescan-startup" ${state.autoRescanOnStartup ? "checked" : ""} />
+      </label>
     `;
     const dirsWrap = foldersCard.querySelector("#rom-dirs-container");
     if (dirsWrap) {
@@ -2040,7 +2268,135 @@ function renderNetplayAndCores() {
         btn.textContent = prev;
       }
     });
+    foldersCard.querySelector("#chk-auto-rescan-startup")?.addEventListener("change", async (ev) => {
+      const enabled = Boolean(ev.currentTarget.checked);
+      state.autoRescanOnStartup = enabled;
+      if (tauriInvoke) {
+        const boot = await invokeBackend("set_auto_rescan_on_startup", { enabled });
+        if (boot) applyBootstrap(boot);
+      }
+      showToast(
+        enabled
+          ? "Actualisation automatique des dossiers activée au démarrage."
+          : "Actualisation automatique au démarrage désactivée.",
+        "info"
+      );
+    });
     libContainer.appendChild(foldersCard);
+
+    // Carte Jaquettes & Métadonnées (Libretro / GameTDB)
+    const coversCount = state.catalog.filter((g) => Boolean(g.coverPath || state.coverCache.get(g.id))).length;
+    const metaCard = document.createElement("div");
+    metaCard.className = "panel-card";
+    metaCard.style.marginTop = "12px";
+    metaCard.innerHTML = `
+      <div class="section-title">
+        <span>Jaquettes &amp; Métadonnées</span>
+        <span class="mono" style="font-size:10px; color:var(--text-muted);">${coversCount}/${state.catalog.length} jaquette(s)</span>
+      </div>
+      <div class="empty-list-hint" style="margin-bottom:10px;">
+        Identification par CRC32 et code jeu via les bases publiques <strong>Libretro No-Intro</strong> et <strong>GameTDB</strong>, mises en cache localement pour un usage hors-ligne.
+      </div>
+      <div class="vault-actions">
+        <button class="btn btn-primary" id="btn-settings-enrich-missing" type="button">Compléter les jaquettes manquantes</button>
+        <button class="btn" id="btn-settings-enrich-force" type="button">Tout re-télécharger</button>
+      </div>
+    `;
+    metaCard.querySelector("#btn-settings-enrich-missing")?.addEventListener("click", (ev) => {
+      handleEnrichAllLibrary(false, ev.currentTarget);
+    });
+    metaCard.querySelector("#btn-settings-enrich-force")?.addEventListener("click", (ev) => {
+      handleEnrichAllLibrary(true, ev.currentTarget);
+    });
+    libContainer.appendChild(metaCard);
+
+    // Carte Cloud Saves (Synchronisation dossier Google Drive / OneDrive / iCloud / NAS)
+    const cloudCard = document.createElement("div");
+    cloudCard.className = "panel-card";
+    cloudCard.style.marginTop = "12px";
+    const syncRep = state.lastCloudSyncReport;
+    cloudCard.innerHTML = `
+      <div class="section-title">
+        <span>Synchronisation Cloud Saves (.srm)</span>
+        <span class="pill-badge ${state.cloudSyncDir ? "pill-green" : ""} mono">${state.cloudSyncDir ? "CONFIGURÉ" : "INACTIF"}</span>
+      </div>
+      <div class="empty-list-hint" style="margin-bottom:10px;">
+        Pointez vers un dossier synchronisé (Google Drive, OneDrive, iCloud Drive, Syncthing ou NAS) pour partager vos sauvegardes entre PC et Mac sans aucun serveur externe ni port ouvert.
+      </div>
+      ${
+        state.cloudSyncDir
+          ? `<div class="rom-dir-row" style="margin-bottom:10px;">
+               <span class="mono path-ellipsis" style="font-size:11px; color:var(--text-primary); flex:1;" title="${escapeHtml(state.cloudSyncDir)}">${escapeHtml(state.cloudSyncDir)}</span>
+               <button class="btn btn-inline-delete" id="btn-clear-cloud-dir" type="button" title="Déconnecter ce dossier">✕</button>
+             </div>`
+          : ""
+      }
+      <div class="vault-actions">
+        <button class="btn${state.cloudSyncDir ? "" : " btn-primary"}" id="btn-pick-cloud-dir" type="button">${state.cloudSyncDir ? "Changer de dossier..." : "Choisir un dossier cloud..."}</button>
+        ${
+          state.cloudSyncDir
+            ? `<button class="btn btn-primary" id="btn-sync-cloud-now" type="button">Synchroniser maintenant</button>`
+            : ""
+        }
+      </div>
+      ${
+        syncRep
+          ? `<div class="mono" style="margin-top:10px; font-size:10.5px; color:var(--text-secondary);">
+               Dernière synchro : ↑ ${syncRep.uploadedCount || 0} envoyée(s) · ↓ ${syncRep.downloadedCount || 0} récupérée(s) · ${syncRep.unchangedCount || 0} identique(s)
+             </div>`
+          : ""
+      }
+    `;
+    cloudCard.querySelector("#btn-pick-cloud-dir")?.addEventListener("click", async () => {
+      if (!tauriInvoke) {
+        showToast("La synchronisation Cloud Saves requiert l'application desktop Zaimule.", "error");
+        return;
+      }
+      const boot = await invokeBackend("pick_cloud_sync_dir");
+      if (boot) {
+        applyBootstrap(boot);
+        showToast("Dossier Cloud Saves configuré.", "ok");
+      }
+    });
+    cloudCard.querySelector("#btn-clear-cloud-dir")?.addEventListener("click", async () => {
+      if (tauriInvoke) {
+        const boot = await invokeBackend("clear_cloud_sync_dir");
+        if (boot) {
+          applyBootstrap(boot);
+          showToast("Dossier Cloud Saves déconnecté.", "info");
+        }
+      } else {
+        state.cloudSyncDir = null;
+        renderNetplayAndCores();
+      }
+    });
+    cloudCard.querySelector("#btn-sync-cloud-now")?.addEventListener("click", async (ev) => {
+      const btn = ev.currentTarget;
+      if (!tauriInvoke) {
+        showToast("La synchronisation Cloud Saves requiert l'application desktop Zaimule.", "error");
+        return;
+      }
+      const prev = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Synchro...";
+      const res = await invokeBackend("sync_cloud_saves_now");
+      if (res) {
+        state.lastCloudSyncReport = res.report;
+        if (res.bootstrap) applyBootstrap(res.bootstrap);
+        const up = res.report?.uploadedCount || 0;
+        const down = res.report?.downloadedCount || 0;
+        showToast(
+          up + down > 0
+            ? `Cloud Saves : ↑ ${up} envoyée(s), ↓ ${down} récupérée(s).`
+            : "Cloud Saves déjà à jour.",
+          "ok"
+        );
+      } else {
+        btn.disabled = false;
+        btn.textContent = prev;
+      }
+    });
+    libContainer.appendChild(cloudCard);
   }
 
   // 2. Paramètres -> Nintendo Switch
@@ -2200,9 +2556,182 @@ function renderNetplayAndCores() {
   }
 }
 
+let coversLoadInFlight = false;
+let lastLoadedCoversSig = "";
+
+async function loadMissingCoversInBackground() {
+  if (!tauriInvoke || coversLoadInFlight) return;
+  const sig = state.catalog
+    .filter((g) => g.coverPath)
+    .map((g) => `${g.id}:${g.coverPath}`)
+    .join("|");
+  if (!sig || sig === lastLoadedCoversSig) return;
+  const needsFetch = state.catalog.some((g) => g.coverPath && !state.coverCache.has(g.id));
+  if (!needsFetch) {
+    lastLoadedCoversSig = sig;
+    return;
+  }
+
+  coversLoadInFlight = true;
+  try {
+    const map = await invokeBackend("load_library_covers", {}, { silent: true });
+    if (map && typeof map === "object") {
+      let changed = false;
+      for (const [gid, dataUrl] of Object.entries(map)) {
+        if (typeof dataUrl === "string" && dataUrl && state.coverCache.get(gid) !== dataUrl) {
+          state.coverCache.set(gid, dataUrl);
+          changed = true;
+        }
+      }
+      lastLoadedCoversSig = sig;
+      if (changed) {
+        renderCatalogGrid();
+        renderInspector();
+        renderNetplayAndCores();
+      }
+    }
+  } finally {
+    coversLoadInFlight = false;
+  }
+}
+
+async function handleEnrichAllLibrary(forceCoverRefresh = false, triggerBtn = null) {
+  if (!tauriInvoke) {
+    showToast("La récupération de jaquettes requiert l'application desktop Zaimule.", "error");
+    return;
+  }
+  if (state.catalog.length === 0) {
+    showToast("Ajoutez d'abord au moins un jeu dans votre bibliothèque.", "info");
+    return;
+  }
+  const prevHtml = triggerBtn ? triggerBtn.innerHTML : "";
+  if (triggerBtn) {
+    triggerBtn.disabled = true;
+    triggerBtn.textContent = "Recherche...";
+  }
+  try {
+    const res = await invokeBackend("fetch_all_library_metadata", {
+      forceCoverRefresh: Boolean(forceCoverRefresh)
+    });
+    if (res) {
+      if (res.covers && typeof res.covers === "object") {
+        for (const [gid, dataUrl] of Object.entries(res.covers)) {
+          if (typeof dataUrl === "string" && dataUrl) {
+            state.coverCache.set(gid, dataUrl);
+          }
+        }
+      }
+      if (res.bootstrap) applyBootstrap(res.bootstrap);
+      showToast(
+        `Bibliothèque enrichie : ${res.coversFound || 0}/${res.processedCount || 0} jaquette(s), ${res.metadataFound || 0} fiche(s) identifiée(s).`,
+        (res.coversFound || 0) > 0 || (res.metadataFound || 0) > 0 ? "ok" : "info",
+        6000
+      );
+    }
+  } finally {
+    if (triggerBtn) {
+      triggerBtn.disabled = false;
+      triggerBtn.innerHTML = prevHtml;
+    }
+  }
+}
+
+async function handleEnrichSingleGame(gameId, triggerBtn = null) {
+  if (!gameId) return;
+  if (!tauriInvoke) {
+    showToast("La récupération de jaquette requiert l'application desktop Zaimule.", "error");
+    return;
+  }
+  const prevText = triggerBtn ? triggerBtn.textContent : "";
+  if (triggerBtn) {
+    triggerBtn.disabled = true;
+    triggerBtn.textContent = "...";
+  }
+  try {
+    const res = await invokeBackend("fetch_game_metadata_and_cover", {
+      gameId,
+      forceCoverRefresh: true
+    });
+    if (res) {
+      if (res.covers && typeof res.covers === "object") {
+        for (const [gid, dataUrl] of Object.entries(res.covers)) {
+          if (typeof dataUrl === "string" && dataUrl) {
+            state.coverCache.set(gid, dataUrl);
+          }
+        }
+      }
+      if (res.bootstrap) applyBootstrap(res.bootstrap);
+      if (res.coversFound > 0 || res.metadataFound > 0) {
+        showToast(
+          res.coversFound > 0
+            ? "Jaquette et métadonnées récupérées."
+            : "Métadonnées identifiées (aucune jaquette publique trouvée — vous pouvez importer une image locale).",
+          "ok"
+        );
+      } else {
+        showToast(
+          "Aucune correspondance automatique (ROM modifiée/homebrew ? Utilisez « Image… » ou « Modifier »).",
+          "info",
+          5500
+        );
+      }
+    }
+  } finally {
+    if (triggerBtn) {
+      triggerBtn.disabled = false;
+      triggerBtn.textContent = prevText;
+    }
+  }
+}
+
+async function handleCreateCollection(rawName, assignToGameId = null) {
+  const name = String(rawName || "").trim();
+  if (!name) return false;
+  if (tauriInvoke) {
+    const cmd = assignToGameId ? "toggle_game_collection" : "create_collection";
+    const payload = assignToGameId ? { gameId: assignToGameId, collection: name } : { name };
+    const boot = await invokeBackend(cmd, payload);
+    if (boot) {
+      applyBootstrap(boot);
+      showToast(`Collection « ${name} » prête.`, "ok");
+      return true;
+    }
+    return false;
+  }
+  if (!state.collections.some((c) => c.toLowerCase() === name.toLowerCase())) {
+    state.collections.push(name);
+  }
+  if (assignToGameId) {
+    const target = state.catalog.find((g) => g.id === assignToGameId);
+    if (target) {
+      if (!Array.isArray(target.collections)) target.collections = [];
+      if (!target.collections.some((c) => c.toLowerCase() === name.toLowerCase())) {
+        target.collections.push(name);
+      }
+    }
+  }
+  updateAllViews();
+  return true;
+}
+
 function applyBootstrap(boot, options = {}) {
   state.activeGameId = boot.activeGameId ?? "";
   state.catalog = Array.isArray(boot.catalog) ? boot.catalog : state.catalog;
+  state.collections = Array.isArray(boot.collections) ? boot.collections : state.collections;
+  if (
+    state.collectionFilter &&
+    !computeCollectionCounts(state.catalog, state.collections).some(
+      (c) => c.name.toLowerCase() === state.collectionFilter.toLowerCase()
+    )
+  ) {
+    state.collectionFilter = "";
+  }
+  if (boot.autoRescanRomDirsOnStartup !== undefined) {
+    state.autoRescanOnStartup = Boolean(boot.autoRescanRomDirsOnStartup);
+  }
+  if (boot.cloudSyncDir !== undefined) {
+    state.cloudSyncDir = boot.cloudSyncDir || null;
+  }
   state.modLayers = Array.isArray(boot.modLayers) ? boot.modLayers : state.modLayers;
   state.cheatCodes = Array.isArray(boot.cheatCodes) ? boot.cheatCodes : state.cheatCodes;
   state.memoryWatchpoints = Array.isArray(boot.memoryWatchpoints)
@@ -2286,6 +2815,7 @@ function applyBootstrap(boot, options = {}) {
   } else {
     updateAllViews();
   }
+  void loadMissingCoversInBackground();
 }
 
 function computeCrc32Hex(bytes) {
@@ -3302,13 +3832,50 @@ function bindEvents() {
     }
   });
 
-  document.querySelectorAll(".console-btn").forEach((btn) => {
+  document.querySelectorAll(".console-btn[data-console]").forEach((btn) => {
     btn.addEventListener("click", () => {
       document.querySelectorAll(".console-btn").forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
       state.consoleFilter = btn.dataset.console;
+      state.collectionFilter = "";
       renderCatalogGrid();
     });
+  });
+
+  // Sidebar new collection inline composer
+  const colComposer = document.getElementById("collection-composer");
+  const colNameInput = document.getElementById("collection-name-input");
+  const closeCollectionComposer = () => {
+    if (colComposer) colComposer.style.display = "none";
+    if (colNameInput) colNameInput.value = "";
+  };
+  document.getElementById("btn-new-collection")?.addEventListener("click", () => {
+    if (!colComposer) return;
+    const isOpen = colComposer.style.display !== "none";
+    if (isOpen) {
+      closeCollectionComposer();
+    } else {
+      colComposer.style.display = "flex";
+      colNameInput?.focus();
+    }
+  });
+  const submitSidebarCollection = async () => {
+    const val = colNameInput?.value?.trim();
+    if (!val) {
+      closeCollectionComposer();
+      return;
+    }
+    const ok = await handleCreateCollection(val);
+    if (ok) closeCollectionComposer();
+  };
+  document.getElementById("btn-confirm-collection")?.addEventListener("click", submitSidebarCollection);
+  colNameInput?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void submitSidebarCollection();
+    } else if (e.key === "Escape") {
+      closeCollectionComposer();
+    }
   });
 
   document.getElementById("search-input")?.addEventListener("input", (e) => {
@@ -3327,9 +3894,113 @@ function bindEvents() {
 
   document.getElementById("btn-import-rom")?.addEventListener("click", () => handleImportRomsTrigger());
   document.getElementById("btn-scan-folder")?.addEventListener("click", () => handleScanFolderTrigger());
+  document.getElementById("btn-enrich-library")?.addEventListener("click", (ev) => {
+    void handleEnrichAllLibrary(false, ev.currentTarget);
+  });
   document.getElementById("btn-import-ips")?.addEventListener("click", () => ipsInput?.click());
   document.getElementById("btn-insp-ips")?.addEventListener("click", () => ipsInput?.click());
   document.getElementById("btn-import-pack")?.addEventListener("click", () => packInput?.click());
+
+  // Inspector: Jaquette (Auto / Image locale / Retirer)
+  document.getElementById("btn-insp-fetch-meta")?.addEventListener("click", (ev) => {
+    const g = getSelectedGame();
+    if (!g) return;
+    void handleEnrichSingleGame(g.id, ev.currentTarget);
+  });
+
+  document.getElementById("btn-insp-pick-cover")?.addEventListener("click", async () => {
+    const g = getSelectedGame();
+    if (!g) return;
+    if (!tauriInvoke) {
+      showToast("L'importation d'une jaquette locale requiert l'application desktop Zaimule.", "error");
+      return;
+    }
+    const res = await invokeBackend("pick_game_cover", { gameId: g.id });
+    if (res) {
+      if (res.coverDataUrl) {
+        state.coverCache.set(g.id, res.coverDataUrl);
+      }
+      if (res.bootstrap) applyBootstrap(res.bootstrap);
+      showToast("Jaquette personnalisée enregistrée.", "ok");
+    }
+  });
+
+  document.getElementById("btn-insp-clear-cover")?.addEventListener("click", async () => {
+    const g = getSelectedGame();
+    if (!g) return;
+    state.coverCache.delete(g.id);
+    if (tauriInvoke) {
+      const boot = await invokeBackend("clear_game_cover", { gameId: g.id });
+      if (boot) applyBootstrap(boot);
+    } else {
+      g.coverPath = null;
+      updateAllViews();
+    }
+    showToast("Jaquette retirée.", "info");
+  });
+
+  // Inspector: Éditeur de métadonnées
+  document.getElementById("btn-insp-edit-meta")?.addEventListener("click", () => {
+    if (!getSelectedGame()) return;
+    state.isEditingMetadata = !state.isEditingMetadata;
+    renderInspector();
+    if (state.isEditingMetadata) {
+      document.getElementById("meta-edit-title")?.focus();
+    }
+  });
+
+  document.getElementById("btn-insp-cancel-meta")?.addEventListener("click", () => {
+    state.isEditingMetadata = false;
+    renderInspector();
+  });
+
+  document.getElementById("insp-meta-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const g = getSelectedGame();
+    if (!g) return;
+    const update = {
+      title: document.getElementById("meta-edit-title")?.value ?? g.title,
+      releaseYear: document.getElementById("meta-edit-year")?.value ?? "",
+      genre: document.getElementById("meta-edit-genre")?.value ?? "",
+      developer: document.getElementById("meta-edit-dev")?.value ?? "",
+      publisher: document.getElementById("meta-edit-pub")?.value ?? "",
+      description: document.getElementById("meta-edit-desc")?.value ?? ""
+    };
+    state.isEditingMetadata = false;
+    if (tauriInvoke) {
+      const boot = await invokeBackend("update_game_metadata", {
+        gameId: g.id,
+        update
+      });
+      if (boot) applyBootstrap(boot);
+    } else {
+      if (update.title.trim()) g.title = update.title.trim();
+      g.metadataReleaseYear = update.releaseYear.trim() || null;
+      g.metadataGenre = update.genre.trim() || null;
+      g.metadataDeveloper = update.developer.trim() || null;
+      g.metadataPublisher = update.publisher.trim() || null;
+      g.metadataDescription = update.description.trim() || null;
+      updateAllViews();
+    }
+    showToast("Fiche du jeu enregistrée.", "ok");
+  });
+
+  // Inspector: Ajouter une nouvelle collection et l'assigner au jeu sélectionné
+  const inspColInput = document.getElementById("insp-new-collection-input");
+  const submitInspectorCollection = async () => {
+    const g = getSelectedGame();
+    const val = inspColInput?.value?.trim();
+    if (!g || !val) return;
+    const ok = await handleCreateCollection(val, g.id);
+    if (ok && inspColInput) inspColInput.value = "";
+  };
+  document.getElementById("btn-insp-add-collection")?.addEventListener("click", submitInspectorCollection);
+  inspColInput?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void submitInspectorCollection();
+    }
+  });
 
   document.getElementById("btn-overclock-cycle")?.addEventListener("click", async () => {
     state.cpuOverclockPct =
@@ -4154,8 +4825,18 @@ async function init() {
           );
         }
       });
+      await window.__TAURI__.event.listen("zaimule-library-updated", (event) => {
+        const boot = event?.payload;
+        if (boot) {
+          applyBootstrap(boot);
+          const added = boot.lastScanReport?.importedEntries?.length || 0;
+          if (added > 0) {
+            showToast(`Dossiers surveillés : ${added} nouveau(x) jeu(x) détecté(s).`, "ok", 5000);
+          }
+        }
+      });
     } catch (err) {
-      console.warn("[zaimule] Écouteur switch-session-ended indisponible :", err);
+      console.warn("[zaimule] Écouteurs d'événements Tauri indisponibles :", err);
     }
   }
 

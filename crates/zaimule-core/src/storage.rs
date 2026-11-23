@@ -24,6 +24,8 @@ pub struct PersistedLibrary {
     pub active_game_id: String,
     pub catalog: Vec<GameEntry>,
     pub rom_directories: Vec<String>,
+    #[serde(default)]
+    pub collections: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -456,6 +458,7 @@ mod tests {
         let lib = PersistedLibrary {
             active_game_id: "rom-platine".into(),
             rom_directories: vec!["C:/Users/Test/ROMs".into()],
+            collections: vec!["Pokémon".into(), "À finir".into()],
             catalog: vec![GameEntry {
                 id: "rom-platine".into(),
                 title: "Pokémon Version Platine".into(),
@@ -477,6 +480,14 @@ mod tests {
                 title_id: Some("CPUF".into()),
                 fast_fingerprint: false,
                 switch_engine: SwitchEngineOverride::Auto,
+                cover_path: Some("rom-platine.jpg".into()),
+                metadata_genre: Some("Role-playing (RPG)".into()),
+                metadata_developer: Some("Game Freak".into()),
+                metadata_publisher: Some("Nintendo".into()),
+                metadata_release_year: Some("2009".into()),
+                metadata_description: Some("Sinnoh".into()),
+                metadata_canonical_name: Some("Pokemon - Version Platine (France)".into()),
+                collections: vec!["Pokémon".into()],
             }],
         };
         save_library_atomic(&path, &lib).unwrap();

@@ -6,6 +6,8 @@ import {
   formatFileSize,
   filterCatalogEntries,
   computeConsoleCounts,
+  computeCollectionCounts,
+  formatGameSubtitle,
   sortCatalogEntries,
   formatHardwareProfileLabel,
   formatSwitchEngineLabel
@@ -214,5 +216,57 @@ test("formatSwitchEngineLabel resolves Auto and explicit Torzu/Fritchii override
   assert.equal(formatSwitchEngineLabel("auto", "SWITCH2"), "Auto (Fritchii)");
   assert.equal(formatSwitchEngineLabel("torzu", "SWITCH2"), "Torzu");
   assert.equal(formatSwitchEngineLabel("fritchii", "SWITCH"), "Fritchii");
+});
+
+test("filterCatalogEntries, computeCollectionCounts, sortCatalogEntries(year), and formatGameSubtitle handle enriched metadata and collections", () => {
+  const enriched = [
+    {
+      ...SAMPLE_ENTRIES[2],
+      metadataGenre: "Role-playing (RPG)",
+      metadataDeveloper: "Game Freak",
+      metadataReleaseYear: "2005",
+      collections: ["Pokémon", "À finir"]
+    },
+    {
+      ...SAMPLE_ENTRIES[3],
+      metadataGenre: "Role-playing (RPG)",
+      metadataDeveloper: "Game Freak",
+      metadataReleaseYear: "2009",
+      collections: ["Pokémon"]
+    },
+    {
+      ...SAMPLE_ENTRIES[0],
+      metadataGenre: "Puzzle",
+      metadataReleaseYear: "1989",
+      collections: []
+    }
+  ];
+
+  const byCollection = filterCatalogEntries(enriched, { collectionFilter: "pokemon" });
+  assert.equal(byCollection.length, 2);
+
+  const byDev = filterCatalogEntries(enriched, { query: "game freak" });
+  assert.equal(byDev.length, 2);
+
+  const byYearQuery = filterCatalogEntries(enriched, { query: "1989" });
+  assert.equal(byYearQuery.length, 1);
+  assert.equal(byYearQuery[0].id, "gb-tetris-dmg");
+
+  const counts = computeCollectionCounts(enriched, ["Multijoueur", "Pokémon", "À finir"]);
+  assert.deepEqual(counts, [
+    { name: "À finir", count: 1 },
+    { name: "Multijoueur", count: 0 },
+    { name: "Pokémon", count: 2 }
+  ]);
+
+  const byYearSort = sortCatalogEntries(enriched, "year");
+  assert.deepEqual(
+    byYearSort.map((e) => e.id),
+    ["nds-platinum", "gba-emerald", "gb-tetris-dmg"]
+  );
+
+  assert.equal(formatGameSubtitle(enriched[0], "GBA"), "RPG · 2005");
+  assert.equal(formatGameSubtitle(enriched[2], "GB"), "Puzzle · 1989");
+  assert.equal(formatGameSubtitle({ console: "NDS" }, "NDS"), "NDS");
 });
 

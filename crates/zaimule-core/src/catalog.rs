@@ -103,6 +103,22 @@ pub struct GameEntry {
     pub fast_fingerprint: bool,
     #[serde(default)]
     pub switch_engine: SwitchEngineOverride,
+    #[serde(default)]
+    pub cover_path: Option<String>,
+    #[serde(default)]
+    pub metadata_genre: Option<String>,
+    #[serde(default)]
+    pub metadata_developer: Option<String>,
+    #[serde(default)]
+    pub metadata_publisher: Option<String>,
+    #[serde(default)]
+    pub metadata_release_year: Option<String>,
+    #[serde(default)]
+    pub metadata_description: Option<String>,
+    #[serde(default)]
+    pub metadata_canonical_name: Option<String>,
+    #[serde(default)]
+    pub collections: Vec<String>,
 }
 
 /// Rich inspection metadata extracted from a ROM header + streaming CRC32 fingerprint.
@@ -170,6 +186,22 @@ pub fn extract_nds_game_code(rom_bytes: &[u8]) -> Option<String> {
         return None;
     }
     let slice = &rom_bytes[0x000C..0x0010];
+    if slice
+        .iter()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        Some(String::from_utf8_lossy(slice).to_string())
+    } else {
+        None
+    }
+}
+
+/// Extracts a 4-character Game Boy Advance Gamecode (offset `0x00AC..0x00B0`, e.g. `BPEF`, `AMKP`).
+pub fn extract_gba_game_code(rom_bytes: &[u8]) -> Option<String> {
+    if rom_bytes.len() < 0x00B0 {
+        return None;
+    }
+    let slice = &rom_bytes[0x00AC..0x00B0];
     if slice
         .iter()
         .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
@@ -419,6 +451,19 @@ fn infer_nds_region(game_code: Option<&str>) -> String {
     }
 }
 
+fn infer_gba_region(game_code: Option<&str>) -> String {
+    match game_code.and_then(|c| c.as_bytes().get(3).copied()) {
+        Some(b'F') => "EUR · FR (AGB)".into(),
+        Some(b'P') | Some(b'X') | Some(b'Y') => "EUR · Multi (AGB)".into(),
+        Some(b'E') => "USA (AGB)".into(),
+        Some(b'J') => "JPN (AGB)".into(),
+        Some(b'D') => "EUR · DE (AGB)".into(),
+        Some(b'I') => "EUR · IT (AGB)".into(),
+        Some(b'S') => "EUR · ES (AGB)".into(),
+        _ => "Game Boy Advance (AGB)".into(),
+    }
+}
+
 /// Builds an `InspectedRomFile` from an already-read header slice and streaming CRC32 checksum.
 pub fn inspect_rom_header_and_stats(
     file_name: &str,
@@ -433,6 +478,11 @@ pub fn inspect_rom_header_and_stats(
     let crc32_hex = format_crc32_hex(crc32);
 
     let (region, title_id) = match console {
+        ConsoleKind::Gba => {
+            let code = extract_gba_game_code(header_bytes);
+            let reg = infer_gba_region(code.as_deref());
+            (reg, code)
+        }
         ConsoleKind::Nds => {
             let code = extract_nds_game_code(header_bytes);
             let reg = infer_nds_region(code.as_deref());
@@ -573,6 +623,25 @@ pub fn filter_catalog<'a>(
                     .as_deref()
                     .map(|tid| normalize_for_search(tid).contains(&q))
                     .unwrap_or(false)
+                || g.metadata_genre
+                    .as_deref()
+                    .map(|v| normalize_for_search(v).contains(&q))
+                    .unwrap_or(false)
+                || g.metadata_developer
+                    .as_deref()
+                    .map(|v| normalize_for_search(v).contains(&q))
+                    .unwrap_or(false)
+                || g.metadata_publisher
+                    .as_deref()
+                    .map(|v| normalize_for_search(v).contains(&q))
+                    .unwrap_or(false)
+                || g.metadata_release_year
+                    .as_deref()
+                    .map(|v| normalize_for_search(v).contains(&q))
+                    .unwrap_or(false)
+                || g.collections
+                    .iter()
+                    .any(|c| normalize_for_search(c).contains(&q))
         })
         .collect()
 }
@@ -602,12 +671,18 @@ mod tests {
         let mut gba_rom = vec![0u8; 0xC0];
         gba_rom[0x04..0x08].copy_from_slice(&[0x24, 0xFF, 0xAE, 0x51]);
         gba_rom[0xA0..0xA7].copy_from_slice(b"EMERALD");
+        gba_rom[0xAC..0xB0].copy_from_slice(b"BPEF");
         gba_rom[0xB2] = 0x96;
         assert_eq!(detect_console("game.gba", &gba_rom), Some(ConsoleKind::Gba));
         assert_eq!(
             extract_rom_title("game.gba", ConsoleKind::Gba, &gba_rom),
             "EMERALD"
         );
+        let gba_info =
+            inspect_rom_header_and_stats("game.gba", &gba_rom, 16_777_216, 0x1F1C_08FB, false)
+                .unwrap();
+        assert_eq!(gba_info.title_id.as_deref(), Some("BPEF"));
+        assert!(gba_info.region.contains("FR"));
 
         let mut nsp = vec![0u8; 256];
         nsp[0..4].copy_from_slice(b"PFS0");
@@ -684,12 +759,28 @@ mod tests {
             cover_symbol: "GBA".into(),
             rom_path: Some("/roms/emeraude.gba".into()),
             archive_entry: None,
-            title_id: None,
+            title_id: Some("BPEF".into()),
             fast_fingerprint: false,
             switch_engine: SwitchEngineOverride::Auto,
+            cover_path: None,
+            metadata_genre: Some("Role-playing (RPG)".into()),
+            metadata_developer: Some("Game Freak".into()),
+            metadata_publisher: Some("Nintendo".into()),
+            metadata_release_year: Some("2005".into()),
+            metadata_description: None,
+            metadata_canonical_name: None,
+            collections: vec!["Pokémon".into()],
         }];
         let hits = filter_catalog(&sample, Some(ConsoleKind::Gba), true, true, "emeraude");
         assert_eq!(hits.len(), 1);
+        assert_eq!(
+            filter_catalog(&sample, None, false, false, "game freak").len(),
+            1
+        );
+        assert_eq!(
+            filter_catalog(&sample, None, false, false, "pokemon").len(),
+            1
+        );
     }
 
     #[test]

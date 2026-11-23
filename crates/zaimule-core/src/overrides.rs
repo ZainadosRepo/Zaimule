@@ -85,6 +85,10 @@ pub struct GlobalSettings {
     pub memory_watchpoints: Vec<MemoryWatchpoint>,
     #[serde(default)]
     pub macros: Vec<MacroSequence>,
+    #[serde(default)]
+    pub auto_rescan_rom_dirs_on_startup: bool,
+    #[serde(default)]
+    pub cloud_sync_dir: Option<String>,
 }
 
 impl Default for GlobalSettings {
@@ -113,6 +117,8 @@ impl Default for GlobalSettings {
             cheat_codes: Vec::new(),
             memory_watchpoints: Vec::new(),
             macros: Vec::new(),
+            auto_rescan_rom_dirs_on_startup: false,
+            cloud_sync_dir: None,
         }
     }
 }

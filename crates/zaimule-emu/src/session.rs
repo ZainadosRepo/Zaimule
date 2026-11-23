@@ -41,6 +41,7 @@ use zaimule_core::keymap::{apply_turbo_mask, default_keymapper_widgets, KeymapWi
 use zaimule_core::macros::{
     verify_and_build_ghost_entry, GhostLeaderboardEntry, MacroSequence, TasTimelineRow,
 };
+use zaimule_core::metadata::{normalize_collection_name, GameMetadataUpdate};
 use zaimule_core::netplay::{
     discover_stun_candidate, format_deep_link, parse_deep_link, NetplayChatMessage, NetplayRoom,
     NetplayWirePacket, StunDiscoveryCandidate, TournamentBracket, UdpNetplayNode,
@@ -78,6 +79,8 @@ pub struct NativeCoreInfo {
 pub struct StationBootstrap {
     pub active_game_id: String,
     pub catalog: Vec<GameEntry>,
+    #[serde(default)]
+    pub collections: Vec<String>,
     pub effective_config: EffectiveGameConfig,
     pub mod_layers: Vec<ModLayerEntry>,
     pub community_mods: Vec<CommunityModPackage>,
@@ -108,6 +111,10 @@ pub struct StationBootstrap {
     pub warning: Option<String>,
     #[serde(default)]
     pub rom_directories: Vec<String>,
+    #[serde(default)]
+    pub auto_rescan_rom_dirs_on_startup: bool,
+    #[serde(default)]
+    pub cloud_sync_dir: Option<String>,
     #[serde(default)]
     pub switch_vault: SwitchVaultStatus,
     #[serde(default)]
@@ -406,6 +413,7 @@ impl BackgroundRewindWorker {
 pub struct EmulatorSession {
     pub settings: GlobalSettings,
     pub catalog: Vec<GameEntry>,
+    pub collections: Vec<String>,
     pub active_game_id: String,
     pub mod_layers: Vec<ModLayerEntry>,
     pub community_mods: Vec<CommunityModPackage>,
@@ -472,6 +480,7 @@ impl EmulatorSession {
         Self {
             settings: GlobalSettings::default(),
             catalog: Vec::new(),
+            collections: Vec::new(),
             active_game_id: String::new(),
             mod_layers: Vec::new(),
             community_mods: Vec::new(),
@@ -790,6 +799,14 @@ impl EmulatorSession {
                     archive_entry: None,
                     title_id: None,
                     fast_fingerprint: false,
+                    cover_path: None,
+                    metadata_genre: None,
+                    metadata_developer: None,
+                    metadata_publisher: None,
+                    metadata_release_year: None,
+                    metadata_description: None,
+                    metadata_canonical_name: None,
+                    collections: Vec::new(),
                 })
             })
     }
@@ -807,6 +824,7 @@ impl EmulatorSession {
         StationBootstrap {
             active_game_id: self.active_game_id.clone(),
             catalog: self.catalog.clone(),
+            collections: self.collections.clone(),
             effective_config,
             mod_layers: self.mod_layers.clone(),
             community_mods: self.community_mods.clone(),
@@ -834,6 +852,8 @@ impl EmulatorSession {
             rewind_memory_bytes: self.rewind_buffer.memory_usage_bytes(),
             warning: self.warning.clone(),
             rom_directories: self.settings.rom_directories.clone(),
+            auto_rescan_rom_dirs_on_startup: self.settings.auto_rescan_rom_dirs_on_startup,
+            cloud_sync_dir: self.settings.cloud_sync_dir.clone(),
             switch_vault: self.switch_vault.clone(),
             last_scan_report: self.last_scan_report.clone(),
             active_shader_css: self.settings.active_shader_css.clone(),
@@ -1011,9 +1031,23 @@ impl EmulatorSession {
                         && g.archive_entry == entry.archive_entry)
             }) {
                 let prev = self.catalog.remove(pos);
+                if !prev.title.is_empty() {
+                    entry.title = prev.title;
+                }
                 entry.playtime_seconds = prev.playtime_seconds;
                 entry.favorite = prev.favorite;
                 entry.switch_engine = prev.switch_engine;
+                entry.cover_path = prev.cover_path;
+                entry.metadata_genre = prev.metadata_genre;
+                entry.metadata_developer = prev.metadata_developer;
+                entry.metadata_publisher = prev.metadata_publisher;
+                entry.metadata_release_year = prev.metadata_release_year;
+                entry.metadata_description = prev.metadata_description;
+                entry.metadata_canonical_name = prev.metadata_canonical_name;
+                entry.collections = prev.collections;
+                if entry.title_id.is_none() {
+                    entry.title_id = prev.title_id;
+                }
                 self.catalog.insert(0, entry);
             } else {
                 self.catalog.insert(0, entry);
@@ -1171,11 +1205,159 @@ impl EmulatorSession {
         Ok(self.bootstrap_snapshot())
     }
 
+    /// Creates a new custom collection (case-insensitive deduplication).
+    pub fn create_collection(&mut self, raw_name: &str) -> Result<StationBootstrap, String> {
+        let name = normalize_collection_name(raw_name)?;
+        if !self
+            .collections
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&name))
+        {
+            self.collections.push(name);
+            self.collections.sort_by_key(|a| a.to_ascii_lowercase());
+        }
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Deletes a custom collection and removes its tag from every game in the catalog.
+    pub fn delete_collection(&mut self, raw_name: &str) -> Result<StationBootstrap, String> {
+        let target = raw_name.trim();
+        let before = self.collections.len();
+        self.collections.retain(|c| !c.eq_ignore_ascii_case(target));
+        for game in &mut self.catalog {
+            game.collections.retain(|c| !c.eq_ignore_ascii_case(target));
+        }
+        if self.collections.len() == before {
+            return Err(format!("collection introuvable : {target}"));
+        }
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Adds or removes a game from a collection (creating the collection if needed).
+    pub fn toggle_game_collection(
+        &mut self,
+        game_id: &str,
+        raw_collection: &str,
+    ) -> Result<StationBootstrap, String> {
+        let name = normalize_collection_name(raw_collection)?;
+        let canonical = self
+            .collections
+            .iter()
+            .find(|c| c.eq_ignore_ascii_case(&name))
+            .cloned()
+            .unwrap_or_else(|| {
+                self.collections.push(name.clone());
+                self.collections.sort_by_key(|a| a.to_ascii_lowercase());
+                name
+            });
+
+        let Some(game) = self.catalog.iter_mut().find(|g| g.id == game_id) else {
+            return Err(format!("jeu introuvable : {game_id}"));
+        };
+        if let Some(idx) = game
+            .collections
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(&canonical))
+        {
+            game.collections.remove(idx);
+        } else {
+            game.collections.push(canonical);
+            game.collections.sort_by_key(|a| a.to_ascii_lowercase());
+        }
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Applies user-edited or scraped metadata fields to a game entry.
+    pub fn update_game_metadata(
+        &mut self,
+        game_id: &str,
+        update: GameMetadataUpdate,
+    ) -> Result<StationBootstrap, String> {
+        let Some(game) = self.catalog.iter_mut().find(|g| g.id == game_id) else {
+            return Err(format!("jeu introuvable : {game_id}"));
+        };
+        let clean_opt = |opt: Option<String>, max_len: usize| -> Option<Option<String>> {
+            opt.map(|raw| {
+                let t = raw.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.chars().take(max_len).collect())
+                }
+            })
+        };
+        if let Some(raw_title) = update.title {
+            let trimmed = raw_title.trim();
+            if !trimmed.is_empty() {
+                game.title = trimmed.chars().take(120).collect();
+            }
+        }
+        if let Some(val) = clean_opt(update.genre, 80) {
+            game.metadata_genre = val;
+        }
+        if let Some(val) = clean_opt(update.developer, 80) {
+            game.metadata_developer = val;
+        }
+        if let Some(val) = clean_opt(update.publisher, 80) {
+            game.metadata_publisher = val;
+        }
+        if let Some(val) = clean_opt(update.release_year, 16) {
+            game.metadata_release_year = val;
+        }
+        if let Some(val) = clean_opt(update.description, 600) {
+            game.metadata_description = val;
+        }
+        if let Some(val) = clean_opt(update.canonical_name, 180) {
+            game.metadata_canonical_name = val;
+        }
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Sets or clears the cached local cover filename for a game entry.
+    pub fn set_game_cover_path(
+        &mut self,
+        game_id: &str,
+        cover_path: Option<String>,
+    ) -> Result<StationBootstrap, String> {
+        let Some(game) = self.catalog.iter_mut().find(|g| g.id == game_id) else {
+            return Err(format!("jeu introuvable : {game_id}"));
+        };
+        game.cover_path = cover_path.and_then(|s| {
+            let t = s.trim().to_string();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        });
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Enables or disables automatic rescanning of user-registered ROM folders on startup.
+    pub fn set_auto_rescan_on_startup(&mut self, enabled: bool) -> StationBootstrap {
+        self.settings.auto_rescan_rom_dirs_on_startup = enabled;
+        self.bootstrap_snapshot()
+    }
+
+    /// Configures or clears the user-selected Cloud Saves sync directory.
+    pub fn set_cloud_sync_dir(&mut self, dir: Option<String>) -> StationBootstrap {
+        self.settings.cloud_sync_dir = dir.and_then(|s| {
+            let t = s.trim().to_string();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        });
+        self.bootstrap_snapshot()
+    }
+
     pub fn to_persisted_library(&self) -> PersistedLibrary {
         PersistedLibrary {
             active_game_id: self.active_game_id.clone(),
             catalog: self.catalog.clone(),
             rom_directories: self.settings.rom_directories.clone(),
+            collections: self.collections.clone(),
         }
     }
 
@@ -1190,6 +1372,32 @@ impl EmulatorSession {
                 self.settings.rom_directories.push(dir);
             }
         }
+        self.collections.clear();
+        for col in lib.collections {
+            if let Ok(clean) = normalize_collection_name(&col) {
+                if !self
+                    .collections
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&clean))
+                {
+                    self.collections.push(clean);
+                }
+            }
+        }
+        for game in &lib.catalog {
+            for col in &game.collections {
+                if let Ok(clean) = normalize_collection_name(col) {
+                    if !self
+                        .collections
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(&clean))
+                    {
+                        self.collections.push(clean);
+                    }
+                }
+            }
+        }
+        self.collections.sort_by_key(|a| a.to_ascii_lowercase());
         self.catalog = lib.catalog;
         if !lib.active_game_id.is_empty() && self.catalog.iter().any(|g| g.id == lib.active_game_id)
         {
@@ -1443,6 +1651,14 @@ impl EmulatorSession {
                     archive_entry: None,
                     title_id,
                     fast_fingerprint: false,
+                    cover_path: None,
+                    metadata_genre: None,
+                    metadata_developer: None,
+                    metadata_publisher: None,
+                    metadata_release_year: None,
+                    metadata_description: None,
+                    metadata_canonical_name: None,
+                    collections: Vec::new(),
                 },
             );
         }
@@ -3471,5 +3687,84 @@ mod tests {
             .rewind(1)
             .expect("rewind(1) should restore ZMND snapshot");
         assert!(rewound_frame >= 90);
+    }
+
+    #[test]
+    fn library_enrichment_collections_metadata_and_rescan_preservation() {
+        let dir =
+            std::env::temp_dir().join(format!("zaimule-session-enrich-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut rom = vec![0u8; 0x200];
+        rom[0x0000..0x000A].copy_from_slice(b"POKEMON HG");
+        rom[0x000C..0x0010].copy_from_slice(b"IPKF");
+        rom[0x015C] = 0x56;
+        rom[0x015D] = 0xCF;
+        std::fs::write(dir.join("Pokemon_HeartGold.nds"), &rom).unwrap();
+
+        let mut session = EmulatorSession::new();
+        let rep = session.scan_directory_and_merge(&dir);
+        assert_eq!(rep.imported_entries.len(), 1);
+        let game_id = rep.imported_entries[0].id.clone();
+
+        session.create_collection("  Pokémon  ").unwrap();
+        session.create_collection("À finir").unwrap();
+        let boot = session.toggle_game_collection(&game_id, "pokémon").unwrap();
+        assert_eq!(
+            boot.collections,
+            vec!["Pokémon".to_string(), "À finir".to_string()]
+        );
+        assert_eq!(boot.catalog[0].collections, vec!["Pokémon".to_string()]);
+
+        let boot = session
+            .update_game_metadata(
+                &game_id,
+                GameMetadataUpdate {
+                    title: Some("Pokémon Version Or HeartGold".into()),
+                    genre: Some("Role-playing (RPG)".into()),
+                    developer: Some("Game Freak".into()),
+                    publisher: Some("Nintendo".into()),
+                    release_year: Some("2010".into()),
+                    description: Some("Voyage à Johto & Kanto".into()),
+                    canonical_name: Some("Pokemon - HeartGold Version (France)".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(boot.catalog[0].title, "Pokémon Version Or HeartGold");
+        assert_eq!(
+            boot.catalog[0].metadata_release_year.as_deref(),
+            Some("2010")
+        );
+
+        let boot = session
+            .set_game_cover_path(&game_id, Some("rom-heartgold.jpg".into()))
+            .unwrap();
+        assert_eq!(
+            boot.catalog[0].cover_path.as_deref(),
+            Some("rom-heartgold.jpg")
+        );
+
+        // Rescanning the watched folder must preserve title, cover, metadata, and collections!
+        let _ = session.rescan_all_rom_directories();
+        let after = session.catalog.iter().find(|g| g.id == game_id).unwrap();
+        assert_eq!(after.title, "Pokémon Version Or HeartGold");
+        assert_eq!(after.cover_path.as_deref(), Some("rom-heartgold.jpg"));
+        assert_eq!(after.metadata_developer.as_deref(), Some("Game Freak"));
+        assert_eq!(after.collections, vec!["Pokémon".to_string()]);
+
+        // Persisted library roundtrip preserves collections + metadata
+        let persisted = session.to_persisted_library();
+        let mut restored = EmulatorSession::new();
+        restored.restore_persisted_library(persisted);
+        assert_eq!(restored.collections.len(), 2);
+        assert_eq!(restored.catalog[0].collections, vec!["Pokémon".to_string()]);
+
+        // Deleting collection removes tag from games too
+        let after_del = restored.delete_collection("pokémon").unwrap();
+        assert_eq!(after_del.collections, vec!["À finir".to_string()]);
+        assert!(after_del.catalog[0].collections.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

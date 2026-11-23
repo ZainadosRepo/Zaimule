@@ -10,6 +10,7 @@ pub mod cheats;
 pub mod external;
 pub mod keymap;
 pub mod macros;
+pub mod metadata;
 pub mod netplay;
 pub mod overrides;
 pub mod patch;

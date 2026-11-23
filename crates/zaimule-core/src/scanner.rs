@@ -118,6 +118,14 @@ pub fn build_game_entry(
         title_id: inspected.title_id.clone(),
         fast_fingerprint: inspected.fast_fingerprint,
         switch_engine: SwitchEngineOverride::Auto,
+        cover_path: None,
+        metadata_genre: None,
+        metadata_developer: None,
+        metadata_publisher: None,
+        metadata_release_year: None,
+        metadata_description: None,
+        metadata_canonical_name: None,
+        collections: Vec::new(),
     }
 }
 

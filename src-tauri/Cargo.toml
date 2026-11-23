@@ -16,6 +16,9 @@ tauri-build = { version = "2.6.3", features = [] }
 [dependencies]
 zaimule-core = { path = "../crates/zaimule-core" }
 zaimule-emu = { path = "../crates/zaimule-emu" }
+base64 = "0.23.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "system-proxy"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tauri = { version = "2.11.3", features = [] }

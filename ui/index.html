@@ -182,6 +182,32 @@
               </span>
               <span class="console-count mono" id="count-switch2">0</span>
             </button>
+
+            <div class="sidebar-divider"></div>
+
+            <div class="sidebar-heading sidebar-heading-action">
+              <span>Collections</span>
+              <button
+                class="sidebar-add-btn"
+                id="btn-new-collection"
+                type="button"
+                title="Créer une collection"
+                aria-label="Créer une collection"
+              >+</button>
+            </div>
+
+            <div class="sidebar-collection-composer" id="collection-composer" style="display: none;">
+              <input
+                type="text"
+                id="collection-name-input"
+                class="field-inline"
+                maxlength="36"
+                placeholder="Ex. Pokémon, À finir..."
+              />
+              <button class="btn btn-primary" id="btn-confirm-collection" type="button" style="padding: 3px 8px; font-size: 11px;">OK</button>
+            </div>
+
+            <div class="sidebar-collections-list" id="sidebar-collections-list"></div>
           </aside>
 
           <div class="library-center">
@@ -195,7 +221,7 @@
                   type="text"
                   id="search-input"
                   class="search-input"
-                  placeholder="Rechercher un jeu..."
+                  placeholder="Rechercher un jeu, genre, studio, tag..."
                 />
                 <span class="kbd-hint">/</span>
               </div>
@@ -208,6 +234,7 @@
                 >
                   <option value="recent">Récents</option>
                   <option value="title">Titre A–Z</option>
+                  <option value="year">Année</option>
                   <option value="playtime">Temps de jeu</option>
                   <option value="console">Console</option>
                 </select>
@@ -220,8 +247,16 @@
                 <button class="btn" id="btn-scan-folder" title="Scanner un dossier de jeux">
                   Dossier
                 </button>
+                <button class="btn" id="btn-enrich-library" title="Télécharger automatiquement les jaquettes et métadonnées (Libretro / GameTDB)">
+                  <svg viewBox="0 0 24 24">
+                    <rect x="3" y="4" width="18" height="16" rx="2" />
+                    <circle cx="8.5" cy="9.5" r="1.5" />
+                    <path d="M21 16l-5-5-4 4-2.5-2.5L3 19" />
+                  </svg>
+                  Jaquettes
+                </button>
                 <div class="toolbar-divider"></div>
-                <button class="btn btn-ghost" id="btn-toggle-inspector" title="Afficher les sauvegardes et options du jeu [Y]">
+                <button class="btn btn-ghost" id="btn-toggle-inspector" title="Afficher la fiche, les jaquettes et les sauvegardes du jeu [Y]">
                   <span>Détails</span>
                 </button>
                 <button class="btn btn-primary" id="btn-launch-selected">
@@ -252,13 +287,112 @@
               </button>
             </div>
 
-            <div class="inspector-tabs inspector-tabs-2" role="tablist">
-              <button class="inspector-tab-btn active" data-insp-tab="insp-pane-states">Sauvegardes</button>
-              <button class="inspector-tab-btn" data-insp-tab="insp-pane-mods">Mods &amp; Triche</button>
+            <div class="inspector-tabs" role="tablist">
+              <button class="inspector-tab-btn active" data-insp-tab="insp-pane-info">Fiche</button>
+              <button class="inspector-tab-btn" data-insp-tab="insp-pane-states">Saves</button>
+              <button class="inspector-tab-btn" data-insp-tab="insp-pane-mods">Mods</button>
             </div>
 
-            <!-- SOUS-ONGLET 1 : INFOS ESSENTIELLES & SAVE STATES -->
-            <div class="inspector-tab-pane active" id="insp-pane-states">
+            <!-- SOUS-ONGLET 1 : JAQUETTE, MÉTADONNÉES & COLLECTIONS -->
+            <div class="inspector-tab-pane active" id="insp-pane-info">
+              <div class="inspector-section">
+                <div class="section-title">
+                  <span>Jaquette</span>
+                  <span style="display:flex; gap:4px;">
+                    <button class="btn" id="btn-insp-fetch-meta" type="button" style="padding:2px 8px; font-size:11px;" title="Récupérer jaquette et métadonnées (Libretro / GameTDB)">Auto</button>
+                    <button class="btn btn-ghost" id="btn-insp-pick-cover" type="button" style="padding:2px 8px; font-size:11px;" title="Choisir une image locale (.png, .jpg, .webp)">Image…</button>
+                    <button class="btn btn-inline-delete" id="btn-insp-clear-cover" type="button" title="Retirer la jaquette" aria-label="Retirer la jaquette" style="display:none;">✕</button>
+                  </span>
+                </div>
+                <div class="inspector-cover-frame" id="insp-cover-preview">
+                  <div class="inspector-cover-placeholder mono">Aucune jaquette en cache</div>
+                </div>
+              </div>
+
+              <div class="inspector-section">
+                <div class="section-title">
+                  <span>Métadonnées</span>
+                  <button class="btn btn-ghost" id="btn-insp-edit-meta" type="button" style="padding:2px 8px; font-size:11px;">Modifier</button>
+                </div>
+
+                <div id="insp-meta-readonly">
+                  <div class="kv-row">
+                    <span class="kv-label">Année</span>
+                    <span class="kv-val mono" id="insp-meta-year">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-label">Genre</span>
+                    <span class="kv-val" id="insp-meta-genre">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-label">Développeur</span>
+                    <span class="kv-val" id="insp-meta-dev">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-label">Éditeur</span>
+                    <span class="kv-val" id="insp-meta-pub">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-label">Code / CRC32</span>
+                    <span class="kv-val mono" id="insp-meta-id">—</span>
+                  </div>
+                  <p class="inspector-meta-desc" id="insp-meta-desc" style="display:none;"></p>
+                </div>
+
+                <form class="inspector-meta-form" id="insp-meta-form" style="display:none;">
+                  <label class="meta-field">
+                    <span>Titre</span>
+                    <input type="text" id="meta-edit-title" class="field-inline" maxlength="120" />
+                  </label>
+                  <div class="meta-field-row">
+                    <label class="meta-field" style="flex:0 0 92px;">
+                      <span>Année</span>
+                      <input type="text" id="meta-edit-year" class="field-inline mono" maxlength="16" placeholder="2010" />
+                    </label>
+                    <label class="meta-field" style="flex:1;">
+                      <span>Genre</span>
+                      <input type="text" id="meta-edit-genre" class="field-inline" maxlength="80" placeholder="RPG, Course..." />
+                    </label>
+                  </div>
+                  <label class="meta-field">
+                    <span>Développeur</span>
+                    <input type="text" id="meta-edit-dev" class="field-inline" maxlength="80" placeholder="Game Freak, Nintendo..." />
+                  </label>
+                  <label class="meta-field">
+                    <span>Éditeur</span>
+                    <input type="text" id="meta-edit-pub" class="field-inline" maxlength="80" placeholder="Nintendo..." />
+                  </label>
+                  <label class="meta-field">
+                    <span>Notes / Résumé</span>
+                    <textarea id="meta-edit-desc" class="field-inline" rows="3" maxlength="600" placeholder="Notes personnelles, version, progression..."></textarea>
+                  </label>
+                  <div style="display:flex; gap:6px; justify-content:flex-end; margin-top:4px;">
+                    <button class="btn btn-ghost" id="btn-insp-cancel-meta" type="button" style="padding:4px 10px; font-size:11px;">Annuler</button>
+                    <button class="btn btn-primary" type="submit" style="padding:4px 10px; font-size:11px;">Enregistrer</button>
+                  </div>
+                </form>
+              </div>
+
+              <div class="inspector-section">
+                <div class="section-title">
+                  <span>Collections</span>
+                </div>
+                <div class="collection-chips-wrap" id="insp-collections-chips"></div>
+                <div class="collection-inline-add">
+                  <input
+                    type="text"
+                    id="insp-new-collection-input"
+                    class="field-inline"
+                    maxlength="36"
+                    placeholder="Nouvelle collection..."
+                  />
+                  <button class="btn" id="btn-insp-add-collection" type="button" style="padding:4px 9px; font-size:11px;">+ Ajouter</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- SOUS-ONGLET 2 : INFOS ESSENTIELLES & SAVE STATES -->
+            <div class="inspector-tab-pane" id="insp-pane-states">
               <div class="inspector-section">
                 <div class="kv-row">
                   <span class="kv-label">Temps de jeu</span>

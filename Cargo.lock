@@ -5193,6 +5193,9 @@ dependencies = [
 name = "zaimule"
 version = "1.7.1"
 dependencies = [
+ "base64 0.23.1",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tauri",

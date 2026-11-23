@@ -32,6 +32,7 @@ export function filterCatalogEntries(entries, filterOptions = {}) {
   if (!Array.isArray(entries)) return [];
   const {
     consoleFilter = "ALL",
+    collectionFilter = "",
     onlyNativeRust = false,
     onlyLinkReady = false,
     onlyFavorites = false,
@@ -39,6 +40,7 @@ export function filterCatalogEntries(entries, filterOptions = {}) {
   } = filterOptions;
 
   const normalizedQuery = normalizeSearchText(query);
+  const normalizedCollection = normalizeSearchText(collectionFilter);
   const rawFilter = String(consoleFilter || "ALL").toUpperCase();
   const allowedConsoles =
     rawFilter === "ALL"
@@ -56,6 +58,12 @@ export function filterCatalogEntries(entries, filterOptions = {}) {
         return false;
       }
     }
+    if (normalizedCollection) {
+      const cols = Array.isArray(item.collections) ? item.collections : [];
+      if (!cols.some((c) => normalizeSearchText(c) === normalizedCollection)) {
+        return false;
+      }
+    }
     if (onlyNativeRust && item.engineKind !== "nativeRust") {
       return false;
     }
@@ -67,8 +75,9 @@ export function filterCatalogEntries(entries, filterOptions = {}) {
     }
     if (!normalizedQuery) return true;
 
+    const colsJoined = Array.isArray(item.collections) ? item.collections.join(" ") : "";
     const haystack = normalizeSearchText(
-      `${item.title || ""} ${item.console || ""} ${item.crc32Hex || ""} ${item.titleId || ""} ${item.region || ""} ${item.coreId || ""}`
+      `${item.title || ""} ${item.console || ""} ${item.crc32Hex || ""} ${item.titleId || ""} ${item.region || ""} ${item.coreId || ""} ${item.metadataGenre || ""} ${item.metadataDeveloper || ""} ${item.metadataPublisher || ""} ${item.metadataReleaseYear || ""} ${colsJoined}`
     );
     return haystack.includes(normalizedQuery);
   });
@@ -90,6 +99,65 @@ export function computeConsoleCounts(entries) {
   return counts;
 }
 
+export function computeCollectionCounts(entries, allCollections = []) {
+  const map = new Map();
+  if (Array.isArray(allCollections)) {
+    for (const raw of allCollections) {
+      const name = String(raw || "").trim();
+      if (!name) continue;
+      const key = normalizeSearchText(name);
+      if (!map.has(key)) {
+        map.set(key, { name, count: 0 });
+      }
+    }
+  }
+  if (Array.isArray(entries)) {
+    for (const g of entries) {
+      if (!g || !Array.isArray(g.collections)) continue;
+      const seenForGame = new Set();
+      for (const raw of g.collections) {
+        const name = String(raw || "").trim();
+        if (!name) continue;
+        const key = normalizeSearchText(name);
+        if (seenForGame.has(key)) continue;
+        seenForGame.add(key);
+        if (!map.has(key)) {
+          map.set(key, { name, count: 1 });
+        } else {
+          map.get(key).count += 1;
+        }
+      }
+    }
+  }
+  return Array.from(map.values()).sort((a, b) =>
+    a.name.localeCompare(b.name, "fr", { sensitivity: "base" })
+  );
+}
+
+export function formatShortGenre(genre) {
+  const raw = String(genre || "").trim();
+  if (!raw) return "";
+  const first = raw.split("/")[0].trim();
+  if (/role[- ]playing/i.test(first)) return "RPG";
+  if (/racing|driving/i.test(first)) return "Course";
+  if (/platform/i.test(first)) return "Plateforme";
+  if (/adventure/i.test(first)) return "Aventure";
+  if (/strategy/i.test(first)) return "Stratégie";
+  if (/fighting/i.test(first)) return "Combat";
+  if (/puzzle/i.test(first)) return "Puzzle";
+  if (/sports/i.test(first)) return "Sport";
+  return first;
+}
+
+export function formatGameSubtitle(game, fallbackConsoleLabel) {
+  const year = String(game?.metadataReleaseYear || "").trim();
+  const genre = formatShortGenre(game?.metadataGenre);
+  if (genre && year) return `${genre} · ${year}`;
+  if (year) return `${fallbackConsoleLabel} · ${year}`;
+  if (genre) return genre;
+  return fallbackConsoleLabel;
+}
+
 export function sortCatalogEntries(entries, sortBy = "recent") {
   if (!Array.isArray(entries)) return [];
   const copy = [...entries];
@@ -104,6 +172,19 @@ export function sortCatalogEntries(entries, sortBy = "recent") {
   if (mode === "playtime") {
     return copy.sort((a, b) => {
       const diff = (Number(b?.playtimeSeconds) || 0) - (Number(a?.playtimeSeconds) || 0);
+      if (diff !== 0) return diff;
+      return String(a?.title || "").localeCompare(String(b?.title || ""), "fr", {
+        sensitivity: "base"
+      });
+    });
+  }
+  if (mode === "year") {
+    const parseYear = (v) => {
+      const m = String(v || "").match(/\b(19\d{2}|20\d{2})\b/);
+      return m ? Number(m[1]) : 0;
+    };
+    return copy.sort((a, b) => {
+      const diff = parseYear(b?.metadataReleaseYear) - parseYear(a?.metadataReleaseYear);
       if (diff !== 0) return diff;
       return String(a?.title || "").localeCompare(String(b?.title || ""), "fr", {
         sensitivity: "base"

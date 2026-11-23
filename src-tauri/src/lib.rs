@@ -1,8 +1,10 @@
+mod metadata_fetcher;
 mod update;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -13,6 +15,7 @@ use zaimule_core::bios::{looks_like_bios_path, BiosImportReport};
 use zaimule_core::catalog::SwitchEngineOverride;
 use zaimule_core::external::{spawn_switch_process, SwitchEngineTarget};
 use zaimule_core::keymap::KeymapWidget;
+use zaimule_core::metadata::{sync_sram_directories, CloudSyncReport, GameMetadataUpdate};
 use zaimule_core::overrides::{GlobalSettings, ShaderPreset};
 use zaimule_core::rewind::SaveStateSlotInfo;
 use zaimule_core::storage::{
@@ -157,6 +160,31 @@ struct BiosImportResponse {
     bootstrap: StationBootstrap,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CoverUpdateResponse {
+    game_id: String,
+    cover_data_url: String,
+    bootstrap: StationBootstrap,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MetadataEnrichResponse {
+    processed_count: usize,
+    covers_found: usize,
+    metadata_found: usize,
+    covers: HashMap<String, String>,
+    bootstrap: StationBootstrap,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudSyncResponse {
+    report: CloudSyncReport,
+    bootstrap: StationBootstrap,
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -186,6 +214,14 @@ fn save_dir(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn rom_cache_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(config_root(app)?.join("rom_cache"))
+}
+
+fn covers_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(config_root(app)?.join("covers"))
+}
+
+fn metadata_cache_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(config_root(app)?.join("metadata_cache"))
 }
 
 fn switch_vault_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1444,6 +1480,9 @@ async fn remove_game_from_library(
         if let Ok(rp) = rom_archive_path(&app, &game_id) {
             let _ = fs::remove_file(rp);
         }
+        if let Ok(cdir) = covers_dir(&app) {
+            metadata_fetcher::remove_cached_cover_files(&cdir, &game_id);
+        }
         persist_library_best_effort(&app, &session);
         Ok(snap)
     })
@@ -1468,6 +1507,369 @@ async fn toggle_game_favorite(
     })
     .await
     .map_err(|e| format!("tâche favori interrompue : {e}"))?
+}
+
+#[tauri::command]
+fn create_collection(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    name: String,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let snap = session.create_collection(&name)?;
+    persist_library_best_effort(&app, &session);
+    Ok(snap)
+}
+
+#[tauri::command]
+fn delete_collection(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    name: String,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let snap = session.delete_collection(&name)?;
+    persist_library_best_effort(&app, &session);
+    Ok(snap)
+}
+
+#[tauri::command]
+fn toggle_game_collection(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    game_id: String,
+    collection: String,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let snap = session.toggle_game_collection(&game_id, &collection)?;
+    persist_library_best_effort(&app, &session);
+    Ok(snap)
+}
+
+#[tauri::command]
+fn update_game_metadata(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    game_id: String,
+    update: GameMetadataUpdate,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let snap = session.update_game_metadata(&game_id, update)?;
+    persist_library_best_effort(&app, &session);
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn load_library_covers(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<HashMap<String, String>, String> {
+    let catalog = {
+        let session = state
+            .session
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        session.catalog.clone()
+    };
+    let cdir = covers_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        metadata_fetcher::load_catalog_cover_map(&cdir, &catalog)
+    })
+    .await
+    .map_err(|e| format!("chargement des jaquettes interrompu : {e}"))
+}
+
+#[tauri::command]
+async fn pick_game_cover(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    game_id: String,
+) -> Result<CoverUpdateResponse, String> {
+    let app_for_dialog = app.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app_for_dialog
+            .dialog()
+            .file()
+            .set_title("Choisir une jaquette (.png, .jpg, .webp)")
+            .add_filter(
+                "Images (.png, .jpg, .jpeg, .webp)",
+                &["png", "jpg", "jpeg", "webp"],
+            )
+            .blocking_pick_file()
+    })
+    .await
+    .map_err(|e| format!("dialogue jaquette interrompu : {e}"))?;
+
+    let Some(file_path) = picked else {
+        return Err("sélection annulée".into());
+    };
+    let src_path = file_path
+        .into_path()
+        .map_err(|e| format!("chemin d'image invalide : {e}"))?;
+
+    let cdir = covers_dir(&app)?;
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || -> Result<CoverUpdateResponse, String> {
+        let (filename, data_url) =
+            metadata_fetcher::import_custom_cover_file(&cdir, &game_id, &src_path)?;
+        let mut session = session_arc
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        let bootstrap = session.set_game_cover_path(&game_id, Some(filename))?;
+        persist_library_best_effort(&app, &session);
+        Ok(CoverUpdateResponse {
+            game_id,
+            cover_data_url: data_url,
+            bootstrap,
+        })
+    })
+    .await
+    .map_err(|e| format!("importation jaquette interrompue : {e}"))?
+}
+
+#[tauri::command]
+async fn clear_game_cover(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    game_id: String,
+) -> Result<StationBootstrap, String> {
+    let cdir = covers_dir(&app)?;
+    let session_arc = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || -> Result<StationBootstrap, String> {
+        metadata_fetcher::remove_cached_cover_files(&cdir, &game_id);
+        let mut session = session_arc
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        let bootstrap = session.set_game_cover_path(&game_id, None)?;
+        persist_library_best_effort(&app, &session);
+        Ok(bootstrap)
+    })
+    .await
+    .map_err(|e| format!("suppression jaquette interrompue : {e}"))?
+}
+
+async fn apply_enrichment_outcomes(
+    app: &AppHandle,
+    session_arc: &Arc<Mutex<EmulatorSession>>,
+    outcomes: Vec<metadata_fetcher::SingleEnrichOutcome>,
+) -> Result<MetadataEnrichResponse, String> {
+    let processed_count = outcomes.len();
+    let mut covers_found = 0usize;
+    let mut metadata_found = 0usize;
+    let mut covers: HashMap<String, String> = HashMap::new();
+
+    let mut session = session_arc
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+
+    for item in outcomes {
+        if item.metadata_found {
+            metadata_found += 1;
+            if let Some(upd) = item.metadata_update {
+                let _ = session.update_game_metadata(&item.game_id, upd);
+            }
+        }
+        if item.cover_found {
+            covers_found += 1;
+            if let Some(fname) = item.cover_filename {
+                let _ = session.set_game_cover_path(&item.game_id, Some(fname));
+            }
+            if let Some(data_url) = item.cover_data_url {
+                covers.insert(item.game_id.clone(), data_url);
+            }
+        }
+    }
+
+    persist_library_best_effort(app, &session);
+    Ok(MetadataEnrichResponse {
+        processed_count,
+        covers_found,
+        metadata_found,
+        covers,
+        bootstrap: session.bootstrap_snapshot(),
+    })
+}
+
+#[tauri::command]
+async fn fetch_game_metadata_and_cover(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    game_id: String,
+    force_cover_refresh: Option<bool>,
+) -> Result<MetadataEnrichResponse, String> {
+    let target_game = {
+        let session = state
+            .session
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        session
+            .catalog
+            .iter()
+            .find(|g| g.id == game_id)
+            .cloned()
+            .ok_or_else(|| format!("jeu introuvable : {game_id}"))?
+    };
+
+    let cdir = covers_dir(&app)?;
+    let mdir = metadata_cache_dir(&app)?;
+    let outcomes = metadata_fetcher::enrich_games_list(
+        vec![target_game],
+        cdir,
+        mdir,
+        force_cover_refresh.unwrap_or(true),
+    )
+    .await?;
+    apply_enrichment_outcomes(&app, &state.session, outcomes).await
+}
+
+#[tauri::command]
+async fn fetch_all_library_metadata(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    force_cover_refresh: Option<bool>,
+) -> Result<MetadataEnrichResponse, String> {
+    let games = {
+        let session = state
+            .session
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        session.catalog.clone()
+    };
+    if games.is_empty() {
+        let session = state
+            .session
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        return Ok(MetadataEnrichResponse {
+            processed_count: 0,
+            covers_found: 0,
+            metadata_found: 0,
+            covers: HashMap::new(),
+            bootstrap: session.bootstrap_snapshot(),
+        });
+    }
+
+    let cdir = covers_dir(&app)?;
+    let mdir = metadata_cache_dir(&app)?;
+    let outcomes = metadata_fetcher::enrich_games_list(
+        games,
+        cdir,
+        mdir,
+        force_cover_refresh.unwrap_or(false),
+    )
+    .await?;
+    apply_enrichment_outcomes(&app, &state.session, outcomes).await
+}
+
+#[tauri::command]
+fn set_auto_rescan_on_startup(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    enabled: bool,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let snap = session.set_auto_rescan_on_startup(enabled);
+    persist_settings_best_effort(&app, &mut session);
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn pick_cloud_sync_dir(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<StationBootstrap, String> {
+    let app_for_dialog = app.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app_for_dialog
+            .dialog()
+            .file()
+            .set_title("Choisir le dossier de synchronisation Cloud Saves (Drive, OneDrive, iCloud, NAS...)")
+            .blocking_pick_folder()
+    })
+    .await
+    .map_err(|e| format!("dialogue dossier cloud interrompu : {e}"))?;
+
+    let Some(folder) = picked else {
+        return Err("sélection annulée".into());
+    };
+    let path = folder
+        .into_path()
+        .map_err(|e| format!("chemin de dossier invalide : {e}"))?;
+    let path_str = path.to_string_lossy().to_string();
+
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let snap = session.set_cloud_sync_dir(Some(path_str));
+    persist_settings_best_effort(&app, &mut session);
+    Ok(snap)
+}
+
+#[tauri::command]
+fn clear_cloud_sync_dir(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let snap = session.set_cloud_sync_dir(None);
+    persist_settings_best_effort(&app, &mut session);
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn sync_cloud_saves_now(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<CloudSyncResponse, String> {
+    let session_arc = Arc::clone(&state.session);
+    let local_saves = save_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<CloudSyncResponse, String> {
+        let (cloud_dir, active_id) = {
+            let mut session = session_arc
+                .lock()
+                .map_err(|_| "verrou session indisponible".to_string())?;
+            flush_sram_best_effort(&app, &mut session);
+            let dir =
+                session.settings.cloud_sync_dir.clone().ok_or_else(|| {
+                    "aucun dossier de synchronisation cloud configuré".to_string()
+                })?;
+            (PathBuf::from(dir), session.active_game_id.clone())
+        };
+
+        let report = sync_sram_directories(&local_saves, &cloud_dir)?;
+
+        let mut session = session_arc
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        if report.downloaded_count > 0 && !active_id.is_empty() {
+            preload_disk_assets_for_game(&app, &mut session, &active_id);
+        }
+        Ok(CloudSyncResponse {
+            report,
+            bootstrap: session.bootstrap_snapshot(),
+        })
+    })
+    .await
+    .map_err(|e| format!("synchronisation cloud interrompue : {e}"))?
 }
 
 #[tauri::command]
@@ -1932,7 +2334,10 @@ pub fn run() {
                                 }
                             }
                         }
-                        if !lib.catalog.is_empty() || !lib.rom_directories.is_empty() {
+                        if !lib.catalog.is_empty()
+                            || !lib.rom_directories.is_empty()
+                            || !lib.collections.is_empty()
+                        {
                             guard.restore_persisted_library(lib);
                         }
                     }
@@ -1940,6 +2345,24 @@ pub fn run() {
 
                 let active_id = guard.active_game_id.clone();
                 preload_disk_assets_for_game(&handle, &mut guard, &active_id);
+
+                if guard.settings.auto_rescan_rom_dirs_on_startup
+                    && !guard.settings.rom_directories.is_empty()
+                {
+                    let rescan_handle = handle.clone();
+                    let session_arc = Arc::clone(&session_for_setup);
+                    tauri::async_runtime::spawn_blocking(move || {
+                        let Ok(mut guard) = session_arc.lock() else {
+                            return;
+                        };
+                        let report = guard.rescan_all_rom_directories();
+                        if !report.imported_entries.is_empty() {
+                            persist_library_best_effort(&rescan_handle, &guard);
+                            let snap = guard.bootstrap_snapshot();
+                            let _ = rescan_handle.emit("zaimule-library-updated", snap);
+                        }
+                    });
+                }
             }
             update::check_in_background(handle);
             Ok(())
@@ -1970,6 +2393,19 @@ pub fn run() {
             rescan_all_rom_directories,
             remove_game_from_library,
             toggle_game_favorite,
+            create_collection,
+            delete_collection,
+            toggle_game_collection,
+            update_game_metadata,
+            load_library_covers,
+            pick_game_cover,
+            clear_game_cover,
+            fetch_game_metadata_and_cover,
+            fetch_all_library_metadata,
+            set_auto_rescan_on_startup,
+            pick_cloud_sync_dir,
+            clear_cloud_sync_dir,
+            sync_cloud_saves_now,
             import_bios_paths,
             pick_and_import_bios,
             refresh_switch_vault,

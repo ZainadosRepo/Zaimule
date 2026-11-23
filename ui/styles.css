@@ -2376,6 +2376,329 @@ canvas.game-canvas {
   background-color: #2B1A17;
 }
 
+/* ==========================================================================
+   ENRICHED LIBRARY — BOXART COVERS, COLLECTIONS, METADATA & CLOUD SYNC
+   ========================================================================== */
+
+.game-cover.has-artwork {
+  background-color: #141210;
+}
+
+.cover-art-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+  z-index: 0;
+  transition: transform 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+  pointer-events: none;
+}
+
+.game-card[data-console="SWITCH"] .game-cover.has-artwork .cover-art-img,
+.game-card[data-console="SWITCH2"] .game-cover.has-artwork .cover-art-img {
+  left: 14px;
+  width: calc(100% - 14px);
+}
+
+.game-card:hover .cover-art-img {
+  transform: scale(1.035);
+}
+
+.game-cover.has-artwork::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: linear-gradient(
+    to top,
+    rgba(14, 12, 11, 0.86) 0%,
+    rgba(14, 12, 11, 0.24) 34%,
+    rgba(14, 12, 11, 0.0) 62%,
+    rgba(14, 12, 11, 0.46) 100%
+  );
+  pointer-events: none;
+}
+
+.game-cover.has-artwork .cover-spine {
+  z-index: 2;
+}
+
+.game-cover.has-artwork .cover-bottom {
+  border-top-color: rgba(255, 255, 255, 0.16);
+  color: rgba(244, 241, 236, 0.9);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
+}
+
+.game-collection-dots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.game-collection-tag {
+  font-size: 10px;
+  line-height: 1.2;
+  padding: 1px 6px;
+  border-radius: var(--radius-xs);
+  background-color: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  max-width: 110px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Sidebar Collections */
+.sidebar-divider {
+  height: 1px;
+  background-color: var(--border-subtle);
+  margin: 10px 4px;
+}
+
+.sidebar-heading-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.sidebar-add-btn {
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border-subtle);
+  background-color: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background-color 0.1s ease, color 0.1s ease, border-color 0.1s ease;
+}
+
+.sidebar-add-btn:hover {
+  background-color: var(--bg-elevated);
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+
+.sidebar-collection-composer {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  padding: 2px 0 6px;
+}
+
+.sidebar-collection-composer .field-inline {
+  min-width: 0;
+  flex: 1;
+  font-size: 11.5px;
+  padding: 4px 7px;
+}
+
+.sidebar-collections-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar-collections-empty {
+  padding: 4px 10px;
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.collection-nav-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.collection-nav-row .console-btn {
+  flex: 1;
+  min-width: 0;
+  padding-right: 26px;
+}
+
+.collection-nav-label-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.collection-delete-btn {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 18px;
+  height: 18px;
+  border-radius: var(--radius-xs);
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 10px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.1s ease, color 0.1s ease, background-color 0.1s ease;
+}
+
+.collection-nav-row:hover .collection-delete-btn,
+.collection-nav-row:focus-within .collection-delete-btn {
+  opacity: 1;
+}
+
+.collection-delete-btn:hover {
+  background-color: #2B1A17;
+  color: #FFDCD4;
+}
+
+/* Inspector Cover, Metadata & Collection Chips */
+.inspector-cover-frame {
+  width: 100%;
+  min-height: 112px;
+  max-height: 196px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background-color: var(--bg-inset);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  padding: 8px;
+}
+
+.inspector-cover-frame img {
+  max-width: 100%;
+  max-height: 180px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border-radius: 3px;
+  box-shadow: var(--shadow-physical);
+}
+
+.inspector-cover-placeholder {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: center;
+  padding: 18px 8px;
+}
+
+.inspector-meta-desc {
+  margin: 10px 0 0;
+  padding-top: 8px;
+  border-top: 1px solid rgba(51, 46, 43, 0.45);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--text-secondary);
+  white-space: pre-line;
+}
+
+.inspector-meta-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.meta-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 10.5px;
+  color: var(--text-secondary);
+}
+
+.meta-field-row {
+  display: flex;
+  gap: 6px;
+}
+
+.meta-field textarea.field-inline {
+  resize: vertical;
+  min-height: 54px;
+  line-height: 1.4;
+}
+
+.collection-chips-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.collection-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background-color: var(--bg-inset);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.1s ease, border-color 0.1s ease, color 0.1s ease;
+}
+
+.collection-chip:hover {
+  border-color: var(--text-secondary);
+  color: var(--text-primary);
+}
+
+.collection-chip.active {
+  background-color: rgba(217, 119, 6, 0.16);
+  border-color: var(--accent-primary);
+  color: var(--text-primary);
+}
+
+.collection-inline-add {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.collection-inline-add .field-inline {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+}
+
+/* Settings -> Library Toggle & Cloud Saves Sync */
+.settings-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-subtle);
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+}
+
+.settings-toggle-row small {
+  display: block;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.settings-toggle-row input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent-primary);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
