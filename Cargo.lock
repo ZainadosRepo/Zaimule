@@ -5191,7 +5191,7 @@ dependencies = [
 
 [[package]]
 name = "zaimule"
-version = "1.7.1"
+version = "1.8.0"
 dependencies = [
  "base64 0.23.1",
  "reqwest",
@@ -5209,7 +5209,7 @@ dependencies = [
 
 [[package]]
 name = "zaimule-core"
-version = "1.7.1"
+version = "1.8.0"
 dependencies = [
  "crc32fast",
  "flate2",
@@ -5221,7 +5221,7 @@ dependencies = [
 
 [[package]]
 name = "zaimule-emu"
-version = "1.7.1"
+version = "1.8.0"
 dependencies = [
  "serde",
  "serde_json",
