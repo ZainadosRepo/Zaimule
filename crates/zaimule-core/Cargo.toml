@@ -1,6 +1,6 @@
 [package]
 name = "zaimule-core"
-version = "1.7.0"
+version = "1.7.1"
 description = "ROM catalog, Switch Torzu/Fritchii vault, pure-Rust ZIP/7z extractors, CRC32/SHA256 hasher, IPS patcher, SRAM inspector, watchpoints, 60s rewind, visual keymapper, and Link Cable sync for Zaimule"
 authors = ["ZainadosRepo"]
 edition = "2021"
