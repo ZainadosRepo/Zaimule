@@ -1518,8 +1518,8 @@ fn raster_poly(
         let mut w2_row = orient(p0, p1, start_c);
         let max_k = (px1 - px0 - 1) as i64;
 
-        // Fast path 1: opaque untextured flat-colored modulation triangle.
-        if fast_opaque_mod && !textured && flat_color {
+        // Fast path 1: opaque untextured flat-colored modulation triangle (Z-buffer).
+        if fast_opaque_mod && !textured && flat_color && !wbuffer {
             let flat_rgb15 = (tri[0].r.clamp(0.0, 31.0) as u16)
                 | ((tri[0].g.clamp(0.0, 31.0) as u16) << 5)
                 | ((tri[0].b.clamp(0.0, 31.0) as u16) << 10);
@@ -1567,7 +1567,7 @@ fn raster_poly(
         // Fast path 2: opaque textured modulation triangle (covers the vast majority of 3D DS geometry).
         if fast_opaque_mod && textured {
             let has_tex_alpha = tex.format == 1 || tex.format == 6;
-            if flat_white && !has_tex_alpha && !depth_equal {
+            if flat_white && !has_tex_alpha && !depth_equal && !wbuffer {
                 // Hottest DS 3D path: format-specialized + adaptive 8px spans + Format 5 block cache.
                 macro_rules! run_fmt_rows {
                     ($fmt:expr) => {
@@ -1641,13 +1641,19 @@ fn raster_poly(
                     let x_end = k_hi as usize;
                     for k_px in x_start..=x_end {
                         let i = row_base + k_px;
-                        let dpass = if depth_equal {
-                            d <= depth[i] + eps
+                        let (cur_d, pre_inv_rw) = if wbuffer {
+                            let irw = 1.0 / rw;
+                            (irw, irw)
                         } else {
-                            d < depth[i]
+                            (d, 0.0)
+                        };
+                        let dpass = if depth_equal {
+                            cur_d <= depth[i] + eps
+                        } else {
+                            cur_d < depth[i]
                         };
                         if dpass {
-                            let inv_rw = 1.0 / rw;
+                            let inv_rw = if wbuffer { pre_inv_rw } else { 1.0 / rw };
                             let s = s_acc * inv_rw;
                             let t = t_acc * inv_rw;
                             if let Some((tc, ta)) =
@@ -1682,7 +1688,7 @@ fn raster_poly(
                                                 as u16)
                                                 << 10)
                                     };
-                                    depth[i] = d;
+                                    depth[i] = cur_d;
                                     fb[i] = rgb555_to_rgb(rgb15);
                                     poly_id[i] = pid;
                                 }
@@ -1727,8 +1733,13 @@ fn raster_poly(
                 let x_end = px0 + k_hi as usize;
 
                 for px in x_start..=x_end {
-                    let cur_d = d;
                     let cur_rw = rw;
+                    let (cur_d, pre_inv_rw) = if wbuffer {
+                        let irw = 1.0 / cur_rw;
+                        (irw, irw)
+                    } else {
+                        (d, 0.0)
+                    };
                     let cur_r = r_acc;
                     let cur_g = g_acc;
                     let cur_b = b_acc;
@@ -1767,7 +1778,7 @@ fn raster_poly(
                     if shadow_draw && (!stencil[i] || poly_id[i] == pid) {
                         continue;
                     }
-                    let inv_rw = 1.0 / cur_rw;
+                    let inv_rw = if wbuffer { pre_inv_rw } else { 1.0 / cur_rw };
                     let vr = cur_r * inv_rw;
                     let vg = cur_g * inv_rw;
                     let vb = cur_b * inv_rw;
@@ -2273,5 +2284,211 @@ mod tests {
         assert!(run_box(
             &mut gx, -0x200, -0x200, -0x400, 0x400, 0x400, 0x800
         ));
+    }
+
+    #[test]
+    fn emit_poly_culls_behind_camera_and_backfaces_and_preserves_late_billboards() {
+        let mut m = Machine::new();
+        let vtx16 = |gx: &mut super::super::gpu3d::Gpu3d, x: i16, y: i16, z: i16| {
+            let p0 = (x as u16 as u32) | ((y as u16 as u32) << 16);
+            let p1 = z as u16 as u32;
+            gx.write_port(0x23, p0);
+            gx.write_port(0x23, p1);
+        };
+
+        // 1) Perspective-like projection with w = -z: polygons at z > 0 have all w <= 0 (behind camera).
+        m.gx.write_port(0x10, 0); // MTX_MODE = PROJ
+        let mut persp = [0i32; 16];
+        persp[0] = 0x1000;
+        persp[5] = 0x1000;
+        persp[10] = -0x1000;
+        persp[11] = -0x1000; // w = -z
+        for word in persp {
+            m.gx.write_port(0x16, word as u32);
+        }
+        m.gx.write_port(0x29, (3 << 6) | (31 << 16)); // double-sided opaque
+        m.gx.write_port(0x40, 1); // QUADS
+        for _ in 0..32 {
+            vtx16(&mut m.gx, -0x400, 0x400, 0x800);
+            vtx16(&mut m.gx, -0x400, -0x400, 0x800);
+            vtx16(&mut m.gx, 0x400, -0x400, 0x800);
+            vtx16(&mut m.gx, 0x400, 0x400, 0x800);
+        }
+        m.gx.write_port(0x41, 0);
+        assert_eq!(
+            m.gx.polys.len(),
+            0,
+            "behind-camera (all w <= 0) polygons must be rejected before RAM commit"
+        );
+        assert_eq!(m.gx.verts.len(), 0);
+
+        // 2) Switch back to identity clip matrix (w = +1.0) and submit 1500 back-facing GX_CULL_BACK quads.
+        m.gx.write_port(0x15, 0); // MTX_IDENTITY on PROJ
+        m.gx.write_port(0x29, (1 << 7) | (31 << 16)); // show_front=1, show_back=0 (GX_CULL_BACK)
+        m.gx.write_port(0x20, 31); // red
+        m.gx.write_port(0x40, 1); // QUADS
+        for _ in 0..1500 {
+            // Clockwise in clip-space (+Y up) => back-facing (`dot > 0`, `area2 > 0`).
+            vtx16(&mut m.gx, -0x800, 0x800, 0x400);
+            vtx16(&mut m.gx, 0x800, 0x800, 0x400);
+            vtx16(&mut m.gx, 0x800, -0x800, 0x400);
+            vtx16(&mut m.gx, -0x800, -0x800, 0x400);
+        }
+        m.gx.write_port(0x41, 0);
+        assert_eq!(
+            m.gx.polys.len(),
+            0,
+            "back-facing GX_CULL_BACK quads must be culled before consuming polygon/vertex RAM"
+        );
+        assert_eq!(m.gx.verts.len(), 0);
+
+        // 3) Submit 2200 visible front-facing background quads (> 2048 hardware MAX_POLYS / > 6144 MAX_VERTS),
+        //    then submit a late-drawn green character billboard quad in the center (HeartGold draw order).
+        m.gx.write_port(0x20, 31); // pure red background tiles at z = +0x400
+        m.gx.write_port(0x40, 1); // QUADS
+        for _ in 0..2200 {
+            // Counter-clockwise in clip-space (+Y up) => front-facing (`dot < 0`, `area2 < 0`).
+            vtx16(&mut m.gx, -0x800, 0x800, 0x400);
+            vtx16(&mut m.gx, -0x800, -0x800, 0x400);
+            vtx16(&mut m.gx, 0x800, -0x800, 0x400);
+            vtx16(&mut m.gx, 0x800, 0x800, 0x400);
+        }
+        m.gx.write_port(0x41, 0);
+
+        // Late-drawn character billboard closer to camera (z = -0x200), pure green.
+        m.gx.write_port(0x20, 31 << 5);
+        m.gx.write_port(0x40, 1);
+        vtx16(&mut m.gx, -0x200, 0x200, -0x200);
+        vtx16(&mut m.gx, -0x200, -0x200, -0x200);
+        vtx16(&mut m.gx, 0x200, -0x200, -0x200);
+        vtx16(&mut m.gx, 0x200, 0x200, -0x200);
+        m.gx.write_port(0x41, 0);
+
+        assert!(
+            m.gx.ram_overflow,
+            "ram_overflow should still flag when exceeding hardware 2048/6144 limits"
+        );
+        assert_eq!(
+            m.gx.polys.len(),
+            2201,
+            "late-drawn character billboard must be retained within internal headroom"
+        );
+
+        m.gx.write_port(0x50, 0); // SWAP_BUFFERS (Z-buffer)
+        let fb = render(&m);
+        let center = fb[96 * WIDTH + 128];
+        let r = (center >> 16) & 0xFF;
+        let g = (center >> 8) & 0xFF;
+        assert!(
+            g > 240 && r < 16,
+            "late-drawn green billboard must render visibly at screen center, got {center:#08X}"
+        );
+    }
+
+    #[test]
+    fn wbuffer_uses_perspective_correct_depth_for_sloped_quads() {
+        let mut m = Machine::new();
+        m.gx.swap_param = 2; // GX_BUFFERMODE_W
+        let attr = (3 << 6) | (31 << 16);
+
+        // Quad 0 (green): sloped in W from w=4096 at bottom (y=-w) to w=24576 at top (y=+w).
+        // Exact perspective W at screen center (y=0) is 2 / (1/4096 + 1/24576) ~= 7022,
+        // whereas linear screen-space W would be (4096 + 24576)/2 = 14336.
+        // Quad 1 (red): flat at constant w=10000 (strictly behind 7022, but ahead of 14336).
+        m.gx.disp_verts = vec![
+            Vertex {
+                clip: [-24576, 24576, 0, 24576],
+                color: 31 << 5,
+                tex: [0, 0],
+            },
+            Vertex {
+                clip: [-4096, -4096, 0, 4096],
+                color: 31 << 5,
+                tex: [0, 0],
+            },
+            Vertex {
+                clip: [4096, -4096, 0, 4096],
+                color: 31 << 5,
+                tex: [0, 0],
+            },
+            Vertex {
+                clip: [24576, 24576, 0, 24576],
+                color: 31 << 5,
+                tex: [0, 0],
+            },
+            Vertex {
+                clip: [-10000, 10000, 0, 10000],
+                color: 31,
+                tex: [0, 0],
+            },
+            Vertex {
+                clip: [-10000, -10000, 0, 10000],
+                color: 31,
+                tex: [0, 0],
+            },
+            Vertex {
+                clip: [10000, -10000, 0, 10000],
+                color: 31,
+                tex: [0, 0],
+            },
+            Vertex {
+                clip: [10000, 10000, 0, 10000],
+                color: 31,
+                tex: [0, 0],
+            },
+        ];
+        m.gx.disp_polys = vec![
+            Polygon {
+                attr,
+                texparam: 0,
+                pltt: 0,
+                verts: [0, 1, 2, 3],
+                nverts: 4,
+            },
+            Polygon {
+                attr,
+                texparam: 0,
+                pltt: 0,
+                verts: [4, 5, 6, 7],
+                nverts: 4,
+            },
+        ];
+
+        let fb = render(&m);
+        let center = fb[96 * WIDTH + 128];
+        let r = (center >> 16) & 0xFF;
+        let g = (center >> 8) & 0xFF;
+        assert!(
+            g > 240 && r < 16,
+            "perspective-correct W-buffer must keep closer green sloped quad (w~=7022) in front of red quad (w=10000), got {center:#08X}"
+        );
+    }
+
+    #[test]
+    fn sqrt64_handles_u64_max_and_ram_count_clamps_to_hardware_limits() {
+        use super::super::bus::{Bus, MachineHandle, View};
+        let handle = MachineHandle::new(Machine::new());
+        let mut view = View::<0>::new(handle.ptr());
+
+        // 64-bit SQRT at u64::MAX must complete immediately with u32::MAX.
+        view.write16(0x0400_02B0, 1);
+        view.write32(0x0400_02B8, u32::MAX);
+        view.write32(0x0400_02BC, u32::MAX);
+        assert_eq!(view.read32(0x0400_02B4), u32::MAX);
+
+        // RAM_COUNT registers (0x04000604/0x04000606) clamp cleanly to MAX_POLYS / MAX_VERTS.
+        {
+            let mut mm = view.m.borrow_mut();
+            mm.gx.polys.resize(2500, Polygon::default());
+            mm.gx.verts.resize(7500, Vertex::default());
+        }
+        assert_eq!(
+            view.read16(0x0400_0604),
+            super::super::gpu3d::MAX_POLYS as u16
+        );
+        assert_eq!(
+            view.read16(0x0400_0606),
+            super::super::gpu3d::MAX_VERTS as u16
+        );
     }
 }

@@ -120,6 +120,12 @@ pub struct Polygon {
 
 pub const MAX_POLYS: usize = 2048;
 pub const MAX_VERTS: usize = 6144;
+// Extra internal storage headroom above hardware limits so dense outdoor scenes
+// (e.g. Pokémon HG/SS/Pt) never drop late-drawn character billboards when unclipped
+// edge polygons briefly exceed hardware counts; RAM_COUNT registers remain clamped
+// to MAX_POLYS / MAX_VERTS.
+const INTERNAL_MAX_POLYS: usize = 4096;
+const INTERNAL_MAX_VERTS: usize = 16384;
 
 /// Stack-inline 4-byte packed command queue with the exact serde wire layout of `VecDeque<u8>`.
 #[derive(Clone, Copy, Default)]
@@ -754,47 +760,113 @@ impl Gpu3d {
     /// Accept or reject a completed polygon whose corners are indices into
     /// the current primitive's vertex list.
     fn emit_poly(&mut self, v: [usize; 4], nverts: u8) {
-        if self.polys.len() >= MAX_POLYS {
-            self.ram_overflow = true;
-            return;
-        }
-        // Trivial reject: all vertices outside the same frustum plane. Only
-        // valid when every w is positive; polygons crossing w<=0 are kept and
-        // clipped properly at render time.
-        let any_wneg = v[..nverts as usize]
-            .iter()
-            .any(|&i| self.strip_v[i].clip[3] <= 0);
-        if !any_wneg {
-            for axis in 0..3 {
-                let mut all_lo = true;
-                let mut all_hi = true;
-                for &i in &v[..nverts as usize] {
-                    let c = self.strip_v[i].clip;
-                    let (x, w) = (c[axis] as i64, c[3] as i64);
-                    if x >= -w {
-                        all_lo = false;
-                    }
-                    if x <= w {
-                        all_hi = false;
-                    }
-                }
-                if all_lo || all_hi {
-                    self.rejected += 1;
-                    return;
-                }
+        let verts = &v[..nverts as usize];
+        // Homogeneous clip-space frustum trivial rejection. Every frustum plane
+        // (w > 0, w + x >= 0, w - x >= 0, w + y >= 0, w - y >= 0, w + z >= 0,
+        // w - z >= 0) is a linear half-space in 4D homogeneous coordinates, so if
+        // all vertices fail the same inequality the polygon cannot intersect the
+        // view frustum even when some or all vertices have w <= 0.
+        let mut all_w_nonpos = true;
+        let mut any_w_nonpos = false;
+        let mut all_x_lo = true;
+        let mut all_x_hi = true;
+        let mut all_y_lo = true;
+        let mut all_y_hi = true;
+        let mut all_z_lo = true;
+        let mut all_z_hi = true;
+        for &i in verts {
+            let c = self.strip_v[i].clip;
+            let (x, y, z, w) = (c[0] as i64, c[1] as i64, c[2] as i64, c[3] as i64);
+            if w > 0 {
+                all_w_nonpos = false;
+            } else {
+                any_w_nonpos = true;
+            }
+            if x >= -w {
+                all_x_lo = false;
+            }
+            if x <= w {
+                all_x_hi = false;
+            }
+            if y >= -w {
+                all_y_lo = false;
+            }
+            if y <= w {
+                all_y_hi = false;
+            }
+            if z >= -w {
+                all_z_lo = false;
+            }
+            if z <= w {
+                all_z_hi = false;
             }
         }
+        if all_w_nonpos || all_x_lo || all_x_hi || all_y_lo || all_y_hi || all_z_lo || all_z_hi {
+            self.rejected += 1;
+            return;
+        }
+
+        // Hardware-accurate clip-space backface culling BEFORE committing to
+        // polygon/vertex RAM (matches real NDS SubmitPolygon / render3d winding).
+        // Without this, back-facing outdoor map/prop geometry consumes ~2x the
+        // hardware budget and starves late-drawn billboards (e.g. Pokémon HG/SS
+        // player & follower drawn in BillboardLists_Draw after shadows).
+        let show_back = self.cur_attr & (1 << 6) != 0;
+        let show_front = self.cur_attr & (1 << 7) != 0;
+        if !show_front && !show_back {
+            self.rejected += 1;
+            return;
+        }
+        if !any_w_nonpos && !(show_front && show_back) {
+            let clip_dot = |a: [i32; 4], b: [i32; 4], c: [i32; 4]| -> i128 {
+                let (x0, y0, w0) = (a[0] as i128, a[1] as i128, a[3] as i128);
+                let (x1, y1, w1) = (b[0] as i128, b[1] as i128, b[3] as i128);
+                let (x2, y2, w2) = (c[0] as i128, c[1] as i128, c[3] as i128);
+                let nx = (y0 - y1) * (w2 - w1) - (w0 - w1) * (y2 - y1);
+                let ny = (w0 - w1) * (x2 - x1) - (x0 - x1) * (w2 - w1);
+                let nz = (x0 - x1) * (y2 - y1) - (y0 - y1) * (x2 - x1);
+                x1 * nx + y1 * ny + w1 * nz
+            };
+            let mut dot = clip_dot(
+                self.strip_v[v[0]].clip,
+                self.strip_v[v[1]].clip,
+                self.strip_v[v[2]].clip,
+            );
+            if dot == 0 && nverts == 4 {
+                dot = clip_dot(
+                    self.strip_v[v[0]].clip,
+                    self.strip_v[v[2]].clip,
+                    self.strip_v[v[3]].clip,
+                );
+            }
+            if (dot < 0 && !show_front) || (dot > 0 && !show_back) {
+                self.rejected += 1;
+                return;
+            }
+        }
+
+        // Check polygon & vertex budgets atomically before pushing any vertex so
+        // an overflow never leaks half-committed corners into vertex RAM.
+        let need_verts = verts
+            .iter()
+            .filter(|&&i| self.strip_ci[i].is_none())
+            .count();
+        if self.polys.len() >= MAX_POLYS || self.verts.len() + need_verts > MAX_VERTS {
+            self.ram_overflow = true;
+        }
+        if self.polys.len() >= INTERNAL_MAX_POLYS
+            || self.verts.len() + need_verts > INTERNAL_MAX_VERTS
+        {
+            return;
+        }
+
         // Commit vertices to vertex RAM (sharing strip vertices already
         // committed by an earlier accepted polygon).
         let mut idx = [0u16; 4];
-        for (k, &i) in v[..nverts as usize].iter().enumerate() {
+        for (k, &i) in verts.iter().enumerate() {
             idx[k] = match self.strip_ci[i] {
                 Some(ci) => ci,
                 None => {
-                    if self.verts.len() >= MAX_VERTS {
-                        self.ram_overflow = true;
-                        return;
-                    }
                     let ci = self.verts.len() as u16;
                     self.verts.push(self.strip_v[i]);
                     self.strip_ci[i] = Some(ci);

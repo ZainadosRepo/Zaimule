@@ -1885,9 +1885,14 @@ impl Machine {
             self.sqrt_param as u32 as u64
         };
         self.sqrt_result = (v as f64).sqrt() as u32;
-        // Integer-exact fixup.
-        while (self.sqrt_result as u64 + 1) * (self.sqrt_result as u64 + 1) <= v {
-            self.sqrt_result += 1;
+        // Integer-exact fixup (guarded against u64 overflow near u64::MAX).
+        while let Some(sq) = (self.sqrt_result as u64 + 1).checked_mul(self.sqrt_result as u64 + 1)
+        {
+            if sq <= v {
+                self.sqrt_result += 1;
+            } else {
+                break;
+            }
         }
         while (self.sqrt_result as u64) * (self.sqrt_result as u64) > v {
             self.sqrt_result -= 1;
@@ -2409,8 +2414,8 @@ impl<const CPU: usize> View<CPU> {
             0x0600 if cpu == 0 => m.gx.gxstat_lo(),
             0x0602 if cpu == 0 => 0x0600 | (m.gxstat_irq as u16) << 14,
             // RAM_COUNT: polygons in bits 0-11, vertices in 16-28.
-            0x0604 if cpu == 0 => m.gx.polys.len() as u16,
-            0x0606 if cpu == 0 => m.gx.verts.len() as u16,
+            0x0604 if cpu == 0 => m.gx.polys.len().min(super::gpu3d::MAX_POLYS) as u16,
+            0x0606 if cpu == 0 => m.gx.verts.len().min(super::gpu3d::MAX_VERTS) as u16,
             // POS_TEST result.
             0x0620 if cpu == 0 => m.gx.pos_result[0] as u16,
             0x0622 if cpu == 0 => (m.gx.pos_result[0] >> 16) as u16,
