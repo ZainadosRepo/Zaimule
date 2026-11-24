@@ -14,7 +14,7 @@ use crate::nds::NdsCore;
 use crate::nds_core::NdsBiosAssets;
 use crate::traits::{CpuDebugSnapshot, EmulatorBackend, FrameStepResult};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use zaimule_core::archive::{
     extract_7z_entry_to_file, extract_zip_entry_to_file, list_zip_entries,
@@ -43,8 +43,9 @@ use zaimule_core::macros::{
 };
 use zaimule_core::metadata::{normalize_collection_name, GameMetadataUpdate};
 use zaimule_core::netplay::{
-    discover_stun_candidate, format_deep_link, parse_deep_link, NetplayChatMessage, NetplayRoom,
-    NetplayWirePacket, StunDiscoveryCandidate, TournamentBracket, UdpNetplayNode,
+    discover_stun_candidate, format_deep_link, parse_deep_link, validate_relay_url, GbLinkPayload,
+    NetplayChatMessage, NetplayRoom, NetplayWirePacket, StunDiscoveryCandidate, TournamentBracket,
+    UdpNetplayNode, GB_LINK_FLAG_MASTER_TX, GB_LINK_FLAG_SLAVE_REPLY,
 };
 use zaimule_core::overrides::{resolve_effective_config, EffectiveGameConfig, GlobalSettings};
 use zaimule_core::patch::{apply_ips_patch, diff_roms_to_ips, CommunityModPackage, ModLayerEntry};
@@ -133,6 +134,12 @@ pub struct StationBootstrap {
     pub viewport_integer_scale: bool,
     #[serde(default)]
     pub rewind_enabled: bool,
+    #[serde(default)]
+    pub relay_url: Option<String>,
+    #[serde(default)]
+    pub relay_key_configured: bool,
+    #[serde(default)]
+    pub relay_player_name: Option<String>,
 }
 
 /// Combined frame step response for single, dual (2P), or quad (4P Tournament) viewport rendering.
@@ -442,6 +449,10 @@ pub struct EmulatorSession {
     pub active_launched_rom_path: Option<PathBuf>,
     pub active_disasm_rom: Vec<u8>,
     pub link_telemetry: LinkCableTelemetry,
+    pub online_link_enabled: bool,
+    online_link_seq: u16,
+    online_link_rx_queue: VecDeque<GbLinkPayload>,
+    online_link_tx_queue: VecDeque<GbLinkPayload>,
     pub rewind_buffer: RewindBuffer,
     rewind_worker: Option<BackgroundRewindWorker>,
     rewind_generation: u64,
@@ -517,6 +528,10 @@ impl EmulatorSession {
             active_launched_rom_path: None,
             active_disasm_rom: Vec::new(),
             link_telemetry: LinkCableTelemetry::default(),
+            online_link_enabled: false,
+            online_link_seq: 0,
+            online_link_rx_queue: VecDeque::with_capacity(32),
+            online_link_tx_queue: VecDeque::with_capacity(32),
             rewind_buffer: RewindBuffer::new(240),
             rewind_worker: None,
             rewind_generation: 0,
@@ -863,6 +878,14 @@ impl EmulatorSession {
             nds_3d_scale: self.settings.nds_3d_scale.clamp(1, 2),
             viewport_integer_scale: self.settings.viewport_integer_scale,
             rewind_enabled: self.settings.rewind_enabled,
+            relay_url: self.settings.relay_url.clone(),
+            relay_key_configured: self
+                .settings
+                .relay_access_key
+                .as_deref()
+                .map(|k| !k.trim().is_empty())
+                .unwrap_or(false),
+            relay_player_name: self.settings.relay_player_name.clone(),
         }
     }
 
@@ -1350,6 +1373,133 @@ impl EmulatorSession {
             }
         });
         self.bootstrap_snapshot()
+    }
+
+    /// Configures the private VPS E2EE multiplayer relay (`wss://relay.<domain>/ws` + private key).
+    pub fn set_relay_config(
+        &mut self,
+        relay_url: Option<String>,
+        access_key: Option<String>,
+        clear_access_key: bool,
+        player_name: Option<String>,
+    ) -> Result<StationBootstrap, String> {
+        if let Some(raw_url) = relay_url {
+            let trimmed = raw_url.trim();
+            if trimmed.is_empty() {
+                self.settings.relay_url = None;
+            } else {
+                self.settings.relay_url = Some(validate_relay_url(trimmed)?);
+            }
+        }
+        if clear_access_key {
+            self.settings.relay_access_key = None;
+        } else if let Some(raw_key) = access_key {
+            let trimmed = raw_key.trim();
+            if !trimmed.is_empty() {
+                if trimmed.len() < 16 {
+                    return Err(
+                        "clé d'accès relais trop courte (minimum 16 caractères requis)".into(),
+                    );
+                }
+                self.settings.relay_access_key = Some(trimmed.to_string());
+            }
+        }
+        if let Some(raw_name) = player_name {
+            let cleaned: String = raw_name
+                .trim()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(32)
+                .collect();
+            self.settings.relay_player_name = if cleaned.is_empty() {
+                None
+            } else {
+                Some(cleaned)
+            };
+        }
+        Ok(self.bootstrap_snapshot())
+    }
+
+    /// Enables or disables the online encrypted GB/GBC Link Cable tunnel on `core_p1`.
+    pub fn set_online_link_enabled(&mut self, enabled: bool) {
+        self.online_link_enabled = enabled;
+        if !enabled {
+            self.online_link_rx_queue.clear();
+            self.online_link_tx_queue.clear();
+        }
+    }
+
+    /// Queues an authenticated `GbLinkPayload` decrypted from the `ZMR1` relay tunnel.
+    pub fn push_remote_link_payload(&mut self, payload: GbLinkPayload) {
+        if !self.online_link_enabled {
+            return;
+        }
+        if self.online_link_rx_queue.len() >= 64 {
+            let _ = self.online_link_rx_queue.pop_front();
+        }
+        self.online_link_rx_queue.push_back(payload);
+    }
+
+    /// Drains pending outbound `GbLinkPayload`s produced by `core_p1` for E2EE relay transmission.
+    pub fn drain_outgoing_link_payloads(&mut self) -> Vec<GbLinkPayload> {
+        self.online_link_tx_queue.drain(..).collect()
+    }
+
+    fn pump_online_link_pre_step(&mut self, frame: u32, buttons_mask: u16) {
+        if !self.online_link_enabled || self.online_link_rx_queue.is_empty() {
+            return;
+        }
+        while let Some(incoming) = self.online_link_rx_queue.pop_front() {
+            let prev_sb = self.core_p1.exchange_serial_byte(incoming.sio_sb);
+            self.link_telemetry.packets_transferred =
+                self.link_telemetry.packets_transferred.saturating_add(1);
+            self.link_telemetry.last_p2_to_p1_hex = format!("0x{:02X}", incoming.sio_sb);
+            self.link_telemetry.baud_rate_bps = 262_144;
+
+            if incoming.is_master_tx() {
+                if self.online_link_tx_queue.len() >= 64 {
+                    let _ = self.online_link_tx_queue.pop_front();
+                }
+                self.online_link_tx_queue.push_back(GbLinkPayload {
+                    frame,
+                    buttons_mask,
+                    sio_sb: prev_sb,
+                    sio_sc: 0x80,
+                    flags: GB_LINK_FLAG_SLAVE_REPLY,
+                    seq: incoming.seq,
+                });
+                self.link_telemetry.last_p1_to_p2_hex = format!("0x{prev_sb:02X}");
+            }
+        }
+    }
+
+    fn pump_online_link_post_step(
+        &mut self,
+        frame: u32,
+        buttons_mask: u16,
+        serial_out: Option<u8>,
+    ) {
+        if !self.online_link_enabled {
+            return;
+        }
+        if let Some(tx_byte) = serial_out {
+            self.online_link_seq = self.online_link_seq.wrapping_add(1);
+            if self.online_link_tx_queue.len() >= 64 {
+                let _ = self.online_link_tx_queue.pop_front();
+            }
+            self.online_link_tx_queue.push_back(GbLinkPayload {
+                frame,
+                buttons_mask,
+                sio_sb: tx_byte,
+                sio_sc: 0x81,
+                flags: GB_LINK_FLAG_MASTER_TX,
+                seq: self.online_link_seq,
+            });
+            self.link_telemetry.packets_transferred =
+                self.link_telemetry.packets_transferred.saturating_add(1);
+            self.link_telemetry.last_p1_to_p2_hex = format!("0x{tx_byte:02X}");
+            self.link_telemetry.baud_rate_bps = 262_144;
+        }
     }
 
     pub fn to_persisted_library(&self) -> PersistedLibrary {
@@ -2087,11 +2237,14 @@ impl EmulatorSession {
                 let _ = self.udp_node.poll_incoming_packet();
             }
 
+            self.pump_online_link_pre_step(current_frame as u32, mask_p1);
+
             let skip_render = (s + 1 < steps) || opts.skip_render;
             self.pcm_scratch.clear();
             let meta =
                 self.core_p1
                     .step_frame_borrowed(mask_p1, skip_render, &mut self.pcm_scratch);
+            self.pump_online_link_post_step(current_frame as u32, mask_p1, meta.serial_out_byte);
 
             if steps > 1 {
                 for pair in self.pcm_scratch.as_chunks::<2>().0 {
@@ -2330,6 +2483,8 @@ impl EmulatorSession {
             }
         }
 
+        self.pump_online_link_pre_step(current_frame as u32, mask_p1);
+
         let (primary, secondary, tertiary, quaternary) = step_quad_link_frame(
             [
                 self.core_p1.as_mut(),
@@ -2345,6 +2500,7 @@ impl EmulatorSession {
             ],
             &mut self.link_telemetry,
         );
+        self.pump_online_link_post_step(current_frame as u32, mask_p1, primary.serial_out_byte);
 
         self.frame_counter = self.frame_counter.saturating_add(1);
         if self.core_loaded && !self.active_game_id.is_empty() {
@@ -3766,5 +3922,135 @@ mod tests {
         assert!(after_del.catalog[0].collections.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn online_gb_link_cable_exchanges_serial_bytes_over_zmr1_e2ee() {
+        use zaimule_core::netplay::{RelayChannel, RelaySessionKey, Zmr1Cipher};
+
+        let build_gb_serial_rom = |sb_val: u8, sc_val: u8| -> Vec<u8> {
+            let mut rom = vec![0u8; 0x8000];
+            rom[0x0100] = 0xC3;
+            rom[0x0101] = 0x50;
+            rom[0x0102] = 0x01;
+            let code: &[u8] = &[
+                0x3E, sb_val, 0xE0, 0x01, // LD A, sb_val; LDH (SB), A
+                0x3E, sc_val, 0xE0, 0x02, // LD A, sc_val; LDH (SC), A
+                0x18, 0xFE, // JR -2
+            ];
+            rom[0x0150..0x0150 + code.len()].copy_from_slice(code);
+            rom
+        };
+
+        let mut master = EmulatorSession::new();
+        master
+            .import_custom_rom("master.gb", &build_gb_serial_rom(0xA1, 0x81))
+            .unwrap();
+        master.set_online_link_enabled(true);
+
+        let mut slave = EmulatorSession::new();
+        slave
+            .import_custom_rom("slave.gb", &build_gb_serial_rom(0xB2, 0x80))
+            .unwrap();
+        slave.set_online_link_enabled(true);
+
+        let key = RelaySessionKey::generate().unwrap();
+        let cipher_master = Zmr1Cipher::new(&key).unwrap();
+        let cipher_slave = Zmr1Cipher::new(&key).unwrap();
+
+        // 1. Les deux consoles avancent d'une frame : Master initie TX (0xA1), Slave charge SB=0xB2
+        let _ = master.step_viewport_binary_bytes_with_options(
+            0,
+            0,
+            false,
+            1,
+            BinaryStepOptions::default(),
+        );
+        let _ = slave.step_viewport_binary_bytes_with_options(
+            0,
+            0,
+            false,
+            1,
+            BinaryStepOptions::default(),
+        );
+
+        let master_tx = master.drain_outgoing_link_payloads();
+        assert_eq!(master_tx.len(), 1);
+        assert_eq!(master_tx[0].sio_sb, 0xA1);
+        assert!(master_tx[0].is_master_tx());
+
+        // 2. Chiffrement ZMR1 Master -> Relais opaque -> Déchiffrement Slave
+        let sealed_m2s = cipher_master
+            .seal(RelayChannel::GbLink, "LINK42", &master_tx[0].to_bytes())
+            .unwrap();
+        let opened_m2s = cipher_slave
+            .open(RelayChannel::GbLink, "LINK42", &sealed_m2s)
+            .unwrap();
+        let decoded_m2s = GbLinkPayload::from_bytes(&opened_m2s).unwrap();
+        slave.push_remote_link_payload(decoded_m2s);
+
+        // 3. Slave consomme 0xA1 et répond automatiquement son registre SB (0xB2)
+        let _ = slave.step_viewport_binary_bytes_with_options(
+            0,
+            0,
+            false,
+            1,
+            BinaryStepOptions::default(),
+        );
+        assert_eq!(slave.core_p1.debug_snapshot().serial_sb_hex, "0xA1");
+
+        let slave_replies = slave.drain_outgoing_link_payloads();
+        assert_eq!(slave_replies.len(), 1);
+        assert_eq!(slave_replies[0].sio_sb, 0xB2);
+        assert!(slave_replies[0].is_slave_reply());
+
+        // 4. Chiffrement ZMR1 Slave -> Relais opaque -> Déchiffrement Master
+        let sealed_s2m = cipher_slave
+            .seal(RelayChannel::GbLink, "LINK42", &slave_replies[0].to_bytes())
+            .unwrap();
+        let opened_s2m = cipher_master
+            .open(RelayChannel::GbLink, "LINK42", &sealed_s2m)
+            .unwrap();
+        master.push_remote_link_payload(GbLinkPayload::from_bytes(&opened_s2m).unwrap());
+
+        let _ = master.step_viewport_binary_bytes_with_options(
+            0,
+            0,
+            false,
+            1,
+            BinaryStepOptions::default(),
+        );
+        assert_eq!(master.core_p1.debug_snapshot().serial_sb_hex, "0xB2");
+        // Pas de boucle infinie d'écho après réception d'une réponse esclave
+        assert!(master.drain_outgoing_link_payloads().is_empty());
+    }
+
+    #[test]
+    fn relay_config_validates_tls_and_updates_bootstrap_safely() {
+        let mut session = EmulatorSession::new();
+        assert!(session
+            .set_relay_config(Some("ws://public.example.org/ws".into()), None, false, None)
+            .is_err());
+        assert!(session
+            .set_relay_config(None, Some("short".into()), false, None)
+            .is_err());
+
+        let boot = session
+            .set_relay_config(
+                Some("wss://relay.example.org".into()),
+                Some("0123456789abcdef0123456789abcdef".into()),
+                false,
+                Some("Sacha".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            boot.relay_url.as_deref(),
+            Some("wss://relay.example.org/ws")
+        );
+        assert!(boot.relay_key_configured);
+        assert_eq!(boot.relay_player_name.as_deref(), Some("Sacha"));
+
+        let cleared = session.set_relay_config(None, None, true, None).unwrap();
+        assert!(!cleared.relay_key_configured);
     }
 }

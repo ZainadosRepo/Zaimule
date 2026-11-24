@@ -369,6 +369,11 @@ let state = {
   udpPacketsReceived: 0,
   stunCandidate: null,
   netplayChat: [],
+  relayUrl: "",
+  relayKeyConfigured: false,
+  relayPlayerName: "",
+  relayStatus: null,
+  relayPollTimer: null,
   communityMods: [],
   ghostLeaderboard: [],
   cpuOverclockPct: 100,
@@ -2053,7 +2058,162 @@ function buildSwitchEngineBlock(install, target, displayName) {
   return block;
 }
 
+function stopRelayStatusPolling() {
+  if (state.relayPollTimer) {
+    clearInterval(state.relayPollTimer);
+    state.relayPollTimer = null;
+  }
+}
+
+function syncRelayStatusPolling() {
+  if (state.relayStatus?.connected && tauriInvoke) {
+    if (!state.relayPollTimer) {
+      state.relayPollTimer = setInterval(async () => {
+        try {
+          const snap = await invokeBackend("get_relay_status");
+          if (snap) {
+            const wasConnected = Boolean(state.relayStatus?.connected);
+            state.relayStatus = snap;
+            renderRelayMultiplayer();
+            if (wasConnected && !snap.connected) {
+              stopRelayStatusPolling();
+              if (snap.lastError) {
+                showToast(`Relais déconnecté : ${snap.lastError}`, "error", 5000);
+              }
+            }
+          }
+        } catch {
+          // Ignore transient polling failures
+        }
+      }, 1200);
+    }
+  } else {
+    stopRelayStatusPolling();
+  }
+}
+
+function renderRelayMultiplayer() {
+  const st = state.relayStatus;
+  const connected = Boolean(st?.connected);
+
+  const urlInp = document.getElementById("relay-url-input");
+  if (urlInp && document.activeElement !== urlInp) {
+    urlInp.value = state.relayUrl || "";
+  }
+  const playerInp = document.getElementById("relay-player-input");
+  if (playerInp && document.activeElement !== playerInp) {
+    playerInp.value = state.relayPlayerName || "";
+  }
+
+  const keyStatus = document.getElementById("relay-key-status");
+  if (keyStatus) {
+    keyStatus.textContent = state.relayKeyConfigured ? "Clé enregistrée" : "Non définie";
+    keyStatus.classList.toggle("pill-green", Boolean(state.relayKeyConfigured));
+  }
+  const clearKeyBtn = document.getElementById("btn-relay-clear-key");
+  if (clearKeyBtn) {
+    clearKeyBtn.style.display = state.relayKeyConfigured ? "inline-flex" : "none";
+  }
+
+  const headerBadge = document.getElementById("relay-header-badge");
+  if (headerBadge) {
+    if (connected) {
+      const rttTxt = st.rttMs != null ? ` · ${st.rttMs} ms` : "";
+      headerBadge.textContent = `Connecté · #${st.roomCode || "------"}${rttTxt}`;
+      headerBadge.classList.add("pill-green");
+    } else {
+      headerBadge.textContent = state.relayUrl && state.relayKeyConfigured ? "Prêt" : "Hors ligne";
+      headerBadge.classList.remove("pill-green");
+    }
+  }
+
+  const topPill = document.getElementById("relay-status-pill");
+  if (topPill) {
+    if (connected) {
+      const rttTxt = st.rttMs != null ? ` · ${st.rttMs}ms` : "";
+      topPill.textContent = `E2EE #${st.roomCode || ""}${rttTxt}`;
+      topPill.style.display = "inline-flex";
+    } else {
+      topPill.style.display = "none";
+    }
+  }
+
+  const g = getSelectedGame();
+  const gameHint = document.getElementById("relay-selected-game-hint");
+  if (gameHint) {
+    if (g) {
+      const crc = g.crc32Hex ? ` · CRC ${g.crc32Hex}` : "";
+      gameHint.innerHTML = `Jeu sélectionné : <strong>${escapeHtml(g.title)}</strong> <span class="mono" style="color:var(--accent-primary);">(${escapeHtml(g.console)}${escapeHtml(crc)})</span>`;
+    } else {
+      gameHint.textContent =
+        "Sélectionnez un jeu dans la Bibliothèque pour pré-remplir la console et la vérification CRC32.";
+    }
+  }
+
+  const discPanel = document.getElementById("relay-disconnected-panel");
+  const connPanel = document.getElementById("relay-connected-panel");
+  if (discPanel) discPanel.style.display = connected ? "none" : "grid";
+  if (connPanel) connPanel.style.display = connected ? "flex" : "none";
+
+  if (!connected) {
+    return;
+  }
+
+  setText("relay-active-code", st.roomCode || "------");
+  setText("relay-cipher-badge", st.e2eeCipher || "ChaCha20-Poly1305 (ZMR1)");
+  setText("relay-rtt-badge", st.rttMs != null ? `Ping ${st.rttMs} ms` : "Ping -- ms");
+  setText(
+    "relay-packets-badge",
+    `${Number(st.packetsSent) || 0} ↑ / ${Number(st.packetsReceived) || 0} ↓`
+  );
+  const crcPart = st.romCrc32 ? ` · CRC ${st.romCrc32}` : "";
+  setText(
+    "relay-active-game",
+    `${st.gameTitle || "Salon Zaimule"} · ${st.console || "Console"}${crcPart}`
+  );
+
+  const inviteReadout = document.getElementById("relay-invite-uri-readout");
+  if (inviteReadout && st.inviteUri) {
+    inviteReadout.value = st.inviteUri;
+  }
+
+  const peers = Array.isArray(st.peers) ? st.peers : [];
+  setText("relay-peers-count", `${peers.length} / ${st.maxPlayers || 2}`);
+  const peersList = document.getElementById("relay-peers-list");
+  if (peersList) {
+    peersList.innerHTML = "";
+    for (const p of peers) {
+      const item = document.createElement("div");
+      item.className = "relay-peer-item";
+      const isMe = p.peerId === st.peerId;
+      item.innerHTML = `
+        <span><strong>${escapeHtml(p.name)}</strong>${isMe ? ' <span style="color:var(--text-muted);">(vous)</span>' : ""}</span>
+        <span class="pill-badge ${p.isHost ? "pill-green" : ""} mono" style="font-size:10px;">${p.isHost ? "Hôte" : `J${p.peerId}`}</span>
+      `;
+      peersList.appendChild(item);
+    }
+  }
+
+  const chatList = document.getElementById("relay-chat-list");
+  if (chatList) {
+    chatList.innerHTML = "";
+    const msgs = Array.isArray(st.chatMessages) ? st.chatMessages : [];
+    if (msgs.length === 0) {
+      chatList.innerHTML = `<div class="empty-list-hint">Salon chiffré prêt. Envoyez un message à vos amis !</div>`;
+    } else {
+      for (const m of msgs) {
+        const row = document.createElement("div");
+        row.className = `relay-chat-row${m.isSelf ? " is-self" : ""}`;
+        row.innerHTML = `<strong class="mono" style="color:var(--accent-secondary);">[${escapeHtml(m.sender)}]</strong> ${escapeHtml(m.text)}`;
+        chatList.appendChild(row);
+      }
+      chatList.scrollTop = chatList.scrollHeight;
+    }
+  }
+}
+
 function renderNetplayAndCores() {
+  renderRelayMultiplayer();
   const portBadge = document.getElementById("udp-port-badge");
   if (portBadge) {
     portBadge.textContent = state.udpLocalPort
@@ -2797,6 +2957,15 @@ function applyBootstrap(boot, options = {}) {
   }
   if (boot.rewindEnabled !== undefined) {
     state.rewindEnabled = Boolean(boot.rewindEnabled);
+  }
+  if (boot.relayUrl !== undefined) {
+    state.relayUrl = boot.relayUrl || "";
+  }
+  if (boot.relayKeyConfigured !== undefined) {
+    state.relayKeyConfigured = Boolean(boot.relayKeyConfigured);
+  }
+  if (boot.relayPlayerName !== undefined) {
+    state.relayPlayerName = boot.relayPlayerName || "";
   }
   state.warning = boot.warning || null;
   if (state.warning && state.warning !== lastSurfacedWarning) {
@@ -4227,6 +4396,163 @@ function bindEvents() {
     const boot = await invokeBackend("join_netplay_deep_link", { uri, peerAddr });
     if (boot) applyBootstrap(boot);
     launchSelectedGame();
+  });
+
+  // --- Multijoueur E2EE (Relais VPS privé · 0 port ouvert) ---
+  document.getElementById("btn-relay-save-config")?.addEventListener("click", async () => {
+    const relayUrl = document.getElementById("relay-url-input")?.value?.trim() ?? "";
+    const keyInp = document.getElementById("relay-key-input");
+    const accessKey = keyInp?.value?.trim() || null;
+    const playerName = document.getElementById("relay-player-input")?.value?.trim() ?? "";
+
+    if (tauriInvoke) {
+      const boot = await invokeBackend("configure_relay_server", {
+        relayUrl,
+        accessKey,
+        clearAccessKey: false,
+        playerName
+      });
+      if (boot) {
+        if (keyInp) keyInp.value = "";
+        applyBootstrap(boot);
+        showToast("Configuration du relais VPS enregistrée.", "ok");
+      }
+    } else {
+      state.relayUrl = relayUrl;
+      if (accessKey) state.relayKeyConfigured = true;
+      state.relayPlayerName = playerName;
+      if (keyInp) keyInp.value = "";
+      renderRelayMultiplayer();
+      showToast("Configuration du relais enregistrée.", "ok");
+    }
+  });
+
+  document.getElementById("btn-relay-clear-key")?.addEventListener("click", async () => {
+    const keyInp = document.getElementById("relay-key-input");
+    if (keyInp) keyInp.value = "";
+    if (tauriInvoke) {
+      const boot = await invokeBackend("configure_relay_server", {
+        relayUrl: null,
+        accessKey: null,
+        clearAccessKey: true,
+        playerName: null
+      });
+      if (boot) applyBootstrap(boot);
+    } else {
+      state.relayKeyConfigured = false;
+      renderRelayMultiplayer();
+    }
+    showToast("Clé privée du relais effacée.", "info");
+  });
+
+  document.getElementById("btn-relay-create-room")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    const password = document.getElementById("relay-create-password")?.value || null;
+    const maxPlayers = Number(document.getElementById("relay-max-players")?.value) || 2;
+    const playerName = document.getElementById("relay-player-input")?.value?.trim() || null;
+    if (btn) btn.disabled = true;
+    try {
+      const snap = await invokeBackend("relay_create_room", {
+        playerName,
+        password,
+        maxPlayers
+      });
+      if (snap) {
+        state.relayStatus = snap;
+        renderRelayMultiplayer();
+        syncRelayStatusPolling();
+        showToast(`Salon E2EE #${snap.roomCode} créé (ChaCha20-Poly1305).`, "ok");
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
+
+  document.getElementById("btn-relay-join-room")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    const inviteOrCode = document.getElementById("relay-join-invite-input")?.value?.trim() || "";
+    if (!inviteOrCode) {
+      showToast("Collez le lien d'invitation zaimule://room/CODE?...#CLE.", "info");
+      return;
+    }
+    const password = document.getElementById("relay-join-password")?.value || null;
+    const playerName = document.getElementById("relay-player-input")?.value?.trim() || null;
+    if (btn) btn.disabled = true;
+    try {
+      const snap = await invokeBackend("relay_join_room", {
+        inviteOrCode,
+        sessionKey: null,
+        playerName,
+        password
+      });
+      if (snap) {
+        state.relayStatus = snap;
+        renderRelayMultiplayer();
+        syncRelayStatusPolling();
+        showToast(`Connecté au salon E2EE #${snap.roomCode}.`, "ok");
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
+
+  document.getElementById("btn-relay-copy-invite")?.addEventListener("click", async () => {
+    const uri = state.relayStatus?.inviteUri || document.getElementById("relay-invite-uri-readout")?.value || "";
+    if (!uri) return;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(uri);
+      } else {
+        const inp = document.getElementById("relay-invite-uri-readout");
+        if (inp) {
+          inp.select();
+          document.execCommand("copy");
+        }
+      }
+      showToast("Lien d'invitation chiffré copié dans le presse-papiers !", "ok");
+    } catch {
+      showToast("Sélectionnez le lien affiché pour le copier.", "info");
+    }
+  });
+
+  document.getElementById("btn-relay-launch-game")?.addEventListener("click", () => {
+    if (!getSelectedGame()) {
+      showToast("Sélectionnez d'abord un jeu dans la Bibliothèque.", "info");
+      return;
+    }
+    launchSelectedGame();
+  });
+
+  document.getElementById("btn-relay-leave-room")?.addEventListener("click", async () => {
+    const snap = await invokeBackend("relay_leave_room");
+    state.relayStatus = snap || { connected: false };
+    stopRelayStatusPolling();
+    renderRelayMultiplayer();
+    showToast("Salon relais quitté.", "info");
+  });
+
+  const sendRelayChatMessage = async () => {
+    const inp = document.getElementById("relay-chat-input");
+    const text = inp?.value?.trim() || "";
+    if (!text) return;
+    const snap = await invokeBackend("relay_send_chat", { text });
+    if (snap) {
+      if (inp) inp.value = "";
+      state.relayStatus = snap;
+      renderRelayMultiplayer();
+    }
+  };
+  document.getElementById("btn-relay-send-chat")?.addEventListener("click", sendRelayChatMessage);
+  document.getElementById("relay-chat-input")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      sendRelayChatMessage();
+    }
+  });
+
+  document.getElementById("relay-status-pill")?.addEventListener("click", () => {
+    document.getElementById("tab-settings")?.click();
+    document.querySelector('[data-settings-tab="settings-pane-multiplayer"]')?.click();
   });
 
   document.getElementById("btn-launch-selected")?.addEventListener("click", () => {

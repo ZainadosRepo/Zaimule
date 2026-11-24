@@ -89,6 +89,12 @@ pub struct GlobalSettings {
     pub auto_rescan_rom_dirs_on_startup: bool,
     #[serde(default)]
     pub cloud_sync_dir: Option<String>,
+    #[serde(default)]
+    pub relay_url: Option<String>,
+    #[serde(default)]
+    pub relay_access_key: Option<String>,
+    #[serde(default)]
+    pub relay_player_name: Option<String>,
 }
 
 impl Default for GlobalSettings {
@@ -119,6 +125,9 @@ impl Default for GlobalSettings {
             macros: Vec::new(),
             auto_rescan_rom_dirs_on_startup: false,
             cloud_sync_dir: None,
+            relay_url: None,
+            relay_access_key: None,
+            relay_player_name: None,
         }
     }
 }

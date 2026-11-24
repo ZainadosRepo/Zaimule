@@ -462,6 +462,7 @@
                 <div class="emu-topbar-left">
                   <span class="emu-game-title" id="active-emu-game">Aucun jeu lancé</span>
                   <span class="pill-badge pill-green mono" id="link-status-pill" style="display: none;">Link 2P</span>
+                  <button class="pill-badge pill-green mono" id="relay-status-pill" type="button" style="display: none; cursor: pointer;" title="Salon relais chiffré E2EE actif — cliquer pour ouvrir Multijoueur">Relais E2EE</button>
                 </div>
 
                 <div class="emu-topbar-controls">
@@ -710,6 +711,9 @@
             <button class="settings-nav-btn" data-settings-tab="settings-pane-switch">
               Nintendo Switch
             </button>
+            <button class="settings-nav-btn" data-settings-tab="settings-pane-multiplayer" id="nav-settings-multiplayer">
+              Multijoueur E2EE
+            </button>
             <div class="settings-nav-sep"></div>
             <button class="settings-nav-btn" data-settings-tab="settings-pane-advanced">
               Réglages avancés
@@ -852,7 +856,198 @@
               <div id="settings-switch-container"></div>
             </div>
 
-            <!-- SOUS-VUE 4 : RÉGLAGES AVANCÉS -->
+            <!-- SOUS-VUE 4 : MULTIJOUEUR E2EE (RELAIS VPS ZERO-PORT) -->
+            <div class="settings-pane" id="settings-pane-multiplayer">
+              <div class="settings-page-head">
+                <div>
+                  <h2 class="settings-title">Multijoueur E2EE</h2>
+                  <p class="settings-subtitle">
+                    Tunnel TLS 1.3 sortant vers votre relais VPS privé (0 port ouvert sur votre PC ou votre box) et chiffrement de bout en bout ChaCha20-Poly1305.
+                  </p>
+                </div>
+                <span class="pill-badge mono" id="relay-header-badge">Hors ligne</span>
+              </div>
+
+              <div class="settings-group">
+                <div class="setting-row">
+                  <div class="setting-copy">
+                    <div class="setting-name">Adresse du relais VPS (WSS)</div>
+                    <div class="setting-desc">Connexion WebSocket chiffrée TLS 1.3 uniquement (ex. <span class="mono">wss://relay.votre-domaine/ws</span>).</div>
+                  </div>
+                  <input
+                    type="url"
+                    id="relay-url-input"
+                    class="field-inline mono relay-input-wide"
+                    placeholder="wss://relay.votre-domaine.fr/ws"
+                    autocomplete="off"
+                  />
+                </div>
+
+                <div class="setting-row">
+                  <div class="setting-copy">
+                    <div class="setting-name">Clé d'accès privée du relais</div>
+                    <div class="setting-desc">Protège votre relais VPS contre les inconnus (<span class="mono">ZAIMULE_RELAY_ACCESS_KEY</span>). Stockée localement, jamais exposée.</div>
+                  </div>
+                  <div class="relay-key-controls">
+                    <span class="pill-badge mono" id="relay-key-status">Non définie</span>
+                    <input
+                      type="password"
+                      id="relay-key-input"
+                      class="field-inline mono"
+                      placeholder="Coller la clé privée (≥ 16 car.)"
+                      autocomplete="off"
+                      style="width: 210px;"
+                    />
+                    <button class="btn btn-ghost" id="btn-relay-clear-key" type="button" style="display:none;">Effacer</button>
+                  </div>
+                </div>
+
+                <div class="setting-row">
+                  <div class="setting-copy">
+                    <div class="setting-name">Pseudo joueur</div>
+                    <div class="setting-desc">Nom affiché aux participants dans le salon et le chat chiffré.</div>
+                  </div>
+                  <div class="relay-key-controls">
+                    <input
+                      type="text"
+                      id="relay-player-input"
+                      class="field-inline"
+                      placeholder="Sacha"
+                      maxlength="32"
+                      style="width: 170px;"
+                    />
+                    <button class="btn btn-primary" id="btn-relay-save-config" type="button">Enregistrer</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- ÉTAT DÉCONNECTÉ : CRÉER OU REJOINDRE UN SALON -->
+              <div id="relay-disconnected-panel" class="relay-actions-grid" style="margin-top: 18px;">
+                <div class="panel-card relay-action-card">
+                  <div class="section-title">
+                    <span>Créer un salon chiffré</span>
+                    <span class="pill-badge pill-green mono">ZMR1 E2EE</span>
+                  </div>
+                  <div class="relay-game-context" id="relay-selected-game-hint">
+                    Sélectionnez un jeu dans la Bibliothèque pour pré-remplir la console et le CRC32.
+                  </div>
+                  <div class="relay-form-stack">
+                    <div class="relay-inline-fields">
+                      <input
+                        type="password"
+                        id="relay-create-password"
+                        class="field-inline"
+                        placeholder="Mot de passe du salon (optionnel)"
+                        autocomplete="off"
+                        style="flex: 1;"
+                      />
+                      <select id="relay-max-players" class="field-inline mono" style="width: 112px;" title="Joueurs max">
+                        <option value="2" selected>2 joueurs</option>
+                        <option value="4">4 joueurs</option>
+                        <option value="8">8 joueurs</option>
+                      </select>
+                    </div>
+                    <button class="btn btn-primary" id="btn-relay-create-room" type="button">
+                      Créer le salon &amp; générer le lien
+                    </button>
+                  </div>
+                </div>
+
+                <div class="panel-card relay-action-card">
+                  <div class="section-title">
+                    <span>Rejoindre un salon</span>
+                    <span class="pill-badge mono">0 port ouvert</span>
+                  </div>
+                  <div class="relay-game-context">
+                    Collez le lien d'invitation complet (<span class="mono">zaimule://room/CODE?...#CLE</span>) partagé par l'hôte.
+                  </div>
+                  <div class="relay-form-stack">
+                    <input
+                      type="text"
+                      id="relay-join-invite-input"
+                      class="field-inline mono"
+                      placeholder="zaimule://room/K9P4XQ?crc=...#CLE_E2EE"
+                      autocomplete="off"
+                    />
+                    <div class="relay-inline-fields">
+                      <input
+                        type="password"
+                        id="relay-join-password"
+                        class="field-inline"
+                        placeholder="Mot de passe du salon (si requis)"
+                        autocomplete="off"
+                        style="flex: 1;"
+                      />
+                      <button class="btn btn-primary" id="btn-relay-join-room" type="button">
+                        Rejoindre
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- ÉTAT CONNECTÉ : SALON ACTIF, PAIRS, PING & CHAT CHIFFRÉ -->
+              <div id="relay-connected-panel" class="panel-card relay-room-live" style="display: none; margin-top: 18px;">
+                <div class="relay-room-head">
+                  <div>
+                    <div class="relay-room-code-row">
+                      <span class="relay-room-code mono" id="relay-active-code">------</span>
+                      <span class="pill-badge pill-green mono" id="relay-cipher-badge">ChaCha20-Poly1305</span>
+                      <span class="pill-badge mono" id="relay-rtt-badge">Ping -- ms</span>
+                      <span class="pill-badge mono" id="relay-packets-badge">0 ↑ / 0 ↓</span>
+                    </div>
+                    <div class="relay-room-subtitle" id="relay-active-game">Jeu actif · Console</div>
+                  </div>
+                  <div class="relay-room-actions">
+                    <button class="btn btn-primary" id="btn-relay-copy-invite" type="button">Copier le lien</button>
+                    <button class="btn" id="btn-relay-launch-game" type="button">Lancer le jeu</button>
+                    <button class="btn btn-ghost" id="btn-relay-leave-room" type="button">Quitter</button>
+                  </div>
+                </div>
+
+                <div class="relay-invite-box">
+                  <label class="kv-label" for="relay-invite-uri-readout">Lien d'invitation chiffré (la clé après # reste uniquement entre joueurs)</label>
+                  <input
+                    type="text"
+                    id="relay-invite-uri-readout"
+                    class="field-inline mono"
+                    readonly
+                    style="width: 100%; margin-top: 6px;"
+                  />
+                </div>
+
+                <div class="relay-live-split">
+                  <div class="relay-peers-box">
+                    <div class="section-title">
+                      <span>Participants</span>
+                      <span class="mono" id="relay-peers-count" style="font-size:11px; color:var(--text-muted);">1 / 2</span>
+                    </div>
+                    <div id="relay-peers-list" class="relay-peers-list"></div>
+                  </div>
+
+                  <div class="relay-chat-box">
+                    <div class="section-title">
+                      <span>Chat du salon (E2EE)</span>
+                      <span class="mono" style="font-size:11px; color:var(--text-muted);">Illisible par le relais</span>
+                    </div>
+                    <div id="relay-chat-list" class="relay-chat-list"></div>
+                    <div class="relay-inline-fields" style="margin-top: 8px;">
+                      <input
+                        type="text"
+                        id="relay-chat-input"
+                        class="field-inline"
+                        placeholder="Message chiffré dans le salon..."
+                        maxlength="280"
+                        style="flex: 1;"
+                      />
+                      <button class="btn" id="btn-relay-send-chat" type="button">Envoyer</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- SOUS-VUE 5 : RÉGLAGES AVANCÉS -->
             <div class="settings-pane" id="settings-pane-advanced">
               <div class="settings-page-head">
                 <div>

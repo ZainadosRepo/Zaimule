@@ -1,7 +1,9 @@
 mod metadata_fetcher;
+mod relay_client;
 mod update;
 
 use core::sync::atomic::{AtomicU64, Ordering};
+use relay_client::{RelayClient, RelayCreateParams, RelayJoinParams, RelayStatusSnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -113,6 +115,7 @@ impl EmuWorker {
 
 struct AppState {
     session: Arc<Mutex<EmulatorSession>>,
+    relay: Arc<RelayClient>,
     emu_worker: EmuWorker,
     last_sram_flush_ms: Arc<AtomicU64>,
     last_playtime_flush_ms: Arc<AtomicU64>,
@@ -564,6 +567,186 @@ fn connect_netplay_peer(
 }
 
 #[tauri::command]
+fn configure_relay_server(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    relay_url: Option<String>,
+    access_key: Option<String>,
+    clear_access_key: Option<bool>,
+    player_name: Option<String>,
+) -> Result<StationBootstrap, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let snap = session.set_relay_config(
+        relay_url,
+        access_key,
+        clear_access_key.unwrap_or(false),
+        player_name,
+    )?;
+    persist_settings_best_effort(&app, &mut session);
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn relay_create_room(
+    state: tauri::State<'_, AppState>,
+    player_name: Option<String>,
+    password: Option<String>,
+    max_players: Option<u8>,
+) -> Result<RelayStatusSnapshot, String> {
+    let (relay_url, access_key, default_name, console_str, game_title, rom_crc32) = {
+        let session = state
+            .session
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        let url = session.settings.relay_url.clone().ok_or_else(|| {
+            "configurez d'abord l'URL du relais VPS (wss://relay.<domaine>/ws)".to_string()
+        })?;
+        let key =
+            session.settings.relay_access_key.clone().ok_or_else(|| {
+                "configurez d'abord votre clé d'accès privée du relais".to_string()
+            })?;
+        let default_name = session
+            .settings
+            .relay_player_name
+            .clone()
+            .unwrap_or_else(|| "Joueur 1".into());
+        let game = session.active_game();
+        let console_str = game.console.label().to_string();
+        let is_switch = matches!(
+            game.console,
+            zaimule_core::catalog::ConsoleKind::Switch
+                | zaimule_core::catalog::ConsoleKind::Switch2
+        );
+        let crc = if is_switch || game.crc32_hex.trim().is_empty() || game.id.is_empty() {
+            None
+        } else {
+            Some(game.crc32_hex.clone())
+        };
+        let title = if game.title.trim().is_empty() {
+            "Salon Zaimule".to_string()
+        } else {
+            game.title.clone()
+        };
+        (url, key, default_name, console_str, title, crc)
+    };
+
+    let chosen_name = player_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or(default_name);
+
+    let snapshot = state
+        .relay
+        .create_room(RelayCreateParams {
+            relay_url,
+            access_key,
+            console: console_str,
+            game_title,
+            rom_crc32,
+            player_name: chosen_name,
+            password,
+            max_players: max_players.unwrap_or(2),
+        })
+        .await?;
+
+    if let Ok(mut session) = state.session.lock() {
+        session.set_online_link_enabled(true);
+    }
+    Ok(snapshot)
+}
+
+#[tauri::command]
+async fn relay_join_room(
+    state: tauri::State<'_, AppState>,
+    invite_or_code: String,
+    session_key: Option<String>,
+    player_name: Option<String>,
+    password: Option<String>,
+) -> Result<RelayStatusSnapshot, String> {
+    let (relay_url, access_key, default_name, local_crc) = {
+        let session = state
+            .session
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        let url = session.settings.relay_url.clone().ok_or_else(|| {
+            "configurez d'abord l'URL du relais VPS (wss://relay.<domaine>/ws)".to_string()
+        })?;
+        let key =
+            session.settings.relay_access_key.clone().ok_or_else(|| {
+                "configurez d'abord votre clé d'accès privée du relais".to_string()
+            })?;
+        let default_name = session
+            .settings
+            .relay_player_name
+            .clone()
+            .unwrap_or_else(|| "Joueur 2".into());
+        let game = session.active_game();
+        let is_switch = matches!(
+            game.console,
+            zaimule_core::catalog::ConsoleKind::Switch
+                | zaimule_core::catalog::ConsoleKind::Switch2
+        );
+        let crc = if is_switch || game.crc32_hex.trim().is_empty() || game.id.is_empty() {
+            None
+        } else {
+            Some(game.crc32_hex.clone())
+        };
+        (url, key, default_name, crc)
+    };
+
+    let chosen_name = player_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or(default_name);
+
+    let snapshot = state
+        .relay
+        .join_room(RelayJoinParams {
+            relay_url,
+            access_key,
+            invite_or_code,
+            explicit_session_key: session_key,
+            local_rom_crc32: local_crc,
+            player_name: chosen_name,
+            password,
+        })
+        .await?;
+
+    if let Ok(mut session) = state.session.lock() {
+        session.set_online_link_enabled(true);
+    }
+    Ok(snapshot)
+}
+
+#[tauri::command]
+fn relay_leave_room(state: tauri::State<AppState>) -> RelayStatusSnapshot {
+    if let Ok(mut session) = state.session.lock() {
+        session.set_online_link_enabled(false);
+    }
+    state.relay.leave_room()
+}
+
+#[tauri::command]
+fn relay_send_chat(
+    state: tauri::State<AppState>,
+    text: String,
+) -> Result<RelayStatusSnapshot, String> {
+    state.relay.send_chat(&text)
+}
+
+#[tauri::command]
+fn get_relay_status(state: tauri::State<AppState>) -> RelayStatusSnapshot {
+    state.relay.status_snapshot()
+}
+
+#[tauri::command]
 fn save_recorded_macro(
     app: AppHandle,
     state: tauri::State<AppState>,
@@ -604,6 +787,7 @@ async fn step_viewport(
     speed_mult: Option<u8>,
 ) -> Result<ViewportStepResponse, String> {
     let session_arc = Arc::clone(&state.session);
+    let relay_arc = Arc::clone(&state.relay);
     let last_sram_flush = Arc::clone(&state.last_sram_flush_ms);
     let last_playtime_flush = Arc::clone(&state.last_playtime_flush_ms);
     let speed = speed_mult.unwrap_or(1);
@@ -615,7 +799,23 @@ async fn step_viewport(
             let mut session = session_arc
                 .lock()
                 .map_err(|_| "verrou session indisponible".to_string())?;
+            let online_active = relay_arc.is_in_room();
+            if online_active {
+                if !session.online_link_enabled {
+                    session.set_online_link_enabled(true);
+                }
+                for incoming in relay_arc.drain_incoming_gb_link() {
+                    session.push_remote_link_payload(incoming);
+                }
+            } else if session.online_link_enabled {
+                session.set_online_link_enabled(false);
+            }
             let out = session.step_viewport_with_speed(buttons_p1, buttons_p2, turbo_active, speed);
+            if online_active {
+                for outgoing in session.drain_outgoing_link_payloads() {
+                    relay_arc.send_gb_link_payload(outgoing);
+                }
+            }
             let flush_sram = maybe_collect_live_sram(&last_sram_flush, &mut session, now);
             let flush_lib = maybe_collect_live_library(&last_playtime_flush, &mut session, now);
             Ok((out, flush_sram, flush_lib))
@@ -637,6 +837,7 @@ async fn step_viewport_binary(
     options: Option<StepViewportOptions>,
 ) -> Result<tauri::ipc::Response, String> {
     let session_arc = Arc::clone(&state.session);
+    let relay_arc = Arc::clone(&state.relay);
     let last_sram_flush = Arc::clone(&state.last_sram_flush_ms);
     let last_playtime_flush = Arc::clone(&state.last_playtime_flush_ms);
     let speed = speed_mult.unwrap_or(1);
@@ -648,6 +849,17 @@ async fn step_viewport_binary(
             let mut session = session_arc
                 .lock()
                 .map_err(|_| "verrou session indisponible".to_string())?;
+            let online_active = relay_arc.is_in_room();
+            if online_active {
+                if !session.online_link_enabled {
+                    session.set_online_link_enabled(true);
+                }
+                for incoming in relay_arc.drain_incoming_gb_link() {
+                    session.push_remote_link_payload(incoming);
+                }
+            } else if session.online_link_enabled {
+                session.set_online_link_enabled(false);
+            }
             let mut step_opts = zaimule_emu::session::BinaryStepOptions::default();
             if let Some(opts) = options {
                 if let (Some(x), Some(y), Some(pressed)) =
@@ -672,6 +884,11 @@ async fn step_viewport_binary(
                 speed,
                 step_opts,
             );
+            if online_active {
+                for outgoing in session.drain_outgoing_link_payloads() {
+                    relay_arc.send_gb_link_payload(outgoing);
+                }
+            }
             let flush_sram = maybe_collect_live_sram(&last_sram_flush, &mut session, now);
             let flush_lib = maybe_collect_live_library(&last_playtime_flush, &mut session, now);
             Ok((out, flush_sram, flush_lib))
@@ -1179,9 +1396,21 @@ fn save_settings(
     state: tauri::State<AppState>,
     settings: Value,
 ) -> Result<(), String> {
-    if let Ok(parsed) = serde_json::from_value::<GlobalSettings>(settings.clone()) {
+    if let Ok(mut parsed) = serde_json::from_value::<GlobalSettings>(settings.clone()) {
         if let Ok(mut session) = state.session.lock() {
+            if parsed.relay_url.is_none() {
+                parsed.relay_url = session.settings.relay_url.clone();
+            }
+            if parsed.relay_access_key.is_none() {
+                parsed.relay_access_key = session.settings.relay_access_key.clone();
+            }
+            if parsed.relay_player_name.is_none() {
+                parsed.relay_player_name = session.settings.relay_player_name.clone();
+            }
             session.apply_loaded_settings(parsed);
+            if let Ok(merged) = serde_json::to_value(&session.settings) {
+                return save_json_atomic(&settings_path(&app)?, &merged);
+            }
         }
     }
     save_json_atomic(&settings_path(&app)?, &settings)
@@ -2282,6 +2511,7 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(AppState {
             session,
+            relay: Arc::new(RelayClient::new()),
             emu_worker: EmuWorker::spawn(),
             last_sram_flush_ms: Arc::new(AtomicU64::new(0)),
             last_playtime_flush_ms: Arc::new(AtomicU64::new(0)),
@@ -2371,6 +2601,7 @@ pub fn run() {
             if let WindowEvent::CloseRequested { .. } = event {
                 let app = window.app_handle();
                 if let Some(state) = app.try_state::<AppState>() {
+                    let _ = state.relay.leave_room();
                     if let Ok(mut guard) = state.session.lock() {
                         flush_sram_best_effort(app, &mut guard);
                         let _ = guard.take_playtime_dirty();
@@ -2445,6 +2676,12 @@ pub fn run() {
             create_netplay_room,
             join_netplay_deep_link,
             connect_netplay_peer,
+            configure_relay_server,
+            relay_create_room,
+            relay_join_room,
+            relay_leave_room,
+            relay_send_chat,
+            get_relay_status,
             save_recorded_macro,
             save_keymapper_layout,
             step_viewport,

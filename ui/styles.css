@@ -2699,6 +2699,167 @@ canvas.game-canvas {
   flex-shrink: 0;
 }
 
+/* Multijoueur E2EE (Relais VPS Zero-Port) */
+.relay-input-wide {
+  width: min(340px, 100%);
+}
+
+.relay-key-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.relay-actions-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+  gap: 14px;
+}
+
+.relay-action-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.relay-game-context {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  line-height: 1.45;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+}
+
+.relay-form-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: auto;
+}
+
+.relay-inline-fields {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.relay-room-live {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  border-color: rgba(46, 213, 115, 0.35);
+}
+
+.relay-room-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.relay-room-code-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.relay-room-code {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--status-ok);
+}
+
+.relay-room-subtitle {
+  margin-top: 4px;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.relay-room-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.relay-invite-box {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+}
+
+.relay-live-split {
+  display: grid;
+  grid-template-columns: minmax(190px, 0.85fr) minmax(260px, 1.4fr);
+  gap: 14px;
+}
+
+@media (max-width: 780px) {
+  .relay-live-split {
+    grid-template-columns: 1fr;
+  }
+}
+
+.relay-peers-box,
+.relay-chat-box {
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+}
+
+.relay-peers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.relay-peer-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  font-size: var(--text-sm);
+}
+
+.relay-chat-list {
+  margin-top: 6px;
+  min-height: 110px;
+  max-height: 170px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.relay-chat-row {
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.relay-chat-row.is-self {
+  border-left: 2px solid var(--status-ok);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

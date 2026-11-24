@@ -2,11 +2,22 @@
 //! non-blocking UDP Rollback & Link Cable wire protocol (`ZML2`), and `zaimule://` deep links.
 
 use crate::catalog::compute_crc32;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+use ring::digest;
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::io::ErrorKind;
 use std::net::UdpSocket;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const ZML2_MAGIC: [u8; 4] = *b"ZML2";
+const ZMR1_MAGIC: [u8; 4] = *b"ZMR1";
+const ZMR1_NONCE_LEN: usize = 12;
+const ZMR1_HEADER_LEN: usize = 4 + 1 + ZMR1_NONCE_LEN;
+const ZMR1_TAG_LEN: usize = 16;
 
 /// Active or public multiplayer lobby entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,7 +202,11 @@ pub fn format_deep_link(room_code: &str, rom_crc32_hex: &str, core_id: &str) -> 
 /// Parses a `zaimule://room/...` invitation link and validates its parameters.
 pub fn parse_deep_link(uri: &str) -> Result<DeepLinkInvite, String> {
     let trimmed = uri.trim();
-    let Some(rest) = trimmed.strip_prefix("zaimule://room/") else {
+    let without_fragment = trimmed
+        .split_once('#')
+        .map(|(head, _)| head)
+        .unwrap_or(trimmed);
+    let Some(rest) = without_fragment.strip_prefix("zaimule://room/") else {
         return Err("le lien doit commencer par 'zaimule://room/'".into());
     };
     let (code_part, query_part) = match rest.split_once('?') {
@@ -369,6 +384,402 @@ pub fn default_tournament_bracket() -> TournamentBracket {
     }
 }
 
+// =============================================================================
+// PROTOCOLE RELAIS CHIFFRÉ DE BOUT EN BOUT (ZMR1 · ChaCha20-Poly1305)
+// =============================================================================
+
+/// Canaux logiques multiplexés sur le relais WebSocket `zaimule-relay`.
+/// Alignés 1:1 avec `apps/public/zaimule-relay/src/protocol.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum RelayChannel {
+    GbLink = 1,
+    Chat = 2,
+    SwitchLdn = 3,
+    TradeHub = 4,
+    GbaLink = 5,
+    NdsWifi = 6,
+}
+
+impl RelayChannel {
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::GbLink),
+            2 => Some(Self::Chat),
+            3 => Some(Self::SwitchLdn),
+            4 => Some(Self::TradeHub),
+            5 => Some(Self::GbaLink),
+            6 => Some(Self::NdsWifi),
+            _ => None,
+        }
+    }
+}
+
+/// Clé symétrique de session 256 bits (`ChaCha20-Poly1305`) partagée uniquement entre joueurs
+/// dans le fragment `#KEY` du lien `zaimule://` (jamais transmise au serveur relais).
+#[derive(Clone, PartialEq, Eq)]
+pub struct RelaySessionKey([u8; 32]);
+
+impl fmt::Debug for RelaySessionKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RelaySessionKey([REDACTED])")
+    }
+}
+
+impl RelaySessionKey {
+    pub fn generate() -> Result<Self, String> {
+        let rng = SystemRandom::new();
+        let mut bytes = [0u8; 32];
+        rng.fill(&mut bytes)
+            .map_err(|_| "générateur aléatoire cryptographique indisponible".to_string())?;
+        Ok(Self(bytes))
+    }
+
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn to_b64url(&self) -> String {
+        URL_SAFE_NO_PAD.encode(self.0)
+    }
+
+    pub fn from_b64url(raw: &str) -> Result<Self, String> {
+        let decoded = URL_SAFE_NO_PAD
+            .decode(raw.trim())
+            .map_err(|_| "clé E2EE de salon invalide (encodage base64url incorrect)".to_string())?;
+        if decoded.len() != 32 {
+            return Err(format!(
+                "clé E2EE de salon invalide ({} octets au lieu de 32)",
+                decoded.len()
+            ));
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&decoded);
+        Ok(Self(out))
+    }
+}
+
+/// Moteur de chiffrement authentifié `ZMR1` (`ChaCha20-Poly1305`).
+/// Chaque trame utilise un nonce unique de 96 bits (`[sel_session_32b || compteur_64b]`) et
+/// lie cryptographiquement le canal et le code de salon via l'AAD.
+pub struct Zmr1Cipher {
+    key: LessSafeKey,
+    nonce_salt: [u8; 4],
+    counter: AtomicU64,
+}
+
+impl fmt::Debug for Zmr1Cipher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Zmr1Cipher")
+            .field("cipher", &"ChaCha20-Poly1305")
+            .finish()
+    }
+}
+
+impl Zmr1Cipher {
+    pub fn new(session_key: &RelaySessionKey) -> Result<Self, String> {
+        let unbound = UnboundKey::new(&CHACHA20_POLY1305, session_key.as_bytes())
+            .map_err(|_| "échec d'initialisation ChaCha20-Poly1305".to_string())?;
+        let rng = SystemRandom::new();
+        let mut nonce_salt = [0u8; 4];
+        rng.fill(&mut nonce_salt)
+            .map_err(|_| "échec de génération du sel de nonce".to_string())?;
+        Ok(Self {
+            key: LessSafeKey::new(unbound),
+            nonce_salt,
+            counter: AtomicU64::new(1),
+        })
+    }
+
+    fn build_aad(channel: RelayChannel, room_code: &str) -> Vec<u8> {
+        let code = room_code.trim().to_ascii_uppercase();
+        let mut aad = Vec::with_capacity(5 + code.len());
+        aad.extend_from_slice(&ZMR1_MAGIC);
+        aad.push(channel as u8);
+        aad.extend_from_slice(code.as_bytes());
+        aad
+    }
+
+    /// Chiffre et authentifie `plaintext` dans une enveloppe binaire `ZMR1`.
+    pub fn seal(
+        &self,
+        channel: RelayChannel,
+        room_code: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let seq = self.counter.fetch_add(1, Ordering::Relaxed);
+        let mut nonce_bytes = [0u8; ZMR1_NONCE_LEN];
+        nonce_bytes[0..4].copy_from_slice(&self.nonce_salt);
+        nonce_bytes[4..12].copy_from_slice(&seq.to_le_bytes());
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+        let aad_bytes = Self::build_aad(channel, room_code);
+
+        let mut in_out = Vec::with_capacity(plaintext.len() + ZMR1_TAG_LEN);
+        in_out.extend_from_slice(plaintext);
+        self.key
+            .seal_in_place_append_tag(nonce, Aad::from(&aad_bytes), &mut in_out)
+            .map_err(|_| "échec du chiffrement ChaCha20-Poly1305".to_string())?;
+
+        let mut packet = Vec::with_capacity(ZMR1_HEADER_LEN + in_out.len());
+        packet.extend_from_slice(&ZMR1_MAGIC);
+        packet.push(channel as u8);
+        packet.extend_from_slice(&nonce_bytes);
+        packet.extend_from_slice(&in_out);
+        Ok(packet)
+    }
+
+    /// Vérifie l'intégrité et déchiffre une enveloppe binaire `ZMR1`.
+    pub fn open(
+        &self,
+        expected_channel: RelayChannel,
+        room_code: &str,
+        packet: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if packet.len() < ZMR1_HEADER_LEN + ZMR1_TAG_LEN {
+            return Err("trame ZMR1 trop courte".into());
+        }
+        if packet[0..4] != ZMR1_MAGIC {
+            return Err("en-tête magique ZMR1 invalide".into());
+        }
+        let channel =
+            RelayChannel::from_byte(packet[4]).ok_or_else(|| "canal ZMR1 inconnu".to_string())?;
+        if channel != expected_channel {
+            return Err("canal ZMR1 inattendu".into());
+        }
+        let mut nonce_bytes = [0u8; ZMR1_NONCE_LEN];
+        nonce_bytes.copy_from_slice(&packet[5..17]);
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+        let aad_bytes = Self::build_aad(expected_channel, room_code);
+
+        let mut buf = packet[ZMR1_HEADER_LEN..].to_vec();
+        let plain = self
+            .key
+            .open_in_place(nonce, Aad::from(&aad_bytes), &mut buf)
+            .map_err(|_| {
+                "authentification E2EE ZMR1 échouée (clé ou intégrité invalide)".to_string()
+            })?;
+        Ok(plain.to_vec())
+    }
+}
+
+/// Drapeaux d'échange série Câble Link GB/GBC dans `GbLinkPayload`.
+pub const GB_LINK_FLAG_MASTER_TX: u8 = 0x01;
+pub const GB_LINK_FLAG_SLAVE_REPLY: u8 = 0x02;
+
+/// Trame binaire compacte (12 octets en clair, chiffrée dans `ZMR1`) pour le Câble Link GB/GBC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GbLinkPayload {
+    pub frame: u32,
+    pub buttons_mask: u16,
+    pub sio_sb: u8,
+    pub sio_sc: u8,
+    pub flags: u8,
+    pub seq: u16,
+}
+
+impl GbLinkPayload {
+    pub const WIRE_LEN: usize = 12;
+
+    pub fn to_bytes(self) -> [u8; Self::WIRE_LEN] {
+        let mut out = [0u8; Self::WIRE_LEN];
+        out[0..4].copy_from_slice(&self.frame.to_le_bytes());
+        out[4..6].copy_from_slice(&self.buttons_mask.to_le_bytes());
+        out[6] = self.sio_sb;
+        out[7] = self.sio_sc;
+        out[8] = self.flags;
+        out[9..11].copy_from_slice(&self.seq.to_le_bytes());
+        out[11] = 0;
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < Self::WIRE_LEN {
+            return Err("charge utile GB Link trop courte".into());
+        }
+        Ok(Self {
+            frame: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            buttons_mask: u16::from_le_bytes([bytes[4], bytes[5]]),
+            sio_sb: bytes[6],
+            sio_sc: bytes[7],
+            flags: bytes[8],
+            seq: u16::from_le_bytes([bytes[9], bytes[10]]),
+        })
+    }
+
+    pub fn is_master_tx(self) -> bool {
+        (self.flags & GB_LINK_FLAG_MASTER_TX) != 0
+    }
+
+    pub fn is_slave_reply(self) -> bool {
+        (self.flags & GB_LINK_FLAG_SLAVE_REPLY) != 0
+    }
+}
+
+/// Message de chat chiffré de bout en bout (transmis dans le canal `RelayChannel::Chat`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayChatPayload {
+    pub sender: String,
+    pub text: String,
+    pub timestamp_ms: u64,
+}
+
+/// Pair présent dans un salon relais chiffré.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayPeerInfo {
+    pub peer_id: u8,
+    pub name: String,
+    pub is_host: bool,
+}
+
+/// Invitation chiffrée `zaimule://room/<CODE>?crc=<CRC>&console=<CONSOLE>#<KEY>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayInvite {
+    pub room_code: String,
+    pub rom_crc32_hex: Option<String>,
+    pub console: Option<String>,
+    pub session_key: RelaySessionKey,
+}
+
+/// Formate un lien d'invitation E2EE dont la clé reste dans le fragment `#` (jamais envoyée au VPS).
+pub fn format_relay_invite(
+    room_code: &str,
+    rom_crc32_hex: Option<&str>,
+    console: Option<&str>,
+    session_key: &RelaySessionKey,
+) -> String {
+    let code = room_code.trim().to_ascii_uppercase();
+    let mut query = Vec::new();
+    if let Some(crc) = rom_crc32_hex.map(str::trim).filter(|s| !s.is_empty()) {
+        query.push(format!("crc={}", crc.to_ascii_uppercase()));
+    }
+    if let Some(con) = console.map(str::trim).filter(|s| !s.is_empty()) {
+        query.push(format!("console={con}"));
+    }
+    let key_b64 = session_key.to_b64url();
+    if query.is_empty() {
+        format!("zaimule://room/{code}#{key_b64}")
+    } else {
+        format!("zaimule://room/{code}?{}#{key_b64}", query.join("&"))
+    }
+}
+
+/// Analyse un lien `zaimule://room/<CODE>?...#<KEY>` ou un raccourci `<CODE>#<KEY>`.
+pub fn parse_relay_invite(input: &str) -> Result<RelayInvite, String> {
+    let trimmed = input.trim();
+    let Some((head, fragment)) = trimmed.split_once('#') else {
+        return Err("clé E2EE manquante après '#' dans le lien d'invitation".into());
+    };
+    let session_key = RelaySessionKey::from_b64url(fragment)?;
+
+    let body = head.strip_prefix("zaimule://room/").unwrap_or(head);
+    let (code_part, query_part) = match body.split_once('?') {
+        Some((c, q)) => (c, q),
+        None => (body, ""),
+    };
+    let room_code: String = code_part
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if room_code.len() < 4 || room_code.len() > 12 {
+        return Err("code de salon invalide (attendu : 6 caractères alphanumériques)".into());
+    }
+
+    let mut rom_crc32_hex = None;
+    let mut console = None;
+    for kv in query_part.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            let val = v.trim();
+            if val.is_empty() {
+                continue;
+            }
+            match k.trim() {
+                "crc" => rom_crc32_hex = Some(val.to_ascii_uppercase()),
+                "console" => console = Some(val.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    Ok(RelayInvite {
+        room_code,
+        rom_crc32_hex,
+        console,
+        session_key,
+    })
+}
+
+/// Hache un mot de passe de salon côté client (SHA-256 hex) pour ne jamais l'envoyer en clair.
+pub fn hash_room_password(password: &str) -> Option<String> {
+    let trimmed = password.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut ctx = digest::Context::new(&digest::SHA256);
+    ctx.update(b"zaimule-room-pw-v1:");
+    ctx.update(trimmed.as_bytes());
+    let d = ctx.finish();
+    let mut hex = String::with_capacity(64);
+    for b in d.as_ref() {
+        use fmt::Write as _;
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    Some(hex)
+}
+
+/// Valide l'URL du serveur relais (`wss://` obligatoire sur Internet ; `ws://127.0.0.1` ou
+/// `ws://localhost` autorisé uniquement pour les tests locaux).
+pub fn validate_relay_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("URL du serveur relais vide".into());
+    }
+    let normalized = if let Some(rest) = trimmed.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else {
+        trimmed.to_string()
+    };
+
+    if let Some(rest) = normalized.strip_prefix("wss://") {
+        if rest.is_empty() || rest.starts_with('/') {
+            return Err("nom d'hôte manquant dans l'URL wss://".into());
+        }
+        return Ok(ensure_ws_path(normalized));
+    }
+
+    if let Some(rest) = normalized.strip_prefix("ws://") {
+        let is_local = rest.starts_with("127.0.0.1")
+            || rest.starts_with("localhost")
+            || rest.starts_with("[::1]");
+        if !is_local {
+            return Err(
+                "protocole non chiffré ws:// refusé hors localhost (utilisez wss://)".into(),
+            );
+        }
+        return Ok(ensure_ws_path(normalized));
+    }
+
+    Err("l'URL du relais doit commencer par wss:// (ex: wss://relay.votre-domaine/ws)".into())
+}
+
+fn ensure_ws_path(mut url: String) -> String {
+    let scheme_end = url.find("://").map(|i| i + 3).unwrap_or(0);
+    if !url[scheme_end..].contains('/') {
+        url.push_str("/ws");
+    } else if url.ends_with('/') {
+        url.push_str("ws");
+    }
+    url
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +892,93 @@ mod tests {
         bracket.advance_match("semi-2", 2, 9).unwrap();
         bracket.advance_match("final", 260, 215).unwrap();
         assert_eq!(bracket.champion.as_deref(), Some("J1"));
+    }
+
+    #[test]
+    fn zmr1_chacha20_poly1305_seals_opens_and_rejects_tampering_or_wrong_context() {
+        let key_a = RelaySessionKey::generate().unwrap();
+        let key_other = RelaySessionKey::generate().unwrap();
+        assert!(!format!("{key_a:?}").contains(&key_a.to_b64url()));
+
+        let cipher_a = Zmr1Cipher::new(&key_a).unwrap();
+        let cipher_b = Zmr1Cipher::new(&key_a).unwrap();
+        let cipher_wrong = Zmr1Cipher::new(&key_other).unwrap();
+
+        let link = GbLinkPayload {
+            frame: 1234,
+            buttons_mask: 0x00A5,
+            sio_sb: 0x5A,
+            sio_sc: 0x81,
+            flags: GB_LINK_FLAG_MASTER_TX,
+            seq: 7,
+        };
+        let sealed = cipher_a
+            .seal(RelayChannel::GbLink, "K9P4XQ", &link.to_bytes())
+            .unwrap();
+        assert!(sealed.starts_with(b"ZMR1"));
+        assert_ne!(&sealed[ZMR1_HEADER_LEN..], &link.to_bytes());
+
+        // Déchiffrement légitime par un autre pair possédant la même clé de session
+        let opened = cipher_b
+            .open(RelayChannel::GbLink, "k9p4xq", &sealed)
+            .unwrap();
+        assert_eq!(GbLinkPayload::from_bytes(&opened).unwrap(), link);
+
+        // Rejet sur mauvaise clé, mauvais salon (AAD), mauvais canal ou octet altéré
+        assert!(cipher_wrong
+            .open(RelayChannel::GbLink, "K9P4XQ", &sealed)
+            .is_err());
+        assert!(cipher_b
+            .open(RelayChannel::GbLink, "OTHER1", &sealed)
+            .is_err());
+        assert!(cipher_b
+            .open(RelayChannel::Chat, "K9P4XQ", &sealed)
+            .is_err());
+        let mut tampered = sealed.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+        assert!(cipher_b
+            .open(RelayChannel::GbLink, "K9P4XQ", &tampered)
+            .is_err());
+    }
+
+    #[test]
+    fn relay_invite_and_url_validation_enforce_e2ee_and_tls() {
+        let key = RelaySessionKey::generate().unwrap();
+        let uri = format_relay_invite("ab23cd", Some("deadbeef"), Some("GBC"), &key);
+        assert!(uri.starts_with("zaimule://room/AB23CD?crc=DEADBEEF&console=GBC#"));
+
+        let parsed = parse_relay_invite(&uri).unwrap();
+        assert_eq!(parsed.room_code, "AB23CD");
+        assert_eq!(parsed.rom_crc32_hex.as_deref(), Some("DEADBEEF"));
+        assert_eq!(parsed.console.as_deref(), Some("GBC"));
+        assert_eq!(parsed.session_key, key);
+
+        // Raccourci CODE#KEY également accepté
+        let short = format!("AB23CD#{}", key.to_b64url());
+        assert_eq!(parse_relay_invite(&short).unwrap().room_code, "AB23CD");
+        assert!(parse_relay_invite("zaimule://room/AB23CD").is_err());
+
+        // URL relais : TLS obligatoire hors localhost
+        assert_eq!(
+            validate_relay_url("wss://relay.example.org").unwrap(),
+            "wss://relay.example.org/ws"
+        );
+        assert_eq!(
+            validate_relay_url("https://relay.example.org/ws").unwrap(),
+            "wss://relay.example.org/ws"
+        );
+        assert_eq!(
+            validate_relay_url("ws://127.0.0.1:3000/ws").unwrap(),
+            "ws://127.0.0.1:3000/ws"
+        );
+        assert!(validate_relay_url("ws://relay.example.org/ws").is_err());
+        assert!(validate_relay_url("http://relay.example.org").is_err());
+
+        // Mot de passe haché de manière déterministe
+        assert_eq!(hash_room_password("   "), None);
+        let h = hash_room_password("pikachu").unwrap();
+        assert_eq!(h.len(), 64);
+        assert_ne!(h, "pikachu");
     }
 }
