@@ -44,8 +44,9 @@ use zaimule_core::macros::{
 use zaimule_core::metadata::{normalize_collection_name, GameMetadataUpdate};
 use zaimule_core::netplay::{
     discover_stun_candidate, format_deep_link, parse_deep_link, validate_relay_url, GbLinkPayload,
-    NetplayChatMessage, NetplayRoom, NetplayWirePacket, StunDiscoveryCandidate, TournamentBracket,
-    UdpNetplayNode, GB_LINK_FLAG_MASTER_TX, GB_LINK_FLAG_SLAVE_REPLY,
+    GbaLinkPayload, NetplayChatMessage, NetplayRoom, NetplayWirePacket, StunDiscoveryCandidate,
+    TournamentBracket, UdpNetplayNode, GBA_LINK_FLAG_MASTER_TX, GBA_LINK_FLAG_SLAVE_REPLY,
+    GB_LINK_FLAG_MASTER_TX, GB_LINK_FLAG_SLAVE_REPLY,
 };
 use zaimule_core::overrides::{resolve_effective_config, EffectiveGameConfig, GlobalSettings};
 use zaimule_core::patch::{apply_ips_patch, diff_roms_to_ips, CommunityModPackage, ModLayerEntry};
@@ -450,9 +451,13 @@ pub struct EmulatorSession {
     pub active_disasm_rom: Vec<u8>,
     pub link_telemetry: LinkCableTelemetry,
     pub online_link_enabled: bool,
+    pub online_gba_player_id: u8,
+    online_gba_last_master_word: u16,
     online_link_seq: u16,
     online_link_rx_queue: VecDeque<GbLinkPayload>,
     online_link_tx_queue: VecDeque<GbLinkPayload>,
+    online_gba_link_rx_queue: VecDeque<GbaLinkPayload>,
+    online_gba_link_tx_queue: VecDeque<GbaLinkPayload>,
     pub rewind_buffer: RewindBuffer,
     rewind_worker: Option<BackgroundRewindWorker>,
     rewind_generation: u64,
@@ -529,9 +534,13 @@ impl EmulatorSession {
             active_disasm_rom: Vec::new(),
             link_telemetry: LinkCableTelemetry::default(),
             online_link_enabled: false,
+            online_gba_player_id: 0,
+            online_gba_last_master_word: 0xFFFF,
             online_link_seq: 0,
             online_link_rx_queue: VecDeque::with_capacity(32),
             online_link_tx_queue: VecDeque::with_capacity(32),
+            online_gba_link_rx_queue: VecDeque::with_capacity(32),
+            online_gba_link_tx_queue: VecDeque::with_capacity(32),
             rewind_buffer: RewindBuffer::new(240),
             rewind_worker: None,
             rewind_generation: 0,
@@ -1420,13 +1429,47 @@ impl EmulatorSession {
         Ok(self.bootstrap_snapshot())
     }
 
-    /// Enables or disables the online encrypted GB/GBC Link Cable tunnel on `core_p1`.
+    /// Enables or disables the online encrypted GB/GBC & GBA Link Cable tunnel on `core_p1`.
     pub fn set_online_link_enabled(&mut self, enabled: bool) {
+        self.set_online_link_enabled_with_role(enabled, self.online_gba_player_id);
+    }
+
+    /// Enables or disables the online encrypted Link Cable tunnel and assigns the GBA Multi-Player
+    /// console ID (`0` = Master/Parent, `1..=3` = Slaves/Children).
+    pub fn set_online_link_enabled_with_role(&mut self, enabled: bool, gba_player_id: u8) {
         self.online_link_enabled = enabled;
+        self.online_gba_player_id = gba_player_id & 0x03;
+        self.core_p1
+            .set_gba_multi_connected(enabled, self.online_gba_player_id);
         if !enabled {
             self.online_link_rx_queue.clear();
             self.online_link_tx_queue.clear();
+            self.online_gba_link_rx_queue.clear();
+            self.online_gba_link_tx_queue.clear();
+            self.online_gba_last_master_word = 0xFFFF;
         }
+    }
+
+    /// Hot-reloads updated SRAM bytes (e.g. right after an atomic Trade Hub Pokémon swap) into
+    /// `core_p1` if `game_id` is currently active, preventing the next autosave from overwriting it.
+    pub fn reload_active_sram_from_bytes(
+        &mut self,
+        game_id: &str,
+        sram_bytes: &[u8],
+    ) -> Result<bool, String> {
+        if !self.core_loaded || self.active_game_id != game_id {
+            return Ok(false);
+        }
+        self.core_p1.load_sram(sram_bytes)?;
+        self.core_p1.sync_sram_cache();
+        let current = self.core_p1.sram();
+        self.last_sram_crc = if current.is_empty() {
+            None
+        } else {
+            Some(compute_crc32(current))
+        };
+        self.sram_dirty = false;
+        Ok(true)
     }
 
     /// Queues an authenticated `GbLinkPayload` decrypted from the `ZMR1` relay tunnel.
@@ -1445,9 +1488,29 @@ impl EmulatorSession {
         self.online_link_tx_queue.drain(..).collect()
     }
 
-    fn pump_online_link_pre_step(&mut self, frame: u32, buttons_mask: u16) {
-        if !self.online_link_enabled || self.online_link_rx_queue.is_empty() {
+    /// Queues an authenticated `GbaLinkPayload` (`SIOMULTI`) decrypted from the `ZMR1` relay tunnel.
+    pub fn push_remote_gba_link_payload(&mut self, payload: GbaLinkPayload) {
+        if !self.online_link_enabled {
             return;
+        }
+        if self.online_gba_link_rx_queue.len() >= 64 {
+            let _ = self.online_gba_link_rx_queue.pop_front();
+        }
+        self.online_gba_link_rx_queue.push_back(payload);
+    }
+
+    /// Drains pending outbound `GbaLinkPayload`s (`SIOMULTI`) produced by `core_p1` for E2EE transmission.
+    pub fn drain_outgoing_gba_link_payloads(&mut self) -> Vec<GbaLinkPayload> {
+        self.online_gba_link_tx_queue.drain(..).collect()
+    }
+
+    fn pump_online_link_pre_step(&mut self, frame: u32, buttons_mask: u16) {
+        if !self.online_link_enabled {
+            return;
+        }
+        if self.core_p1.console() == ConsoleKind::Gba {
+            self.core_p1
+                .set_gba_multi_connected(true, self.online_gba_player_id);
         }
         while let Some(incoming) = self.online_link_rx_queue.pop_front() {
             let prev_sb = self.core_p1.exchange_serial_byte(incoming.sio_sb);
@@ -1469,6 +1532,42 @@ impl EmulatorSession {
                     seq: incoming.seq,
                 });
                 self.link_telemetry.last_p1_to_p2_hex = format!("0x{prev_sb:02X}");
+            }
+        }
+
+        while let Some(incoming) = self.online_gba_link_rx_queue.pop_front() {
+            if self.core_p1.console() != ConsoleKind::Gba {
+                continue;
+            }
+            self.link_telemetry.packets_transferred =
+                self.link_telemetry.packets_transferred.saturating_add(1);
+            self.link_telemetry.last_p2_to_p1_hex = format!("0x{:04X}", incoming.siomlt_send);
+            self.link_telemetry.baud_rate_bps = 115_200;
+
+            if incoming.is_master_tx() && self.online_gba_player_id > 0 {
+                let my_id = self.online_gba_player_id.clamp(1, 3);
+                let (slave_word, siocnt) = self
+                    .core_p1
+                    .exchange_gba_multi_slave(incoming.siomlt_send, my_id);
+                if self.online_gba_link_tx_queue.len() >= 64 {
+                    let _ = self.online_gba_link_tx_queue.pop_front();
+                }
+                self.online_gba_link_tx_queue.push_back(GbaLinkPayload {
+                    frame,
+                    buttons_mask,
+                    siomlt_send: slave_word,
+                    siocnt,
+                    flags: GBA_LINK_FLAG_SLAVE_REPLY,
+                    player_id: my_id,
+                    seq: incoming.seq,
+                });
+                self.link_telemetry.last_p1_to_p2_hex = format!("0x{slave_word:04X}");
+            } else if incoming.is_slave_reply() && self.online_gba_player_id == 0 {
+                let slave_slot = usize::from(incoming.player_id.clamp(1, 3));
+                let mut slots = [0xFFFFu16; 4];
+                slots[0] = self.online_gba_last_master_word;
+                slots[slave_slot] = incoming.siomlt_send;
+                self.core_p1.deliver_gba_multi(slots, 0);
             }
         }
     }
@@ -1499,6 +1598,29 @@ impl EmulatorSession {
                 self.link_telemetry.packets_transferred.saturating_add(1);
             self.link_telemetry.last_p1_to_p2_hex = format!("0x{tx_byte:02X}");
             self.link_telemetry.baud_rate_bps = 262_144;
+        }
+
+        if self.core_p1.console() == ConsoleKind::Gba && self.online_gba_player_id == 0 {
+            if let Some((send_word, siocnt)) = self.core_p1.take_gba_multi_tx() {
+                self.online_gba_last_master_word = send_word;
+                self.online_link_seq = self.online_link_seq.wrapping_add(1);
+                if self.online_gba_link_tx_queue.len() >= 64 {
+                    let _ = self.online_gba_link_tx_queue.pop_front();
+                }
+                self.online_gba_link_tx_queue.push_back(GbaLinkPayload {
+                    frame,
+                    buttons_mask,
+                    siomlt_send: send_word,
+                    siocnt,
+                    flags: GBA_LINK_FLAG_MASTER_TX,
+                    player_id: 0,
+                    seq: self.online_link_seq,
+                });
+                self.link_telemetry.packets_transferred =
+                    self.link_telemetry.packets_transferred.saturating_add(1);
+                self.link_telemetry.last_p1_to_p2_hex = format!("0x{send_word:04X}");
+                self.link_telemetry.baud_rate_bps = 115_200;
+            }
         }
     }
 
@@ -4052,5 +4174,125 @@ mod tests {
 
         let cleared = session.set_relay_config(None, None, true, None).unwrap();
         assert!(!cleared.relay_key_configured);
+    }
+
+    #[test]
+    fn online_gba_link_cable_exchanges_16bit_words_over_zmr1_e2ee() {
+        use zaimule_core::netplay::{RelayChannel, RelaySessionKey, Zmr1Cipher};
+
+        let build_gba_sio_rom = |send_word: u16, siocnt_val: u16| -> Vec<u8> {
+            let mut rom = vec![0u8; 0x200];
+            let insns: [u32; 9] = [
+                0xE3A0_0404, // MOV r0, #0x04000000
+                0xE380_0C01, // ORR r0, r0, #0x100
+                0xE3A0_1000, // MOV r1, #0
+                0xE1C0_13B4, // STRH r1, [r0, #0x34] (RCNT = 0)
+                0xE1DF_20BC, // LDRH r2, [pc, #0x0C] (@0x24)
+                0xE1C0_22BA, // STRH r2, [r0, #0x2A] (SIOMLT_SEND)
+                0xE1DF_30B6, // LDRH r3, [pc, #0x06] (@0x26)
+                0xE1C0_32B8, // STRH r3, [r0, #0x28] (SIOCNT)
+                0xEAFF_FFFE, // B .
+            ];
+            for (idx, insn) in insns.iter().enumerate() {
+                rom[idx * 4..idx * 4 + 4].copy_from_slice(&insn.to_le_bytes());
+            }
+            rom[0x24..0x26].copy_from_slice(&send_word.to_le_bytes());
+            rom[0x26..0x28].copy_from_slice(&siocnt_val.to_le_bytes());
+            rom
+        };
+
+        let mut master = EmulatorSession::new();
+        master
+            .import_custom_rom("master.gba", &build_gba_sio_rom(0xCAFE, 0x6083))
+            .unwrap();
+        master.set_online_link_enabled_with_role(true, 0);
+
+        let mut slave = EmulatorSession::new();
+        slave
+            .import_custom_rom("slave.gba", &build_gba_sio_rom(0xBEEF, 0x6003))
+            .unwrap();
+        slave.set_online_link_enabled_with_role(true, 1);
+
+        let key = RelaySessionKey::generate().unwrap();
+        let cipher_master = Zmr1Cipher::new(&key).unwrap();
+        let cipher_slave = Zmr1Cipher::new(&key).unwrap();
+
+        let _ = master.step_viewport_binary_bytes_with_options(
+            0,
+            0,
+            false,
+            1,
+            BinaryStepOptions::default(),
+        );
+        let _ = slave.step_viewport_binary_bytes_with_options(
+            0,
+            0,
+            false,
+            1,
+            BinaryStepOptions::default(),
+        );
+
+        let master_tx = master.drain_outgoing_gba_link_payloads();
+        assert_eq!(master_tx.len(), 1);
+        assert_eq!(master_tx[0].siomlt_send, 0xCAFE);
+        assert!(master_tx[0].is_master_tx());
+        assert_eq!(master_tx[0].player_id, 0);
+
+        // Chiffrement ZMR1 Master -> Slave sur RelayChannel::GbaLink
+        let sealed_m2s = cipher_master
+            .seal(RelayChannel::GbaLink, "GBA42P", &master_tx[0].to_bytes())
+            .unwrap();
+        let opened_m2s = cipher_slave
+            .open(RelayChannel::GbaLink, "GBA42P", &sealed_m2s)
+            .unwrap();
+        slave.push_remote_gba_link_payload(GbaLinkPayload::from_bytes(&opened_m2s).unwrap());
+
+        let _ = slave.step_viewport_binary_bytes_with_options(
+            0,
+            0,
+            false,
+            1,
+            BinaryStepOptions::default(),
+        );
+        let slave_replies = slave.drain_outgoing_gba_link_payloads();
+        assert_eq!(slave_replies.len(), 1);
+        assert_eq!(slave_replies[0].siomlt_send, 0xBEEF);
+        assert!(slave_replies[0].is_slave_reply());
+        assert_eq!(slave_replies[0].player_id, 1);
+        assert_eq!(slave.link_telemetry.last_p2_to_p1_hex, "0xCAFE");
+
+        // Chiffrement ZMR1 Slave -> Master
+        let sealed_s2m = cipher_slave
+            .seal(
+                RelayChannel::GbaLink,
+                "GBA42P",
+                &slave_replies[0].to_bytes(),
+            )
+            .unwrap();
+        let opened_s2m = cipher_master
+            .open(RelayChannel::GbaLink, "GBA42P", &sealed_s2m)
+            .unwrap();
+        master.push_remote_gba_link_payload(GbaLinkPayload::from_bytes(&opened_s2m).unwrap());
+
+        let _ = master.step_viewport_binary_bytes_with_options(
+            0,
+            0,
+            false,
+            1,
+            BinaryStepOptions::default(),
+        );
+        assert_eq!(master.link_telemetry.last_p2_to_p1_hex, "0xBEEF");
+        // Bit 7 (Start/Busy) effacé dans SIOCNT après livraison SIOMULTI0..3
+        let sc = u16::from_str_radix(
+            master
+                .core_p1
+                .debug_snapshot()
+                .serial_sc_hex
+                .trim_start_matches("0x"),
+            16,
+        )
+        .unwrap();
+        assert_eq!(sc & 0x0080, 0);
+        assert!(master.drain_outgoing_gba_link_payloads().is_empty());
     }
 }

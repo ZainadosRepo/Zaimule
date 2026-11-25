@@ -70,6 +70,26 @@ impl GbaCore {
         self.cpu.bus.apu.telemetry()
     }
 
+    pub fn set_sio_multi_connected(&mut self, connected: bool, player_id: u8) {
+        self.cpu.bus.set_sio_multi_connected(connected, player_id);
+    }
+
+    pub fn take_sio_multi_tx(&mut self) -> Option<u16> {
+        self.cpu.bus.take_sio_multi_tx()
+    }
+
+    pub fn deliver_sio_multi(&mut self, slots: [u16; 4], my_id: u8) {
+        self.cpu.bus.deliver_sio_multi(slots, my_id);
+    }
+
+    pub fn sio_cnt(&self) -> u16 {
+        self.cpu.bus.sio_cnt()
+    }
+
+    pub fn sio_mlt_send(&self) -> u16 {
+        self.cpu.bus.sio_mlt_send()
+    }
+
     /// Test/debug: drive a raw byte access to the save region.
     pub fn debug_write8(&mut self, addr: u32, value: u8) {
         self.cpu.bus.write8(addr, value);

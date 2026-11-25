@@ -55,16 +55,24 @@ pub struct Bus {
     apu_synced: u64,
     /// Set by HALTCNT / the Halt SWI; cleared when IE & IF intersect.
     pub halted: bool,
+    /// GBA Multi-Player Link Cable (`SIOMULTI`) runtime state (transient, outside savestates).
+    sio_multi_connected: bool,
+    sio_multi_player_id: u8,
+    sio_multi_pending_tx: Option<u16>,
 }
 
 impl Bus {
     pub fn new(rom: Vec<u8>) -> Self {
         let save = crate::save::Save::detect(&rom);
+        let mut io = Box::new([0u8; 0x400]);
+        // Power-on SIO defaults: SIOMULTI0..3 = 0xFFFF, RCNT = 0x8000 (GPIO mode)
+        io[0x120..0x128].fill(0xFF);
+        io[0x135] = 0x80;
         let mut bus = Self {
             rom,
             ewram: Box::new([0; 0x4_0000]),
             iwram: Box::new([0; 0x8000]),
-            io: Box::new([0; 0x400]),
+            io,
             palette: Box::new([0; 0x400]),
             vram: Box::new([0; 0x1_8000]),
             oam: Box::new([0; 0x400]),
@@ -87,6 +95,9 @@ impl Bus {
             apu: crate::apu::Apu::new(),
             apu_synced: 0,
             halted: false,
+            sio_multi_connected: false,
+            sio_multi_player_id: 0,
+            sio_multi_pending_tx: None,
         };
         bus.rebuild_wait_lut();
         bus
@@ -674,6 +685,85 @@ impl Bus {
         self.io[0x203] = b;
     }
 
+    #[inline]
+    fn sio_is_multi_mode(&self) -> bool {
+        (self.io[0x135] & 0x80) == 0 && (self.io[0x129] & 0x30) == 0x20
+    }
+
+    /// Configures whether the virtual GBA Multi-Player link cable is attached and sets this unit's ID (`0..=3`).
+    pub fn set_sio_multi_connected(&mut self, connected: bool, player_id: u8) {
+        self.sio_multi_connected = connected;
+        self.sio_multi_player_id = player_id & 0x03;
+        if !connected {
+            self.sio_multi_pending_tx = None;
+            self.io[0x120..0x128].fill(0xFF);
+            self.io[0x128] &= !0x80;
+        }
+    }
+
+    /// Takes a pending 16-bit Multi-Player outgoing word latched when `SIOCNT` Start bit (7) was raised.
+    pub fn take_sio_multi_tx(&mut self) -> Option<u16> {
+        self.sio_multi_pending_tx.take()
+    }
+
+    /// Returns the live synthesized `SIOCNT` (`0x0400_0128`) register value.
+    pub fn sio_cnt(&self) -> u16 {
+        u16::from_le_bytes([self.read_io(0x0400_0128), self.read_io(0x0400_0129)])
+    }
+
+    /// Returns the current `SIOMLT_SEND` (`0x0400_012A`) 16-bit word queued by the game.
+    pub fn sio_mlt_send(&self) -> u16 {
+        self.io16(0x12A)
+    }
+
+    /// Completes a GBA Multi-Player (`SIOMULTI`) transfer by populating `SIOMULTI0..3`,
+    /// clearing the Start/Busy flag, updating the unit ID, and firing Serial IRQ (bit 7) if enabled.
+    pub fn deliver_sio_multi(&mut self, slots: [u16; 4], my_id: u8) {
+        self.sio_multi_connected = true;
+        self.sio_multi_player_id = my_id & 0x03;
+        self.sio_multi_pending_tx = None;
+        for (idx, word) in slots.iter().enumerate() {
+            let off = 0x120 + idx * 2;
+            let [lo, hi] = word.to_le_bytes();
+            self.io[off] = lo;
+            self.io[off + 1] = hi;
+        }
+        // Clear Start/Busy (bit 7) and Error (bit 6)
+        self.io[0x128] &= !0xC0;
+        // Fire Serial Communication IRQ (IF bit 7) if SIOCNT bit 14 is enabled
+        if (self.io[0x129] & 0x40) != 0 {
+            self.raise_irq(1 << 7);
+            if self.irq_asserted() {
+                self.halted = false;
+            }
+        }
+    }
+
+    fn maybe_trigger_sio_multi_start(&mut self) {
+        if !self.sio_is_multi_mode() || (self.io[0x128] & 0x80) == 0 {
+            return;
+        }
+        if self.sio_multi_connected {
+            if self.sio_multi_pending_tx.is_none() {
+                self.sio_multi_pending_tx = Some(self.io16(0x12A));
+            }
+        } else {
+            // Disconnected cable fallback: complete immediately with own word in slot 0 and 0xFFFF elsewhere
+            let send = self.io16(0x12A);
+            let [lo, hi] = send.to_le_bytes();
+            self.io[0x120] = lo;
+            self.io[0x121] = hi;
+            self.io[0x122..0x128].fill(0xFF);
+            self.io[0x128] &= !0x80;
+            if (self.io[0x129] & 0x40) != 0 {
+                self.raise_irq(1 << 7);
+                if self.irq_asserted() {
+                    self.halted = false;
+                }
+            }
+        }
+    }
+
     fn read_io(&self, addr: u32) -> u8 {
         let reg = (addr as usize) & 0x3FF;
         match reg {
@@ -695,6 +785,25 @@ impl Bus {
             }
             0x006 => self.line() as u8, // VCOUNT
             0x007 => 0,
+            0x128 => {
+                if self.sio_is_multi_mode() {
+                    let mut v = self.io[0x128] & 0xC3; // baud (0-1), error (6), start/busy (7)
+                    if self.sio_multi_connected {
+                        if self.sio_multi_player_id != 0 {
+                            v |= 1 << 2; // SI = 1 for Child/Slave, 0 for Parent/Master
+                        }
+                        if (v & 0x80) == 0 {
+                            v |= 1 << 3; // SD = 1 when all connected consoles are ready
+                        }
+                        v |= (self.sio_multi_player_id & 0x03) << 4;
+                    } else {
+                        v |= 1 << 2; // Pull-up SI = 1 when cable disconnected
+                    }
+                    v
+                } else {
+                    self.io[0x128]
+                }
+            }
             0x130 => self.keyinput as u8,
             0x131 => (self.keyinput >> 8) as u8,
             // Timer counters read live; their io slots hold the reload value
@@ -710,6 +819,22 @@ impl Bus {
         let reg = (addr as usize) & 0x3FF;
         match reg {
             0x202 | 0x203 => self.io[reg] &= !value, // IF: write-1-to-acknowledge
+            // SIOCNT low/high bytes & RCNT: Multi-Player Link Cable control
+            0x128 => {
+                self.io[0x128] = value;
+                self.maybe_trigger_sio_multi_start();
+            }
+            0x129 => {
+                self.io[0x129] = value;
+                self.maybe_trigger_sio_multi_start();
+            }
+            0x134 | 0x135 => {
+                self.io[reg] = value;
+                if (self.io[0x135] & 0x80) != 0 {
+                    // Switched back to GPIO/Normal mode: drop any pending Multi TX
+                    self.sio_multi_pending_tx = None;
+                }
+            }
             // KEYCNT: a new selection can match the keys already held. Only
             // the high byte (written last in a 16-bit store) triggers the
             // check, so a half-written register never matches transiently.
@@ -1019,5 +1144,41 @@ mod tests {
         let mut b = bus();
         // beyond rom.len(): open bus returns the address bus pattern (addr/2)
         assert_eq!(b.read16(0x0800_2000), 0x1000);
+    }
+
+    #[test]
+    fn sio_multi_transfer_latches_tx_delivers_slots_and_raises_serial_irq() {
+        let mut master = bus();
+        let mut slave = bus();
+        master.set_sio_multi_connected(true, 0);
+        slave.set_sio_multi_connected(true, 1);
+
+        // Switch both GBAs from GPIO (RCNT=0x8000) into Multi-Player SIO mode
+        master.write16(0x0400_0134, 0x0000);
+        slave.write16(0x0400_0134, 0x0000);
+
+        // Slave queues 0xBEEF and enables Multi-Player + Serial IRQ
+        slave.write16(0x0400_012A, 0xBEEF);
+        slave.write16(0x0400_0128, 0x6003); // IRQ | Multi | 115200 baud
+        assert_eq!(slave.sio_cnt() & 0x003C, (1 << 4) | (1 << 3) | (1 << 2)); // ID=1, SD=1, SI=1
+
+        // Master queues 0xCAFE and starts transfer (bit 7 = 1) with Serial IRQ enabled
+        master.write16(0x0400_012A, 0xCAFE);
+        master.write16(0x0400_0128, 0x6083); // IRQ | Multi | Start | 115200 baud
+        assert_eq!(master.take_sio_multi_tx(), Some(0xCAFE));
+        assert_eq!(master.read16(0x0400_0202) & (1 << 7), 0); // IRQ waits for completion
+
+        // Deliver exchanged 4-slot frame to both consoles
+        let slots = [0xCAFE, slave.sio_mlt_send(), 0xFFFF, 0xFFFF];
+        master.deliver_sio_multi(slots, 0);
+        slave.deliver_sio_multi(slots, 1);
+
+        assert_eq!(master.read16(0x0400_0120), 0xCAFE);
+        assert_eq!(master.read16(0x0400_0122), 0xBEEF);
+        assert_eq!(slave.read16(0x0400_0120), 0xCAFE);
+        assert_eq!(slave.read16(0x0400_0122), 0xBEEF);
+        assert_eq!(master.sio_cnt() & 0x0080, 0); // Start bit cleared
+        assert_eq!(master.read16(0x0400_0202) & (1 << 7), 1 << 7); // Serial IRQ raised!
+        assert_eq!(slave.read16(0x0400_0202) & (1 << 7), 1 << 7); // Serial IRQ raised!
     }
 }

@@ -14,6 +14,7 @@ pub mod metadata;
 pub mod netplay;
 pub mod overrides;
 pub mod patch;
+pub mod pokemon_trade;
 pub mod rewind;
 pub mod scanner;
 pub mod storage;

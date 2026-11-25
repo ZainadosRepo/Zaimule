@@ -178,6 +178,19 @@ pub trait EmulatorBackend: Send {
     fn sram(&self) -> &[u8];
     fn load_sram(&mut self, data: &[u8]) -> Result<(), String>;
     fn exchange_serial_byte(&mut self, incoming: u8) -> u8;
+    /// Configures virtual GBA Multi-Player (`SIOMULTI`) link cable attachment and console ID (`0..=3`).
+    fn set_gba_multi_connected(&mut self, _connected: bool, _player_id: u8) {}
+    /// Takes a pending 16-bit GBA Multi-Player Master outgoing transfer `(siomlt_send, siocnt)`.
+    fn take_gba_multi_tx(&mut self) -> Option<(u16, u16)> {
+        None
+    }
+    /// Delivers a completed 4-player `SIOMULTI0..3` frame to a GBA console and raises Serial IRQ if enabled.
+    fn deliver_gba_multi(&mut self, _slots: [u16; 4], _my_id: u8) {}
+    /// Executes a Slave GBA `SIOMULTI` reply: captures this console's `SIOMLT_SEND` word, populates
+    /// `SIOMULTI0..3` with Master's word + Slave's word, raises Serial IRQ, and returns `(slave_word, siocnt)`.
+    fn exchange_gba_multi_slave(&mut self, _master_word: u16, _my_id: u8) -> (u16, u16) {
+        (0xFFFF, 0x0000)
+    }
     fn debug_snapshot(&self) -> CpuDebugSnapshot;
     fn apply_ram_cheat(&mut self, _addr: u16, _val: u8) {}
     /// Applies a 32-bit Nintendo DS Action Replay cheat code (`[(w0, w1), ...]`) on NDS cores.

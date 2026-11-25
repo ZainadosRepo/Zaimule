@@ -881,6 +881,67 @@ impl SwitchLdnPacket {
     }
 }
 
+// =============================================================================
+// PHASE 3 — CÂBLE LINK GBA TEMPS RÉEL (SIOMULTI 2–4 joueurs · ZMR1)
+// =============================================================================
+
+/// Drapeaux d'échange Multi-Player GBA (`SIOMULTI0..3` / `SIOMLT_SEND`) dans `GbaLinkPayload`.
+pub const GBA_LINK_FLAG_MASTER_TX: u8 = 0x01;
+pub const GBA_LINK_FLAG_SLAVE_REPLY: u8 = 0x02;
+
+/// Trame binaire compacte (14 octets en clair, chiffrée dans `ZMR1` sur `RelayChannel::GbaLink`)
+/// pour le Câble Link GBA `SIOMULTI` temps réel (2 à 4 consoles).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GbaLinkPayload {
+    pub frame: u32,
+    pub buttons_mask: u16,
+    pub siomlt_send: u16,
+    pub siocnt: u16,
+    pub flags: u8,
+    pub player_id: u8,
+    pub seq: u16,
+}
+
+impl GbaLinkPayload {
+    pub const WIRE_LEN: usize = 14;
+
+    pub fn to_bytes(self) -> [u8; Self::WIRE_LEN] {
+        let mut out = [0u8; Self::WIRE_LEN];
+        out[0..4].copy_from_slice(&self.frame.to_le_bytes());
+        out[4..6].copy_from_slice(&self.buttons_mask.to_le_bytes());
+        out[6..8].copy_from_slice(&self.siomlt_send.to_le_bytes());
+        out[8..10].copy_from_slice(&self.siocnt.to_le_bytes());
+        out[10] = self.flags;
+        out[11] = self.player_id & 0x03;
+        out[12..14].copy_from_slice(&self.seq.to_le_bytes());
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < Self::WIRE_LEN {
+            return Err("charge utile GBA Link SIOMULTI trop courte".into());
+        }
+        Ok(Self {
+            frame: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            buttons_mask: u16::from_le_bytes([bytes[4], bytes[5]]),
+            siomlt_send: u16::from_le_bytes([bytes[6], bytes[7]]),
+            siocnt: u16::from_le_bytes([bytes[8], bytes[9]]),
+            flags: bytes[10],
+            player_id: bytes[11] & 0x03,
+            seq: u16::from_le_bytes([bytes[12], bytes[13]]),
+        })
+    }
+
+    pub fn is_master_tx(self) -> bool {
+        (self.flags & GBA_LINK_FLAG_MASTER_TX) != 0
+    }
+
+    pub fn is_slave_reply(self) -> bool {
+        (self.flags & GBA_LINK_FLAG_SLAVE_REPLY) != 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1117,5 +1178,30 @@ mod tests {
         )
         .to_bytes()
         .is_err());
+    }
+
+    #[test]
+    fn gba_link_payload_roundtrips_through_zmr1_e2ee() {
+        let key = RelaySessionKey::generate().unwrap();
+        let p0 = Zmr1Cipher::new(&key).unwrap();
+        let p1 = Zmr1Cipher::new(&key).unwrap();
+
+        let pkt = GbaLinkPayload {
+            frame: 420,
+            buttons_mask: 0x00A5,
+            siomlt_send: 0xCAFE,
+            siocnt: 0x6088,
+            flags: GBA_LINK_FLAG_MASTER_TX,
+            player_id: 0,
+            seq: 17,
+        };
+        let sealed = p0
+            .seal(RelayChannel::GbaLink, "EMERLD", &pkt.to_bytes())
+            .unwrap();
+        let opened = p1.open(RelayChannel::GbaLink, "EMERLD", &sealed).unwrap();
+        let decoded = GbaLinkPayload::from_bytes(&opened).unwrap();
+        assert_eq!(decoded, pkt);
+        assert!(decoded.is_master_tx());
+        assert!(!decoded.is_slave_reply());
     }
 }

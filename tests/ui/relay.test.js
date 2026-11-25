@@ -63,7 +63,19 @@ test("Multijoueur E2EE UI elements, security attributes, and Tauri commands stay
     "relay-switch-tunnel-endpoint",
     "btn-relay-copy-switch-endpoint",
     "btn-relay-toggle-switch-tunnel",
-    "relay-switch-tunnel-hint"
+    "relay-switch-tunnel-hint",
+    "relay-trade-hub-box",
+    "relay-trade-phase-badge",
+    "relay-trade-format-badge",
+    "relay-trade-box-select",
+    "btn-trade-load-boxes",
+    "relay-trade-box-grid",
+    "relay-trade-local-offer",
+    "relay-trade-peer-offer",
+    "chk-trade-allow-evo",
+    "btn-trade-accept",
+    "btn-trade-cancel",
+    "relay-trade-status-msg"
   ];
 
   for (const id of relayIds) {
@@ -81,7 +93,12 @@ test("Multijoueur E2EE UI elements, security attributes, and Tauri commands stay
     "get_relay_status",
     "relay_start_switch_tunnel",
     "relay_stop_switch_tunnel",
-    "get_switch_tunnel_status"
+    "get_switch_tunnel_status",
+    "trade_inspect_active_save",
+    "trade_offer_pokemon",
+    "trade_accept_and_commit",
+    "trade_cancel",
+    "get_trade_hub_status"
   ];
   for (const cmd of commands) {
     assert.ok(appJs.includes(`"${cmd}"`), `app.js missing invokeBackend("${cmd}")`);

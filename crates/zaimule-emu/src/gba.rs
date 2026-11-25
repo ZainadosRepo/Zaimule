@@ -208,6 +208,37 @@ impl EmulatorBackend for GbaCore {
         incoming
     }
 
+    fn set_gba_multi_connected(&mut self, connected: bool, player_id: u8) {
+        if let Some(ref mut gba) = self.inner {
+            gba.set_sio_multi_connected(connected, player_id);
+        }
+    }
+
+    fn take_gba_multi_tx(&mut self) -> Option<(u16, u16)> {
+        let gba = self.inner.as_mut()?;
+        let word = gba.take_sio_multi_tx()?;
+        Some((word, gba.sio_cnt()))
+    }
+
+    fn deliver_gba_multi(&mut self, slots: [u16; 4], my_id: u8) {
+        if let Some(ref mut gba) = self.inner {
+            gba.deliver_sio_multi(slots, my_id);
+        }
+    }
+
+    fn exchange_gba_multi_slave(&mut self, master_word: u16, my_id: u8) -> (u16, u16) {
+        let Some(ref mut gba) = self.inner else {
+            return (0xFFFF, 0x0000);
+        };
+        let slot_idx = usize::from(my_id.clamp(1, 3));
+        let slave_word = gba.sio_mlt_send();
+        let mut slots = [0xFFFFu16; 4];
+        slots[0] = master_word;
+        slots[slot_idx] = slave_word;
+        gba.deliver_sio_multi(slots, my_id);
+        (slave_word, gba.sio_cnt())
+    }
+
     fn debug_snapshot(&self) -> CpuDebugSnapshot {
         let Some(ref gba) = self.inner else {
             return CpuDebugSnapshot {
@@ -220,8 +251,8 @@ impl EmulatorBackend for GbaCore {
                 reg_hl_hex: "0x00000000".into(),
                 flags_str: "STANDBY".into(),
                 ly_scanline: 0,
-                serial_sb_hex: "0x00".into(),
-                serial_sc_hex: "0x00".into(),
+                serial_sb_hex: "0x0000".into(),
+                serial_sc_hex: "0x0000".into(),
                 cycles: 0,
                 score: 0,
             };
@@ -251,8 +282,8 @@ impl EmulatorBackend for GbaCore {
             reg_hl_hex: format!("0x{:08X}", cpu.regs.get(14)),
             flags_str: flags,
             ly_scanline: ((cpu.bus.cycles / 1232) % 228) as u8,
-            serial_sb_hex: "0x00".into(),
-            serial_sc_hex: "0x00".into(),
+            serial_sb_hex: format!("0x{:04X}", gba.sio_mlt_send()),
+            serial_sc_hex: format!("0x{:04X}", gba.sio_cnt()),
             cycles: cpu.bus.cycles,
             score: 0,
         }

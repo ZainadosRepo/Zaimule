@@ -17,8 +17,10 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use zaimule_core::netplay::{
     format_relay_invite, hash_room_password, parse_relay_invite, validate_relay_url, GbLinkPayload,
-    RelayChannel, RelayChatPayload, RelayPeerInfo, RelaySessionKey, SwitchLdnPacket, Zmr1Cipher,
+    GbaLinkPayload, RelayChannel, RelayChatPayload, RelayPeerInfo, RelaySessionKey,
+    SwitchLdnPacket, Zmr1Cipher,
 };
+use zaimule_core::pokemon_trade::TradeHubWireMessage;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(5);
@@ -184,6 +186,8 @@ enum WireServerControl {
 
 enum OutboundCmd {
     GbLink(GbLinkPayload),
+    GbaLink(GbaLinkPayload),
+    TradeHub(TradeHubWireMessage),
     Chat(RelayChatPayload),
     SwitchLdn {
         target_peer_id: u8,
@@ -196,6 +200,8 @@ struct RelayInner {
     status: RelayStatusSnapshot,
     cmd_tx: Option<mpsc::Sender<OutboundCmd>>,
     inbound_gb_link: VecDeque<GbLinkPayload>,
+    inbound_gba_link: VecDeque<GbaLinkPayload>,
+    inbound_trade_hub: VecDeque<(u8, TradeHubWireMessage)>,
     switch_ldn_tx: Option<mpsc::Sender<(u8, SwitchLdnPacket)>>,
     session_generation: u64,
 }
@@ -206,6 +212,8 @@ impl Default for RelayInner {
             status: RelayStatusSnapshot::default(),
             cmd_tx: None,
             inbound_gb_link: VecDeque::with_capacity(32),
+            inbound_gba_link: VecDeque::with_capacity(32),
+            inbound_trade_hub: VecDeque::with_capacity(16),
             switch_ldn_tx: None,
             session_generation: 0,
         }
@@ -248,6 +256,18 @@ impl RelayClient {
             .find(|p| p.is_host)
             .map(|p| p.peer_id)
             .or(Some(1))
+    }
+
+    /// Retourne le rôle GBA `SIOMULTI` (`0` = Hôte/Parent, `1..=3` = Invités/Enfants).
+    pub fn gba_player_id(&self) -> u8 {
+        let Ok(guard) = self.inner.lock() else {
+            return 0;
+        };
+        if !guard.status.connected || guard.status.is_host {
+            0
+        } else {
+            guard.status.peer_id.saturating_sub(1).clamp(1, 3)
+        }
     }
 
     /// Envoie un datagramme Switch LDN chiffré `ZMR1` en unicast (`target_peer_id`).
@@ -302,6 +322,54 @@ impl RelayClient {
             return Vec::new();
         };
         guard.inbound_gb_link.drain(..).collect()
+    }
+
+    /// Empile un paquet Câble Link GBA (`SIOMULTI`) pour chiffrement `ZMR1` et envoi asynchrone.
+    pub fn send_gba_link_payload(&self, payload: GbaLinkPayload) {
+        if !self.is_in_room() {
+            return;
+        }
+        let tx = self.inner.lock().ok().and_then(|g| g.cmd_tx.clone());
+        if let Some(tx) = tx {
+            let _ = tx.try_send(OutboundCmd::GbaLink(payload));
+        }
+    }
+
+    /// Récupère tous les paquets Câble Link GBA (`SIOMULTI`) déchiffrés depuis le relais.
+    pub fn drain_incoming_gba_link(&self) -> Vec<GbaLinkPayload> {
+        if !self.is_in_room() {
+            return Vec::new();
+        }
+        let Ok(mut guard) = self.inner.lock() else {
+            return Vec::new();
+        };
+        guard.inbound_gba_link.drain(..).collect()
+    }
+
+    /// Envoie un message Trade Hub Pokémon chiffré de bout en bout (`RelayChannel::TradeHub`).
+    pub fn send_trade_hub_message(&self, msg: TradeHubWireMessage) -> Result<(), String> {
+        if !self.is_in_room() {
+            return Err("connectez-vous d'abord à un salon relais chiffré".into());
+        }
+        let tx = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|g| g.cmd_tx.clone())
+            .ok_or_else(|| "canal relais indisponible".to_string())?;
+        tx.try_send(OutboundCmd::TradeHub(msg))
+            .map_err(|_| "file d'envoi relais saturée".to_string())
+    }
+
+    /// Récupère tous les messages Trade Hub Pokémon reçus et authentifiés depuis le relais.
+    pub fn drain_incoming_trade_hub(&self) -> Vec<(u8, TradeHubWireMessage)> {
+        if !self.is_in_room() {
+            return Vec::new();
+        }
+        let Ok(mut guard) = self.inner.lock() else {
+            return Vec::new();
+        };
+        guard.inbound_trade_hub.drain(..).collect()
     }
 
     /// Envoie un message de chat chiffré `ZMR1` (`ChaCha20-Poly1305`) dans le salon actif.
@@ -360,6 +428,8 @@ impl RelayClient {
             let _ = tx.try_send(OutboundCmd::Leave);
         }
         guard.inbound_gb_link.clear();
+        guard.inbound_gba_link.clear();
+        guard.inbound_trade_hub.clear();
         guard.switch_ldn_tx = None;
         guard.status = RelayStatusSnapshot::default();
         guard.status.clone()
@@ -586,6 +656,8 @@ impl RelayClient {
             guard.status = snapshot.clone();
             guard.cmd_tx = Some(cmd_tx);
             guard.inbound_gb_link.clear();
+            guard.inbound_gba_link.clear();
+            guard.inbound_trade_hub.clear();
             guard.session_generation
         };
         self.in_room.store(true, Ordering::Relaxed);
@@ -635,6 +707,42 @@ impl RelayClient {
                                     if let Ok(mut g) = shared_inner.lock() {
                                         if g.session_generation == generation {
                                             g.status.packets_sent = g.status.packets_sent.saturating_add(1);
+                                        }
+                                    }
+                                }
+                            }
+                            OutboundCmd::GbaLink(gba_payload) => {
+                                if let Ok(sealed) = cipher.seal(
+                                    RelayChannel::GbaLink,
+                                    &room_code,
+                                    &gba_payload.to_bytes(),
+                                ) {
+                                    let frame = encode_client_binary(RelayChannel::GbaLink, 0, &sealed);
+                                    if ws_tx.send(WsMessage::Binary(frame.into())).await.is_err() {
+                                        break;
+                                    }
+                                    if let Ok(mut g) = shared_inner.lock() {
+                                        if g.session_generation == generation {
+                                            g.status.packets_sent = g.status.packets_sent.saturating_add(1);
+                                        }
+                                    }
+                                }
+                            }
+                            OutboundCmd::TradeHub(trade_msg) => {
+                                if let Ok(plain) = serde_json::to_vec(&trade_msg) {
+                                    if let Ok(sealed) = cipher.seal(
+                                        RelayChannel::TradeHub,
+                                        &room_code,
+                                        &plain,
+                                    ) {
+                                        let frame = encode_client_binary(RelayChannel::TradeHub, 0, &sealed);
+                                        if ws_tx.send(WsMessage::Binary(frame.into())).await.is_err() {
+                                            break;
+                                        }
+                                        if let Ok(mut g) = shared_inner.lock() {
+                                            if g.session_generation == generation {
+                                                g.status.packets_sent = g.status.packets_sent.saturating_add(1);
+                                            }
                                         }
                                     }
                                 }
@@ -822,6 +930,24 @@ fn handle_inbound_binary(
                     let _ = guard.inbound_gb_link.pop_front();
                 }
                 guard.inbound_gb_link.push_back(pkt);
+                guard.status.packets_received = guard.status.packets_received.saturating_add(1);
+            }
+        }
+        RelayChannel::GbaLink => {
+            if let Ok(pkt) = GbaLinkPayload::from_bytes(&plain) {
+                if guard.inbound_gba_link.len() >= MAX_INBOUND_LINK_QUEUE {
+                    let _ = guard.inbound_gba_link.pop_front();
+                }
+                guard.inbound_gba_link.push_back(pkt);
+                guard.status.packets_received = guard.status.packets_received.saturating_add(1);
+            }
+        }
+        RelayChannel::TradeHub => {
+            if let Ok(msg) = serde_json::from_slice::<TradeHubWireMessage>(&plain) {
+                if guard.inbound_trade_hub.len() >= 32 {
+                    let _ = guard.inbound_trade_hub.pop_front();
+                }
+                guard.inbound_trade_hub.push_back((sender_peer_id, msg));
                 guard.status.packets_received = guard.status.packets_received.saturating_add(1);
             }
         }

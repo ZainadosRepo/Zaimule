@@ -374,6 +374,9 @@ let state = {
   relayPlayerName: "",
   relayStatus: null,
   switchTunnelStatus: null,
+  tradeInventory: null,
+  tradeSelectedBox: 0,
+  tradeHubStatus: null,
   relayPollTimer: null,
   communityMods: [],
   ghostLeaderboard: [],
@@ -2071,12 +2074,33 @@ function syncRelayStatusPolling() {
     if (!state.relayPollTimer) {
       state.relayPollTimer = setInterval(async () => {
         try {
-          const [snap, tunnelSnap] = await Promise.all([
+          const [snap, tunnelSnap, tradeSnap] = await Promise.all([
             invokeBackend("get_relay_status"),
-            invokeBackend("get_switch_tunnel_status")
+            invokeBackend("get_switch_tunnel_status"),
+            invokeBackend("get_trade_hub_status")
           ]);
           if (tunnelSnap) {
             state.switchTunnelStatus = tunnelSnap;
+          }
+          if (tradeSnap) {
+            const prevPhase = state.tradeHubStatus?.phase;
+            state.tradeHubStatus = tradeSnap;
+            if (prevPhase !== "committed" && tradeSnap.phase === "committed") {
+              showToast(tradeSnap.statusMessage || "Échange atomique Pokémon terminé !", "ok", 6000);
+              // Recharger automatiquement les Boîtes PC pour afficher le Pokémon reçu / évolué
+              if (state.tradeInventory) {
+                invokeBackend("trade_inspect_active_save", {
+                  gameId: getSelectedGame()?.id || null
+                })
+                  .then((inv) => {
+                    if (inv) {
+                      state.tradeInventory = inv;
+                      renderTradeHubBox();
+                    }
+                  })
+                  .catch(() => {});
+              }
+            }
           }
           if (snap) {
             const wasConnected = Boolean(state.relayStatus?.connected);
@@ -2084,6 +2108,7 @@ function syncRelayStatusPolling() {
             renderRelayMultiplayer();
             if (wasConnected && !snap.connected) {
               state.switchTunnelStatus = null;
+              state.tradeHubStatus = null;
               stopRelayStatusPolling();
               if (snap.lastError) {
                 showToast(`Relais déconnecté : ${snap.lastError}`, "error", 5000);
@@ -2097,6 +2122,194 @@ function syncRelayStatusPolling() {
     }
   } else {
     stopRelayStatusPolling();
+  }
+}
+
+function formatTradePokemonCardHtml(mon, accepted, trainerName, formatLabel) {
+  if (!mon) return "";
+  const shiny = mon.isShiny ? " ★" : "";
+  const nickDiff =
+    mon.nickname && mon.nickname.toLowerCase() !== (mon.speciesNameFr || "").toLowerCase()
+      ? ` <span class="mono" style="color:var(--text-muted);">(${escapeHtml(mon.nickname)})</span>`
+      : "";
+  const itemPart = mon.heldItemNameFr
+    ? `<div class="relay-trade-mon-meta">Objet : ${escapeHtml(mon.heldItemNameFr)}</div>`
+    : "";
+  const evoPart = mon.tradeEvolutionPreview
+    ? `<div class="relay-trade-mon-evo">Évolution : ${escapeHtml(mon.tradeEvolutionPreview)}</div>`
+    : "";
+  const badge = accepted
+    ? `<span class="pill-badge pill-green mono" style="font-size:10px; margin-left:6px;">Validé ✓</span>`
+    : "";
+  const metaLine = [
+    `Nv. ${mon.levelApprox || 1}`,
+    `Boîte ${(Number(mon.boxIndex) || 0) + 1}`,
+    trainerName ? `Dresseur ${trainerName}` : null
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const fmtLine = formatLabel
+    ? `<div class="relay-trade-mon-meta">${escapeHtml(formatLabel)}</div>`
+    : "";
+  return `
+    <div><strong>${escapeHtml(mon.speciesNameFr || "Pokémon")}${shiny}</strong>${nickDiff}${badge}</div>
+    <div class="relay-trade-mon-meta mono">${escapeHtml(metaLine)}</div>
+    ${fmtLine}
+    ${itemPart}
+    ${evoPart}
+  `;
+}
+
+function renderTradeHubBox() {
+  const box = document.getElementById("relay-trade-hub-box");
+  if (!box) return;
+  const th = state.tradeHubStatus;
+  const inv = state.tradeInventory;
+
+  const phaseBadge = document.getElementById("relay-trade-phase-badge");
+  if (phaseBadge) {
+    const phase = th?.phase || "idle";
+    let label = "Prêt";
+    let isOk = false;
+    if (phase === "committed") {
+      label = "Terminé ✓";
+      isOk = true;
+    } else if (phase === "negotiating") {
+      label = th?.localAccepted ? "Attente partenaire" : "Négociation";
+      isOk = Boolean(th?.compatible);
+    } else if (phase === "cancelled") {
+      label = "Annulé";
+    }
+    phaseBadge.textContent = label;
+    phaseBadge.classList.toggle("pill-green", isOk);
+  }
+
+  const fmtBadge = document.getElementById("relay-trade-format-badge");
+  if (fmtBadge) {
+    if (inv) {
+      fmtBadge.textContent = `${inv.formatLabel} · ${inv.trainerName}`;
+      fmtBadge.style.display = "inline-flex";
+    } else {
+      fmtBadge.style.display = "none";
+    }
+  }
+
+  const boxSelect = document.getElementById("relay-trade-box-select");
+  const grid = document.getElementById("relay-trade-box-grid");
+  if (boxSelect && grid) {
+    if (inv) {
+      const boxCount = Number(inv.boxCount) || 12;
+      if (state.tradeSelectedBox >= boxCount) {
+        state.tradeSelectedBox = 0;
+      }
+      boxSelect.style.display = "inline-flex";
+      if (boxSelect.options.length !== boxCount) {
+        boxSelect.innerHTML = "";
+        for (let b = 0; b < boxCount; b += 1) {
+          const opt = document.createElement("option");
+          opt.value = String(b);
+          opt.textContent = `Boîte ${b + 1}`;
+          boxSelect.appendChild(opt);
+        }
+      }
+      boxSelect.value = String(state.tradeSelectedBox);
+
+      grid.style.display = "grid";
+      grid.innerHTML = "";
+      const list = (inv.pokemon || []).filter((p) => p.boxIndex === state.tradeSelectedBox);
+      if (list.length === 0) {
+        grid.innerHTML = `<div class="empty-list-hint" style="grid-column:1/-1;">Aucun Pokémon dans la Boîte ${state.tradeSelectedBox + 1}. Choisissez une autre boîte.</div>`;
+      } else {
+        for (const mon of list) {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          const isSelected =
+            th?.localOffer &&
+            th.localOffer.boxIndex === mon.boxIndex &&
+            th.localOffer.slotIndex === mon.slotIndex;
+          btn.className = `relay-trade-mon-btn${isSelected ? " is-selected" : ""}`;
+          const shiny = mon.isShiny ? " ★" : "";
+          const itemLine = mon.heldItemNameFr
+            ? `<span class="relay-trade-mon-meta">${escapeHtml(mon.heldItemNameFr)}</span>`
+            : "";
+          const evoLine = mon.tradeEvolutionPreview
+            ? `<span class="relay-trade-mon-evo">${escapeHtml(mon.tradeEvolutionPreview)}</span>`
+            : "";
+          btn.innerHTML = `
+            <strong>${escapeHtml(mon.speciesNameFr)}${shiny}</strong>
+            <span class="relay-trade-mon-meta mono">Nv. ${mon.levelApprox} · Empl. ${mon.slotIndex + 1}</span>
+            ${itemLine}
+            ${evoLine}
+          `;
+          btn.addEventListener("click", async () => {
+            const snap = await invokeBackend("trade_offer_pokemon", {
+              gameId: getSelectedGame()?.id || null,
+              boxIndex: mon.boxIndex,
+              slotIndex: mon.slotIndex
+            });
+            if (snap) {
+              state.tradeHubStatus = snap;
+              renderTradeHubBox();
+              showToast(`Offre envoyée : ${mon.speciesNameFr}`, "ok");
+            }
+          });
+          grid.appendChild(btn);
+        }
+      }
+    } else {
+      boxSelect.style.display = "none";
+      grid.style.display = "none";
+    }
+  }
+
+  const localEl = document.getElementById("relay-trade-local-offer");
+  if (localEl) {
+    if (th?.localOffer) {
+      localEl.innerHTML = formatTradePokemonCardHtml(
+        th.localOffer,
+        Boolean(th.localAccepted),
+        th.localTrainerName,
+        th.localFormatLabel
+      );
+    } else {
+      localEl.textContent = "Aucun Pokémon proposé.";
+    }
+  }
+
+  const peerEl = document.getElementById("relay-trade-peer-offer");
+  if (peerEl) {
+    if (th?.peerOffer) {
+      peerEl.innerHTML = formatTradePokemonCardHtml(
+        th.peerOffer,
+        Boolean(th.peerAccepted),
+        th.peerTrainerName,
+        th.peerFormatLabel
+      );
+    } else {
+      peerEl.textContent = "En attente d'une offre chiffrée…";
+    }
+  }
+
+  const acceptBtn = document.getElementById("btn-trade-accept");
+  if (acceptBtn) {
+    acceptBtn.disabled = !th?.canAccept;
+    if (th?.phase === "committed") {
+      acceptBtn.textContent = "Échange terminé ✓";
+    } else if (th?.localAccepted) {
+      acceptBtn.textContent = "En attente du partenaire…";
+    } else {
+      acceptBtn.textContent = "Confirmer l'échange atomique";
+    }
+  }
+
+  const cancelBtn = document.getElementById("btn-trade-cancel");
+  if (cancelBtn) {
+    cancelBtn.style.display = th?.phase === "negotiating" ? "inline-flex" : "none";
+  }
+
+  const msgEl = document.getElementById("relay-trade-status-msg");
+  if (msgEl && th?.statusMessage) {
+    msgEl.textContent = th.statusMessage;
   }
 }
 
@@ -2235,6 +2448,7 @@ function renderRelayMultiplayer() {
   }
 
   renderSwitchTunnelBox(st);
+  renderTradeHubBox();
 
   setText("relay-active-code", st.roomCode || "------");
   setText("relay-cipher-badge", st.e2eeCipher || "ChaCha20-Poly1305 (ZMR1)");
@@ -4604,9 +4818,82 @@ function bindEvents() {
     const snap = await invokeBackend("relay_leave_room");
     state.relayStatus = snap || { connected: false };
     state.switchTunnelStatus = null;
+    state.tradeInventory = null;
+    state.tradeHubStatus = null;
     stopRelayStatusPolling();
     renderRelayMultiplayer();
     showToast("Salon relais quitté.", "info");
+  });
+
+  document.getElementById("btn-trade-load-boxes")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    if (btn) btn.disabled = true;
+    try {
+      const inv = await invokeBackend("trade_inspect_active_save", {
+        gameId: getSelectedGame()?.id || null
+      });
+      if (inv) {
+        state.tradeInventory = inv;
+        state.tradeSelectedBox = Number(inv.currentBox) || 0;
+        // Si la boîte courante est vide mais qu'une autre boîte contient des Pokémon, basculer dessus
+        const hasInCurrent = (inv.pokemon || []).some((p) => p.boxIndex === state.tradeSelectedBox);
+        if (!hasInCurrent && inv.pokemon?.length > 0) {
+          state.tradeSelectedBox = inv.pokemon[0].boxIndex;
+        }
+        renderTradeHubBox();
+        showToast(
+          `${inv.pokemon?.length || 0} Pokémon chargé(s) (${inv.formatLabel})`,
+          "ok"
+        );
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
+
+  document.getElementById("relay-trade-box-select")?.addEventListener("change", (e) => {
+    state.tradeSelectedBox = Number(e.target.value) || 0;
+    renderTradeHubBox();
+  });
+
+  document.getElementById("btn-trade-accept")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    const allowEvo = Boolean(document.getElementById("chk-trade-allow-evo")?.checked ?? true);
+    if (btn) btn.disabled = true;
+    try {
+      const snap = await invokeBackend("trade_accept_and_commit", {
+        allowEvolution: allowEvo
+      });
+      if (snap) {
+        state.tradeHubStatus = snap;
+        renderTradeHubBox();
+        if (snap.phase === "committed") {
+          showToast(snap.statusMessage || "Échange atomique Pokémon terminé !", "ok", 6000);
+          const refreshed = await invokeBackend("trade_inspect_active_save", {
+            gameId: getSelectedGame()?.id || null
+          });
+          if (refreshed) {
+            state.tradeInventory = refreshed;
+            renderTradeHubBox();
+          }
+        } else {
+          showToast("Validation envoyée — en attente du partenaire…", "info");
+        }
+      }
+    } finally {
+      renderTradeHubBox();
+    }
+  });
+
+  document.getElementById("btn-trade-cancel")?.addEventListener("click", async () => {
+    const snap = await invokeBackend("trade_cancel", {
+      reason: "Annulé par le joueur"
+    });
+    if (snap) {
+      state.tradeHubStatus = snap;
+      renderTradeHubBox();
+      showToast("Échange annulé.", "info");
+    }
   });
 
   document.getElementById("btn-relay-toggle-switch-tunnel")?.addEventListener("click", async (e) => {

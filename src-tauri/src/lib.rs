@@ -1,6 +1,7 @@
 mod metadata_fetcher;
 mod relay_client;
 mod switch_tunnel;
+mod trade_hub;
 mod update;
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -15,6 +16,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use switch_tunnel::{SwitchLdnTunnel, SwitchTunnelStatus};
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
+use trade_hub::{TradeHubManager, TradeHubStatus};
 use zaimule_core::bios::{looks_like_bios_path, BiosImportReport};
 use zaimule_core::catalog::SwitchEngineOverride;
 use zaimule_core::external::{
@@ -24,6 +26,7 @@ use zaimule_core::external::{
 use zaimule_core::keymap::KeymapWidget;
 use zaimule_core::metadata::{sync_sram_directories, CloudSyncReport, GameMetadataUpdate};
 use zaimule_core::overrides::{GlobalSettings, ShaderPreset};
+use zaimule_core::pokemon_trade::{inspect_pokemon_save, PokemonSaveInventory};
 use zaimule_core::rewind::SaveStateSlotInfo;
 use zaimule_core::storage::{
     load_json_atomic, load_library_atomic, load_sram_bytes, load_state_slot_atomic,
@@ -122,6 +125,7 @@ struct AppState {
     session: Arc<Mutex<EmulatorSession>>,
     relay: Arc<RelayClient>,
     switch_tunnel: Arc<SwitchLdnTunnel>,
+    trade_hub: Arc<TradeHubManager>,
     emu_worker: EmuWorker,
     last_sram_flush_ms: Arc<AtomicU64>,
     last_playtime_flush_ms: Arc<AtomicU64>,
@@ -660,8 +664,9 @@ async fn relay_create_room(
         })
         .await?;
 
+    let gba_role = state.relay.gba_player_id();
     if let Ok(mut session) = state.session.lock() {
-        session.set_online_link_enabled(true);
+        session.set_online_link_enabled_with_role(true, gba_role);
     }
     Ok(snapshot)
 }
@@ -725,8 +730,9 @@ async fn relay_join_room(
         })
         .await?;
 
+    let gba_role = state.relay.gba_player_id();
     if let Ok(mut session) = state.session.lock() {
-        session.set_online_link_enabled(true);
+        session.set_online_link_enabled_with_role(true, gba_role);
     }
     Ok(snapshot)
 }
@@ -734,8 +740,9 @@ async fn relay_join_room(
 #[tauri::command]
 fn relay_leave_room(state: tauri::State<AppState>) -> RelayStatusSnapshot {
     let _ = state.switch_tunnel.stop(&state.relay);
+    state.trade_hub.reset();
     if let Ok(mut session) = state.session.lock() {
-        session.set_online_link_enabled(false);
+        session.set_online_link_enabled_with_role(false, 0);
     }
     state.relay.leave_room()
 }
@@ -772,6 +779,126 @@ fn relay_stop_switch_tunnel(state: tauri::State<AppState>) -> SwitchTunnelStatus
 #[tauri::command]
 fn get_switch_tunnel_status(state: tauri::State<AppState>) -> SwitchTunnelStatus {
     state.switch_tunnel.status_snapshot()
+}
+
+fn resolve_trade_sram_target(
+    app: &AppHandle,
+    session: &mut EmulatorSession,
+    requested_game_id: Option<String>,
+) -> Result<(String, PathBuf, Vec<u8>), String> {
+    let target_id = requested_game_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| session.active_game_id.clone());
+    if target_id.is_empty() {
+        return Err(
+            "sélectionnez d'abord un jeu Pokémon GB, GBA ou NDS dans votre bibliothèque".into(),
+        );
+    }
+    let path = sram_path(app, &target_id)?;
+
+    // Si le jeu demandé est actuellement chargé en mémoire, synchroniser sa SRAM vivante
+    if session.active_game_id == target_id {
+        session.sync_active_sram();
+        let live = session.active_sram_bytes();
+        if !live.is_empty() {
+            return Ok((target_id, path, live.to_vec()));
+        }
+    }
+
+    if let Some(disk_bytes) = load_sram_bytes(&path)? {
+        if !disk_bytes.is_empty() {
+            return Ok((target_id, path, disk_bytes));
+        }
+    }
+
+    // Repli pratique : vérifier si un fichier `.sav` existe directement à côté de la ROM
+    if let Some(rom_str) = session
+        .catalog
+        .iter()
+        .find(|g| g.id == target_id)
+        .and_then(|g| g.rom_path.as_deref())
+    {
+        let sidecar_sav = PathBuf::from(rom_str).with_extension("sav");
+        if sidecar_sav.is_file() {
+            if let Ok(bytes) = fs::read(&sidecar_sav) {
+                if !bytes.is_empty() {
+                    return Ok((target_id, sidecar_sav, bytes));
+                }
+            }
+        }
+    }
+
+    Err(
+        "aucune sauvegarde .srm / .sav trouvée pour ce jeu (sauvegardez au moins une fois en jeu avant d'ouvrir le Trade Hub)"
+            .into(),
+    )
+}
+
+#[tauri::command]
+fn trade_inspect_active_save(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    game_id: Option<String>,
+) -> Result<PokemonSaveInventory, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    let (_id, _path, bytes) = resolve_trade_sram_target(&app, &mut session, game_id)?;
+    inspect_pokemon_save(&bytes)
+}
+
+#[tauri::command]
+fn trade_offer_pokemon(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    game_id: Option<String>,
+    box_index: u8,
+    slot_index: u8,
+) -> Result<TradeHubStatus, String> {
+    let (resolved_id, path, bytes) = {
+        let mut session = state
+            .session
+            .lock()
+            .map_err(|_| "verrou session indisponible".to_string())?;
+        resolve_trade_sram_target(&app, &mut session, game_id)?
+    };
+    state.trade_hub.post_offer(
+        &state.relay,
+        Some(&state.session),
+        resolved_id,
+        path,
+        &bytes,
+        box_index,
+        slot_index,
+    )
+}
+
+#[tauri::command]
+fn trade_accept_and_commit(
+    state: tauri::State<AppState>,
+    allow_evolution: Option<bool>,
+) -> Result<TradeHubStatus, String> {
+    state.trade_hub.accept_offer(
+        &state.relay,
+        Some(&state.session),
+        allow_evolution.unwrap_or(true),
+    )
+}
+
+#[tauri::command]
+fn trade_cancel(state: tauri::State<AppState>, reason: Option<String>) -> TradeHubStatus {
+    state.trade_hub.cancel_trade(&state.relay, reason)
+}
+
+#[tauri::command]
+fn get_trade_hub_status(state: tauri::State<AppState>) -> TradeHubStatus {
+    state
+        .trade_hub
+        .poll_and_snapshot(&state.relay, Some(&state.session))
 }
 
 #[tauri::command]
@@ -829,19 +956,26 @@ async fn step_viewport(
                 .map_err(|_| "verrou session indisponible".to_string())?;
             let online_active = relay_arc.is_in_room();
             if online_active {
-                if !session.online_link_enabled {
-                    session.set_online_link_enabled(true);
+                let gba_role = relay_arc.gba_player_id();
+                if !session.online_link_enabled || session.online_gba_player_id != gba_role {
+                    session.set_online_link_enabled_with_role(true, gba_role);
                 }
                 for incoming in relay_arc.drain_incoming_gb_link() {
                     session.push_remote_link_payload(incoming);
                 }
+                for incoming in relay_arc.drain_incoming_gba_link() {
+                    session.push_remote_gba_link_payload(incoming);
+                }
             } else if session.online_link_enabled {
-                session.set_online_link_enabled(false);
+                session.set_online_link_enabled_with_role(false, 0);
             }
             let out = session.step_viewport_with_speed(buttons_p1, buttons_p2, turbo_active, speed);
             if online_active {
                 for outgoing in session.drain_outgoing_link_payloads() {
                     relay_arc.send_gb_link_payload(outgoing);
+                }
+                for outgoing in session.drain_outgoing_gba_link_payloads() {
+                    relay_arc.send_gba_link_payload(outgoing);
                 }
             }
             let flush_sram = maybe_collect_live_sram(&last_sram_flush, &mut session, now);
@@ -879,14 +1013,18 @@ async fn step_viewport_binary(
                 .map_err(|_| "verrou session indisponible".to_string())?;
             let online_active = relay_arc.is_in_room();
             if online_active {
-                if !session.online_link_enabled {
-                    session.set_online_link_enabled(true);
+                let gba_role = relay_arc.gba_player_id();
+                if !session.online_link_enabled || session.online_gba_player_id != gba_role {
+                    session.set_online_link_enabled_with_role(true, gba_role);
                 }
                 for incoming in relay_arc.drain_incoming_gb_link() {
                     session.push_remote_link_payload(incoming);
                 }
+                for incoming in relay_arc.drain_incoming_gba_link() {
+                    session.push_remote_gba_link_payload(incoming);
+                }
             } else if session.online_link_enabled {
-                session.set_online_link_enabled(false);
+                session.set_online_link_enabled_with_role(false, 0);
             }
             let mut step_opts = zaimule_emu::session::BinaryStepOptions::default();
             if let Some(opts) = options {
@@ -915,6 +1053,9 @@ async fn step_viewport_binary(
             if online_active {
                 for outgoing in session.drain_outgoing_link_payloads() {
                     relay_arc.send_gb_link_payload(outgoing);
+                }
+                for outgoing in session.drain_outgoing_gba_link_payloads() {
+                    relay_arc.send_gba_link_payload(outgoing);
                 }
             }
             let flush_sram = maybe_collect_live_sram(&last_sram_flush, &mut session, now);
@@ -2593,6 +2734,7 @@ pub fn run() {
             session,
             relay: Arc::new(RelayClient::new()),
             switch_tunnel: Arc::new(SwitchLdnTunnel::new()),
+            trade_hub: Arc::new(TradeHubManager::new()),
             emu_worker: EmuWorker::spawn(),
             last_sram_flush_ms: Arc::new(AtomicU64::new(0)),
             last_playtime_flush_ms: Arc::new(AtomicU64::new(0)),
@@ -2683,6 +2825,7 @@ pub fn run() {
                 let app = window.app_handle();
                 if let Some(state) = app.try_state::<AppState>() {
                     let _ = state.switch_tunnel.stop(&state.relay);
+                    state.trade_hub.reset();
                     let _ = state.relay.leave_room();
                     if let Ok(mut guard) = state.session.lock() {
                         flush_sram_best_effort(app, &mut guard);
@@ -2767,6 +2910,11 @@ pub fn run() {
             relay_start_switch_tunnel,
             relay_stop_switch_tunnel,
             get_switch_tunnel_status,
+            trade_inspect_active_save,
+            trade_offer_pokemon,
+            trade_accept_and_commit,
+            trade_cancel,
+            get_trade_hub_status,
             save_recorded_macro,
             save_keymapper_layout,
             step_viewport,

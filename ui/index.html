@@ -1047,6 +1047,59 @@
                   </div>
                 </div>
 
+                <!-- PHASE 3 : ZAIMULE TRADE HUB POKÉMON (GEN 1 / 2 / 3 / 4 · ÉCHANGE ATOMIQUE E2EE) -->
+                <div class="relay-trade-box" id="relay-trade-hub-box">
+                  <div class="relay-switch-head">
+                    <div class="relay-switch-title-row">
+                      <span>Trade Hub Pokémon (Gen 1 · 2 · 3 · 4 · E2EE)</span>
+                      <span class="pill-badge mono" id="relay-trade-phase-badge">Prêt</span>
+                      <span class="pill-badge mono" id="relay-trade-format-badge" style="display: none;">--</span>
+                    </div>
+                    <div class="relay-switch-controls">
+                      <select
+                        id="relay-trade-box-select"
+                        class="field-inline mono"
+                        style="display: none; min-width: 112px;"
+                        aria-label="Boîte PC Pokémon"
+                      ></select>
+                      <button class="btn" id="btn-trade-load-boxes" type="button">Charger mes Boîtes PC</button>
+                    </div>
+                  </div>
+
+                  <div class="relay-trade-grid" id="relay-trade-box-grid" style="display: none;"></div>
+
+                  <div class="relay-trade-offers" id="relay-trade-offers-deck">
+                    <div class="relay-trade-offer-card">
+                      <div class="relay-trade-offer-label">Votre offre</div>
+                      <div class="relay-trade-offer-body" id="relay-trade-local-offer">
+                        Aucun Pokémon proposé.
+                      </div>
+                    </div>
+                    <div class="relay-trade-offer-arrow mono" aria-hidden="true">⇄</div>
+                    <div class="relay-trade-offer-card">
+                      <div class="relay-trade-offer-label">Offre du partenaire</div>
+                      <div class="relay-trade-offer-body" id="relay-trade-peer-offer">
+                        En attente d'une offre chiffrée…
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="relay-trade-actions">
+                    <label class="relay-trade-evo-toggle">
+                      <input type="checkbox" id="chk-trade-allow-evo" checked />
+                      <span>Autoriser les évolutions par échange</span>
+                    </label>
+                    <div class="relay-switch-controls">
+                      <button class="btn btn-primary" id="btn-trade-accept" type="button" disabled>Confirmer l'échange atomique</button>
+                      <button class="btn btn-ghost" id="btn-trade-cancel" type="button" style="display: none;">Annuler</button>
+                    </div>
+                  </div>
+
+                  <div class="relay-switch-hint" id="relay-trade-status-msg">
+                    Inspecte les boîtes PC de votre sauvegarde Pokémon (.srm / .sav), applique les évolutions officielles, vérifie les sommes de contrôle et crée un backup .srm.bak1 avant écriture.
+                  </div>
+                </div>
+
                 <div class="relay-live-split">
                   <div class="relay-peers-box">
                     <div class="section-title">
