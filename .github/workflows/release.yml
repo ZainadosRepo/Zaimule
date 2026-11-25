@@ -11,7 +11,37 @@ permissions:
   contents: write
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Ensure draft release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          TAG="v${VERSION}"
+          if gh release list -R "${{ github.repository }}" --limit 20 --json tagName --jq '.[].tagName' | grep -Fxq "$TAG"; then
+            echo "Release $TAG already exists."
+            exit 0
+          fi
+          for attempt in 1 2 3 4 5; do
+            if gh release create "$TAG" \
+              -R "${{ github.repository }}" \
+              --draft \
+              --title "Zaimule ${TAG}" \
+              --notes "" \
+              --target "${{ github.sha }}"; then
+              echo "Created draft release $TAG."
+              exit 0
+            fi
+            echo "Draft release creation attempt $attempt failed, retrying in 5s..."
+            sleep 5
+          done
+          exit 1
+
   build:
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -30,6 +60,8 @@ jobs:
         with:
           targets: ${{ matrix.targets }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - uses: actions/setup-node@v5
         with:
           node-version: lts/*
@@ -45,6 +77,7 @@ jobs:
           tagName: v__VERSION__
           releaseName: Zaimule v__VERSION__
           releaseDraft: true
+          retryAttempts: 4
 
   publish:
     needs: build
