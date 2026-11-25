@@ -31,15 +31,21 @@ Au lancement, l'appli regarde sur GitHub si une version plus récente est publi�
 
 ---
 
-## ✨ Architecture & Fonctionnalités (`v1.8.0`)
+## ✨ Architecture & Fonctionnalités (`v1.9.0`)
 
+- **🌐 Multijoueur E2EE sans port ouvert (`ZMR1` ChaCha20-Poly1305) & Relais auto-hébergeable (`server/zaimule-relay`)**
+  - **Zéro port ouvert côté joueur & chiffrement bout-en-bout (`ZMR1`)** : connexions sortantes `wss://` uniquement ; clé de session dérivée par salon (`HKDF-SHA256`) pour que le serveur relais ne voie jamais les trames en clair, avec déploiement Docker autonome (`server/zaimule-relay/`) permettant à chacun d'héberger son propre relais privé avec sa propre clé d'accès.
+  - **Câble Link GB/GBC & GBA (`SIOMULTI`) temps réel** : échanges et combats en ligne sur Game Boy, Game Boy Color et Game Boy Advance (jusqu'à 4 joueurs).
+  - **Tunnel Switch LDN (`127.0.0.1`)** : relie **Torzu** et **Fritchii / Lichii** en multijoueur local-sans-fil à distance via loopback local et auto-configuration `qt-config.ini`.
+  - **Trade Hub Pokémon Gen 1–4 atomique** : échanges sécurisés avec validation SHA-256 en deux phases, rotation de sauvegardes `.srm.bak1..3` et préservation RTC / checksums (Rouge/Bleu/Jaune, Or/Argent/Cristal, Rubis/Saphir/Émeraude/RF/VF, Diamant/Perle/Platine/HG/SS).
+  - **Wi-Fi Nintendo DS temps réel (`nds_core/wifi.rs` & `nds_wfc.rs`)** : sans-fil local **NiFi / Multi-Play** 802.11b (Mario Kart DS, Pokémon Salle Union) et **Point d'Accès Virtuel WFC (`ZaimuleAP`)** avec adresse MAC unique par joueur, DHCP/DNS/`conntest` intégrés et passerelle NAT sortante sans port ouvert.
 - **🧹 Démarrage Propre, Bibliothèque & Dossiers ROMs (`.zip`, `.7z`, Fichiers & Dossiers)**
   - **Zéro contenu propriétaire inclus & zéro scan automatique** : la bibliothèque démarre vide sans parcourir vos dossiers personnels ; aucune ROM, aucune clé Switch ni aucun binaire externe n'est distribué avec Zaimule.
   - **Importation directe & gestion de dossiers (`scanner.rs` & `archive.rs`)** : sélecteurs natifs de fichiers/dossiers (`tauri-plugin-dialog`), glisser-déposer direct, extraction streaming **`.zip` / ZIP64** et **`.7z`**, boutons **Rescanner**, **Tout rescanner** et **Retirer** par dossier, **Favoris**, tri dynamique, temps de jeu natif persisté et navigation clavier/manette 2D filtrée.
 - **🦀 Cœurs d'Émulation 100% Rust Natifs (`crates/zaimule-emu` & `vendor/termboy-*`)**
   - **Game Boy & Game Boy Color (`GB` / `GBC`, `zaimule-rust-gb`)** : motorisé par `termboy-gb` + `termboy-core` (MIT) — affichage `160×144` RGBA8888 à `59.73 Hz`, APU 4 canaux `48 kHz` stéréo, sauvegarde batterie MBC (`.srm`) avec suivi de modifications, Save States `"TBSS"` et Câble Link Série `SB`/`SC`.
   - **Game Boy Advance (`GBA`, `zaimule-rust-gba`)** : motorisé par `termboy-gba` + `termboy-core` (MIT) — CPU ARM7TDMI + BIOS HLE SWI/DMA, PPU `240×160` RGBA8888 à `59.73 Hz` avec correction couleur LCD, APU `48 kHz` stéréo, sauvegarde SRAM/Flash et Save States `"TBSS"`.
-  - **Nintendo DS (`NDS`, `zaimule-rust-nds`)** : motorisé par `nds_core` (`x0cero/nds` MIT) — double CPU **ARM946E-S + ARM7TDMI**, support optionnel de vos propres dumps **BIOS / Firmware** (`bios7.bin`, `bios9.bin`, `firmware.bin`) avec vérification CRC32 et calibration tactile **TSC2046**, **4 dispositions d'écrans** (Vertical, Côte à côte, Inversés) avec stylet tactile adapté, **SPU 16 canaux `48 kHz` stéréo**, **moteur 3D** (`4×4`, `Decal`/`Toon`/`Highlight`), **PPU 2D complet**, télémétrie `VCOUNT`/cycles en direct, Flash 512 Ko et Save States RLE `"ZMND"`.
+  - **Nintendo DS (`NDS`, `zaimule-rust-nds`)** : motorisé par `nds_core` (`x0cero/nds` MIT) — double CPU **ARM946E-S + ARM7TDMI**, support optionnel de vos propres dumps **BIOS / Firmware** (`bios7.bin`, `bios9.bin`, `firmware.bin`) avec vérification CRC32 et calibration tactile **TSC2046**, **4 dispositions d'écrans** (Vertical, Côte à côte, Inversés) avec stylet tactile adapté, **SPU 16 canaux `48 kHz` stéréo**, **moteur 3D** (`4×4`, `Decal`/`Toon`/`Highlight`), **PPU 2D complet**, contrôleur Wi-Fi ARM7 (`NiFi` & `ZaimuleAP`), télémétrie `VCOUNT`/cycles en direct, Flash 512 Ko et Save States RLE `"ZMND"`.
 - **🔐 Coffre Nintendo Switch Option A — Torzu & Fritchii (`external.rs`)**
   - **Séparation Switch 1 & Switch 2** : `SWITCH` (`.nsp`, `.xci`, `.nsz`, `.xcz`, `.nro`, `.nso`) cible par défaut **Torzu**, tandis que `SWITCH2` (`.nx`, `.nup`) cible par défaut **Fritchii / Lichii**, avec **surcharge par jeu** (`Auto` / `Torzu` / `Fritchii`).
   - **Coffre isolé (`<app_config_dir>/switch`)** : importation de vos builds (dossier, exécutable, `.zip`/`.7z`), de vos clés (`prod.keys` / `title.keys`) et de votre **Firmware Nintendo Switch (`.nca`)** synchronisés vers Torzu et Fritchii avant exécution (`-f -g <rom>`), purge du cache shaders et comptabilisation du temps de jeu (`switch-session-ended`).
@@ -71,11 +77,10 @@ Au lancement, l'appli regarde sur GitHub si une version plus récente est publi�
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 
-# Exécuter les 391 tests Rust (termboy-core, termboy-gb, termboy-gba, zaimule-core, zaimule-emu)
-# Note : sous Linux, la compilation du crate Tauri `zaimule` requiert les en-têtes système WebKitGTK / libsoup-3.0 ;
-# la CI exécute le workspace complet sur `windows-latest`.
-cargo test -p termboy-core -p termboy-gb -p termboy-gba -p zaimule-core -p zaimule-emu --locked
+# Exécuter les tests Rust du workspace et du relais autonome
+cargo test --workspace --locked
+cargo test --manifest-path server/zaimule-relay/Cargo.toml --locked
 
-# Exécuter les 27 tests unitaires JavaScript (catalogue, filtres GB/GBC/Switch, IPC binaire ZMFR v1 & audio)
+# Exécuter les tests unitaires JavaScript (catalogue, Multijoueur E2EE, IPC binaire ZMFR v1 & audio)
 node --test "tests/ui/*.test.js"
 ```
