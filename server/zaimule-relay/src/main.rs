@@ -16,6 +16,7 @@ mod config;
 mod error;
 mod healthcheck;
 mod limits;
+mod outbound;
 mod protocol;
 mod rooms;
 mod routes;
@@ -261,6 +262,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(root_404.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn waiting_player_survives_idle_timeout_and_failed_join_keeps_room() {
+        let (mut state, _shutdown_tx) = test_state(Some(TEST_KEY));
+        let mut cfg = Config::for_tests(Some(TEST_KEY));
+        cfg.ws_idle_timeout = Duration::from_millis(600);
+        state.config = Arc::new(cfg);
+        let rooms = state.rooms.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router(state)).await });
+
+        let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+        req.headers_mut()
+            .insert("x-zaimule-key", HeaderValue::from_static(TEST_KEY));
+        let (mut host, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+
+        let send = |value: serde_json::Value| TungsteniteMsg::Text(value.to_string().into());
+        host.send(send(serde_json::json!({
+            "type": "create_room", "console": "GB", "game_title": "Tetris", "player_name": "Host"
+        })))
+        .await
+        .unwrap();
+
+        // Attente bien au-delà du délai d'inactivité : le client ne fait que lire
+        let waited = tokio::time::timeout(Duration::from_millis(1500), async {
+            while let Some(Ok(msg)) = host.next().await {
+                assert!(!matches!(msg, TungsteniteMsg::Close(_)));
+            }
+        })
+        .await;
+        assert!(waited.is_err(), "connection must still be open");
+
+        host.send(send(serde_json::json!({
+            "type": "join_room", "room_code": "ZZZZZZ", "player_name": "Host"
+        })))
+        .await
+        .unwrap();
+        let error = loop {
+            let msg = host.next().await.unwrap().unwrap();
+            if let TungsteniteMsg::Text(text) = msg {
+                break serde_json::from_str::<ServerMessage>(&text).unwrap();
+            }
+        };
+        assert!(matches!(error, ServerMessage::Error { ref code, .. } if code == "room_not_found"));
+        assert_eq!(rooms.room_count(), 1);
     }
 
     #[tokio::test]

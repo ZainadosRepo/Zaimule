@@ -74,7 +74,7 @@ impl Config {
             access_key_digest,
             max_rooms: env_parse("ZAIMULE_MAX_ROOMS", 64usize)?.clamp(1, 512),
             max_peers_per_room: env_parse("ZAIMULE_MAX_PEERS_PER_ROOM", 8usize)?.clamp(2, 16),
-            max_connections_total: env_parse("ZAIMULE_MAX_CONNECTIONS", 128usize)?.clamp(2, 1024),
+            max_connections_total: env_parse("ZAIMULE_MAX_CONNECTIONS", 128usize)?.clamp(2, 128),
             max_connections_per_ip: env_parse("ZAIMULE_MAX_CONN_PER_IP", 6usize)?.clamp(1, 32),
             max_frames_per_sec: env_parse("ZAIMULE_MAX_FRAMES_PER_SEC", 600u32)?.clamp(10, 4000),
             max_frame_bytes,

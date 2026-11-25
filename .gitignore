@@ -1,5 +1,6 @@
 **/target/
 **/node_modules/
+src-tauri/gen/schemas/
 .env
 .env.*
 !.env.example

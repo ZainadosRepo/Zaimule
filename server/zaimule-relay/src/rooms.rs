@@ -2,23 +2,18 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use ring::digest;
-use ring::rand::{SecureRandom, SystemRandom};
-use subtle::ConstantTimeEq;
-use tokio::sync::mpsc;
-
+use crate::outbound::PeerSender;
 use crate::protocol::{
     encode_server_binary_frame, normalize_crc32, normalize_room_code, sanitize_label,
     OutboundFrame, PeerInfo, RelayChannel, ServerMessage,
 };
+use ring::digest;
+use ring::rand::{SecureRandom, SystemRandom};
+use subtle::ConstantTimeEq;
 
 /// Alphabet sans caractères ambigus (`0/O`, `1/I`) pour des codes faciles à dicter.
 const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const ROOM_CODE_LEN: usize = 6;
-
-/// Taille du tampon de sortie par pair : borne strictement la RAM du relais (~64 Mo)
-/// tout en absorbant les rafales UDP ENet (Nintendo Switch LDN 4–8 joueurs).
-pub const PEER_OUTBOUND_QUEUE: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct CreateRoomRequest {
@@ -61,7 +56,7 @@ impl RoomError {
 
 struct PeerSlot {
     name: String,
-    tx: mpsc::Sender<OutboundFrame>,
+    tx: PeerSender,
 }
 
 struct Room {
@@ -125,7 +120,7 @@ impl RoomManager {
     pub fn create_room(
         &self,
         req: CreateRoomRequest,
-        tx: mpsc::Sender<OutboundFrame>,
+        tx: PeerSender,
     ) -> Result<(RoomMembership, ServerMessage), RoomError> {
         let mut rooms = self
             .rooms
@@ -149,7 +144,7 @@ impl RoomManager {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|s| sha256_bytes(&s.as_bytes()[..s.len().min(128)]));
+            .map(|s| sha256_bytes(s.as_bytes()));
         let max_players = req
             .max_players
             .unwrap_or(2)
@@ -199,7 +194,7 @@ impl RoomManager {
     pub fn join_room(
         &self,
         req: JoinRoomRequest,
-        tx: mpsc::Sender<OutboundFrame>,
+        tx: PeerSender,
     ) -> Result<(RoomMembership, ServerMessage), RoomError> {
         let code = normalize_room_code(&req.room_code);
         if code.len() != ROOM_CODE_LEN {
@@ -255,7 +250,7 @@ impl RoomManager {
             peer: joined_info.clone(),
         });
         for slot in room.peers.values() {
-            let _ = slot.tx.try_send(notify.clone());
+            slot.tx.push(notify.clone());
         }
 
         room.peers.insert(
@@ -309,7 +304,7 @@ impl RoomManager {
             reason: reason.to_string(),
         });
         for slot in room.peers.values() {
-            let _ = slot.tx.try_send(left_notice.clone());
+            slot.tx.push(left_notice.clone());
         }
 
         if room.host_peer_id == membership.peer_id {
@@ -319,7 +314,7 @@ impl RoomManager {
                     new_host_peer_id: new_host,
                 });
                 for slot in room.peers.values() {
-                    let _ = slot.tx.try_send(migrated.clone());
+                    slot.tx.push(migrated.clone());
                 }
             }
         }
@@ -356,13 +351,13 @@ impl RoomManager {
         let mut delivered = 0usize;
         if target_peer_id == 0 {
             for (&peer_id, slot) in &room.peers {
-                if peer_id != membership.peer_id && slot.tx.try_send(frame.clone()).is_ok() {
+                if peer_id != membership.peer_id && slot.tx.push(frame.clone()) {
                     delivered += 1;
                 }
             }
         } else if target_peer_id != membership.peer_id {
             if let Some(slot) = room.peers.get(&target_peer_id) {
-                if slot.tx.try_send(frame).is_ok() {
+                if slot.tx.push(frame) {
                     delivered = 1;
                 }
             }
@@ -388,7 +383,7 @@ impl RoomManager {
                     message: "salon expiré pour inactivité".to_string(),
                 });
                 for slot in room.peers.values() {
-                    let _ = slot.tx.try_send(msg.clone());
+                    slot.tx.push(msg.clone());
                 }
             }
         }
@@ -457,7 +452,7 @@ mod tests {
     #[test]
     fn create_join_crc_password_and_strict_room_isolation() {
         let mgr = mgr();
-        let (tx1, mut rx1) = mpsc::channel(16);
+        let (tx1, mut rx1) = PeerSender::channel();
         let (m1, msg1) = mgr
             .create_room(
                 CreateRoomRequest {
@@ -475,7 +470,7 @@ mod tests {
         assert!(matches!(msg1, ServerMessage::RoomCreated { .. }));
 
         // Mauvais mot de passe refusé
-        let (tx_bad, _) = mpsc::channel(16);
+        let (tx_bad, _) = PeerSender::channel();
         let err = mgr
             .join_room(
                 JoinRoomRequest {
@@ -490,7 +485,7 @@ mod tests {
         assert_eq!(err.code, "invalid_password");
 
         // Mauvais CRC32 refusé
-        let (tx_bad_crc, _) = mpsc::channel(16);
+        let (tx_bad_crc, _) = PeerSender::channel();
         let err = mgr
             .join_room(
                 JoinRoomRequest {
@@ -505,7 +500,7 @@ mod tests {
         assert_eq!(err.code, "rom_mismatch");
 
         // Connexion légitime acceptée
-        let (tx2, mut rx2) = mpsc::channel(16);
+        let (tx2, mut rx2) = PeerSender::channel();
         let (m2, _) = mgr
             .join_room(
                 JoinRoomRequest {
@@ -520,7 +515,7 @@ mod tests {
         assert_eq!(m2.peer_id, 2);
 
         // Alice reçoit PeerJoined
-        match rx1.try_recv().expect("peer joined") {
+        match rx1.try_recv().expect("peer joined").frame {
             OutboundFrame::Control(ServerMessage::PeerJoined { peer }) => {
                 assert_eq!(peer.peer_id, 2);
                 assert_eq!(peer.name, "Bob");
@@ -529,7 +524,7 @@ mod tests {
         }
 
         // Salon complet (max 2)
-        let (tx3, _) = mpsc::channel(16);
+        let (tx3, _) = PeerSender::channel();
         let err = mgr
             .join_room(
                 JoinRoomRequest {
@@ -544,7 +539,7 @@ mod tests {
         assert_eq!(err.code, "room_full");
 
         // Deuxième salon totalement isolé
-        let (tx_other, mut rx_other) = mpsc::channel(16);
+        let (tx_other, mut rx_other) = PeerSender::channel();
         let (_m_other, _) = mgr
             .create_room(
                 CreateRoomRequest {
@@ -565,7 +560,7 @@ mod tests {
             .expect("relayed");
         assert_eq!(delivered, 1);
 
-        match rx2.try_recv().expect("bob receives") {
+        match rx2.try_recv().expect("bob receives").frame {
             OutboundFrame::Binary(bytes) => {
                 assert_eq!(bytes[0], RelayChannel::GbLink as u8);
                 assert_eq!(bytes[1], 1); // expéditeur estampillé par le relais
@@ -579,11 +574,11 @@ mod tests {
         // Départ de l'hôte -> migration vers Bob
         mgr.leave_room(&m1, "disconnected");
         assert!(matches!(
-            rx2.try_recv().expect("peer left"),
+            rx2.try_recv().expect("peer left").frame,
             OutboundFrame::Control(ServerMessage::PeerLeft { peer_id: 1, .. })
         ));
         assert!(matches!(
-            rx2.try_recv().expect("host migrated"),
+            rx2.try_recv().expect("host migrated").frame,
             OutboundFrame::Control(ServerMessage::HostMigrated {
                 new_host_peer_id: 2
             })
@@ -597,7 +592,7 @@ mod tests {
     #[test]
     fn idle_rooms_are_purged() {
         let mgr = RoomManager::new(4, 4, Duration::from_secs(10));
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = PeerSender::channel();
         let _ = mgr
             .create_room(
                 CreateRoomRequest {
@@ -617,8 +612,39 @@ mod tests {
         assert_eq!(purged, 1);
         assert_eq!(mgr.room_count(), 0);
         assert!(matches!(
-            rx.try_recv().expect("expired notice"),
+            rx.try_recv().expect("expired notice").frame,
             OutboundFrame::Control(ServerMessage::Error { ref code, .. }) if code == "room_expired"
         ));
+    }
+
+    #[test]
+    fn long_password_is_accepted_by_both_create_and_join() {
+        let mgr = mgr();
+        let password = "p".repeat(200);
+        let (tx1, _rx1) = PeerSender::channel();
+        let (host, _) = mgr
+            .create_room(
+                CreateRoomRequest {
+                    console: "GB".into(),
+                    game_title: "Tetris".into(),
+                    rom_crc32: None,
+                    player_name: "Host".into(),
+                    password_hash: Some(password.clone()),
+                    max_players: Some(2),
+                },
+                tx1,
+            )
+            .expect("created");
+        let (tx2, _rx2) = PeerSender::channel();
+        mgr.join_room(
+            JoinRoomRequest {
+                room_code: host.room_code,
+                rom_crc32: None,
+                player_name: "Guest".into(),
+                password_hash: Some(password),
+            },
+            tx2,
+        )
+        .expect("joined");
     }
 }
