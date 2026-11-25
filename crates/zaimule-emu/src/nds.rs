@@ -12,6 +12,7 @@ use crate::traits::{
     FrameStepResult, DEFAULT_SAMPLE_RATE_HZ,
 };
 use zaimule_core::catalog::ConsoleKind;
+use zaimule_core::netplay::{NdsWifiMode, NdsWifiPacket, NdsWifiTelemetry};
 
 pub const NDS_SCREEN_WIDTH: usize = NDS_WIDTH;
 pub const NDS_SCREEN_HEIGHT: usize = NDS_HEIGHT;
@@ -24,6 +25,9 @@ pub struct NdsCore {
     stylus_down: bool,
     cpu_overclock_pct: u16,
     scale_3d: u8,
+    wifi_mode: NdsWifiMode,
+    wifi_peer_id: u8,
+    wifi_wfc_dns: Option<[u8; 4]>,
     sram_cache: Vec<u8>,
     ram_cache: Vec<u8>,
     vram_cache: Vec<u8>,
@@ -50,6 +54,9 @@ impl NdsCore {
             stylus_down: false,
             cpu_overclock_pct: 100,
             scale_3d: 1,
+            wifi_mode: NdsWifiMode::Off,
+            wifi_peer_id: 1,
+            wifi_wfc_dns: None,
             sram_cache: Vec::new(),
             ram_cache: Vec::new(),
             vram_cache: Vec::new(),
@@ -67,6 +74,9 @@ impl NdsCore {
         nds.set_audio_rate(DEFAULT_SAMPLE_RATE_HZ);
         nds.set_cpu_overclock_pct(self.cpu_overclock_pct);
         nds.set_3d_scale(self.scale_3d);
+        if self.wifi_mode != NdsWifiMode::Off {
+            nds.configure_wifi(self.wifi_mode, self.wifi_peer_id, self.wifi_wfc_dns);
+        }
         self.frame_number = 0;
         self.stylus_down = false;
         self.inner = Some(nds);
@@ -270,6 +280,48 @@ impl EmulatorBackend for NdsCore {
 
     fn exchange_serial_byte(&mut self, incoming: u8) -> u8 {
         incoming
+    }
+
+    fn configure_nds_wifi(
+        &mut self,
+        mode: NdsWifiMode,
+        peer_id: u8,
+        wfc_dns_ipv4: Option<[u8; 4]>,
+    ) {
+        self.wifi_mode = mode;
+        self.wifi_peer_id = peer_id.max(1);
+        self.wifi_wfc_dns = wfc_dns_ipv4;
+        if let Some(ref mut nds) = self.inner {
+            nds.configure_wifi(self.wifi_mode, self.wifi_peer_id, self.wifi_wfc_dns);
+        }
+    }
+
+    fn drain_nds_wifi_tx(&mut self, out: &mut Vec<NdsWifiPacket>) {
+        if let Some(ref mut nds) = self.inner {
+            nds.drain_wifi_tx(out);
+        }
+    }
+
+    fn push_nds_wifi_rx(&mut self, packet: &NdsWifiPacket) {
+        if let Some(ref mut nds) = self.inner {
+            nds.push_wifi_rx(packet);
+        }
+    }
+
+    fn drain_nds_wfc_external_ip(&mut self, out: &mut Vec<Vec<u8>>) {
+        if let Some(ref mut nds) = self.inner {
+            nds.drain_wfc_external_ip(out);
+        }
+    }
+
+    fn inject_nds_wfc_external_ip(&mut self, ipv4_packet: &[u8]) {
+        if let Some(ref mut nds) = self.inner {
+            nds.inject_wfc_external_ip(ipv4_packet);
+        }
+    }
+
+    fn nds_wifi_telemetry(&self) -> Option<NdsWifiTelemetry> {
+        self.inner.as_ref().map(NdsMachine::wifi_telemetry)
     }
 
     fn debug_snapshot(&self) -> CpuDebugSnapshot {

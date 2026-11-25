@@ -191,6 +191,26 @@ pub trait EmulatorBackend: Send {
     fn exchange_gba_multi_slave(&mut self, _master_word: u16, _my_id: u8) -> (u16, u16) {
         (0xFFFF, 0x0000)
     }
+    /// Configures the Nintendo DS ARM7 Wi-Fi controller (`0x0480_0000`) & Virtual WFC Access Point.
+    fn configure_nds_wifi(
+        &mut self,
+        _mode: zaimule_core::netplay::NdsWifiMode,
+        _peer_id: u8,
+        _wfc_dns_ipv4: Option<[u8; 4]>,
+    ) {
+    }
+    /// Drains outgoing Nintendo DS 802.11b / Multi-Play / WFC LAN frames for `ZMR1` E2EE relay.
+    fn drain_nds_wifi_tx(&mut self, _out: &mut Vec<zaimule_core::netplay::NdsWifiPacket>) {}
+    /// Injects a decrypted remote `NdsWifiPacket` into the Nintendo DS ARM7 Wi-Fi RX ring buffer.
+    fn push_nds_wifi_rx(&mut self, _packet: &zaimule_core::netplay::NdsWifiPacket) {}
+    /// Drains external-bound WFC IPv4 packets from `ZaimuleAP` for the outbound-only NAT gateway.
+    fn drain_nds_wfc_external_ip(&mut self, _out: &mut Vec<Vec<u8>>) {}
+    /// Injects a returning IPv4 packet from the outbound-only WFC NAT gateway into `ZaimuleAP`.
+    fn inject_nds_wfc_external_ip(&mut self, _ipv4_packet: &[u8]) {}
+    /// Returns live Nintendo DS Wi-Fi hardware & `ZaimuleAP` telemetry if this core is NDS.
+    fn nds_wifi_telemetry(&self) -> Option<zaimule_core::netplay::NdsWifiTelemetry> {
+        None
+    }
     fn debug_snapshot(&self) -> CpuDebugSnapshot;
     fn apply_ram_cheat(&mut self, _addr: u16, _val: u8) {}
     /// Applies a 32-bit Nintendo DS Action Replay cheat code (`[(w0, w1), ...]`) on NDS cores.

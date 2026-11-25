@@ -981,6 +981,7 @@ pub fn restore_snapshot<B9: Bus, B7: Bus>(
         let bios9 = mm.bios9.take();
         let custom_firmware = mm.custom_firmware;
         let touch_cal = mm.touch_cal;
+        let wifi_ctrl = std::mem::take(&mut mm.wifi_ctrl);
         *mm = restored_machine;
         mm.rom = rom.to_vec();
         mm.io_log = io_log;
@@ -988,6 +989,7 @@ pub fn restore_snapshot<B9: Bus, B7: Bus>(
         mm.bios7 = bios7;
         mm.bios9 = bios9;
         mm.custom_firmware = custom_firmware;
+        mm.wifi_ctrl = wifi_ctrl;
         mm.touch_cal = super::bus::extract_firmware_user_settings(&mm.firmware)
             .and_then(|us| super::bus::TouchCalibration::from_user_settings(&us))
             .or(touch_cal);

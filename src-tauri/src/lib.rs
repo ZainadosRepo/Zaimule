@@ -1,10 +1,12 @@
 mod metadata_fetcher;
+mod nds_wfc;
 mod relay_client;
 mod switch_tunnel;
 mod trade_hub;
 mod update;
 
 use core::sync::atomic::{AtomicU64, Ordering};
+use nds_wfc::NdsWfcGateway;
 use relay_client::{RelayClient, RelayCreateParams, RelayJoinParams, RelayStatusSnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,6 +27,7 @@ use zaimule_core::external::{
 };
 use zaimule_core::keymap::KeymapWidget;
 use zaimule_core::metadata::{sync_sram_directories, CloudSyncReport, GameMetadataUpdate};
+use zaimule_core::netplay::{parse_optional_wfc_dns, NdsWifiMode, NdsWifiTelemetry};
 use zaimule_core::overrides::{GlobalSettings, ShaderPreset};
 use zaimule_core::pokemon_trade::{inspect_pokemon_save, PokemonSaveInventory};
 use zaimule_core::rewind::SaveStateSlotInfo;
@@ -126,6 +129,7 @@ struct AppState {
     relay: Arc<RelayClient>,
     switch_tunnel: Arc<SwitchLdnTunnel>,
     trade_hub: Arc<TradeHubManager>,
+    nds_wfc: Arc<NdsWfcGateway>,
     emu_worker: EmuWorker,
     last_sram_flush_ms: Arc<AtomicU64>,
     last_playtime_flush_ms: Arc<AtomicU64>,
@@ -665,8 +669,14 @@ async fn relay_create_room(
         .await?;
 
     let gba_role = state.relay.gba_player_id();
+    let peer_id = state.relay.peer_id();
     if let Ok(mut session) = state.session.lock() {
         session.set_online_link_enabled_with_role(true, gba_role);
+        if snapshot.console.eq_ignore_ascii_case("NDS") && session.nds_wifi_mode == NdsWifiMode::Off
+        {
+            let dns = session.nds_wifi_wfc_dns;
+            session.configure_nds_wifi(NdsWifiMode::LocalNiFi, peer_id, dns);
+        }
     }
     Ok(snapshot)
 }
@@ -731,8 +741,14 @@ async fn relay_join_room(
         .await?;
 
     let gba_role = state.relay.gba_player_id();
+    let peer_id = state.relay.peer_id();
     if let Ok(mut session) = state.session.lock() {
         session.set_online_link_enabled_with_role(true, gba_role);
+        if snapshot.console.eq_ignore_ascii_case("NDS") && session.nds_wifi_mode == NdsWifiMode::Off
+        {
+            let dns = session.nds_wifi_wfc_dns;
+            session.configure_nds_wifi(NdsWifiMode::LocalNiFi, peer_id, dns);
+        }
     }
     Ok(snapshot)
 }
@@ -741,8 +757,11 @@ async fn relay_join_room(
 fn relay_leave_room(state: tauri::State<AppState>) -> RelayStatusSnapshot {
     let _ = state.switch_tunnel.stop(&state.relay);
     state.trade_hub.reset();
+    state.nds_wfc.reset();
     if let Ok(mut session) = state.session.lock() {
         session.set_online_link_enabled_with_role(false, 0);
+        let dns = session.nds_wifi_wfc_dns;
+        session.configure_nds_wifi(NdsWifiMode::Off, 1, dns);
     }
     state.relay.leave_room()
 }
@@ -933,6 +952,35 @@ fn save_keymapper_layout(
 }
 
 #[tauri::command]
+fn configure_nds_wifi(
+    state: tauri::State<AppState>,
+    mode: String,
+    wfc_dns: Option<String>,
+) -> Result<NdsWifiTelemetry, String> {
+    let parsed_mode = NdsWifiMode::parse_str(&mode)?;
+    let parsed_dns = parse_optional_wfc_dns(wfc_dns.as_deref())?;
+    let peer_id = state.relay.peer_id();
+    if parsed_mode != NdsWifiMode::WfcAccessPoint {
+        state.nds_wfc.reset();
+    }
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    session.configure_nds_wifi(parsed_mode, peer_id, parsed_dns);
+    Ok(session.nds_wifi_telemetry())
+}
+
+#[tauri::command]
+fn get_nds_wifi_status(state: tauri::State<AppState>) -> Result<NdsWifiTelemetry, String> {
+    let session = state
+        .session
+        .lock()
+        .map_err(|_| "verrou session indisponible".to_string())?;
+    Ok(session.nds_wifi_telemetry())
+}
+
+#[tauri::command]
 async fn step_viewport(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
@@ -943,6 +991,7 @@ async fn step_viewport(
 ) -> Result<ViewportStepResponse, String> {
     let session_arc = Arc::clone(&state.session);
     let relay_arc = Arc::clone(&state.relay);
+    let nds_wfc_arc = Arc::clone(&state.nds_wfc);
     let last_sram_flush = Arc::clone(&state.last_sram_flush_ms);
     let last_playtime_flush = Arc::clone(&state.last_playtime_flush_ms);
     let speed = speed_mult.unwrap_or(1);
@@ -966,8 +1015,16 @@ async fn step_viewport(
                 for incoming in relay_arc.drain_incoming_gba_link() {
                     session.push_remote_gba_link_payload(incoming);
                 }
+                for incoming in relay_arc.drain_incoming_nds_wifi() {
+                    session.push_remote_nds_wifi_packet(incoming);
+                }
             } else if session.online_link_enabled {
                 session.set_online_link_enabled_with_role(false, 0);
+            }
+            if session.nds_wifi_mode == NdsWifiMode::WfcAccessPoint {
+                for incoming_ip in nds_wfc_arc.poll_inbound_ipv4() {
+                    session.push_nds_wfc_external_ip(incoming_ip);
+                }
             }
             let out = session.step_viewport_with_speed(buttons_p1, buttons_p2, turbo_active, speed);
             if online_active {
@@ -976,6 +1033,14 @@ async fn step_viewport(
                 }
                 for outgoing in session.drain_outgoing_gba_link_payloads() {
                     relay_arc.send_gba_link_payload(outgoing);
+                }
+                for outgoing in session.drain_outgoing_nds_wifi_packets() {
+                    relay_arc.send_nds_wifi_packet(outgoing);
+                }
+            }
+            if session.nds_wifi_mode == NdsWifiMode::WfcAccessPoint {
+                for ext_ip in session.drain_nds_wfc_external_ip() {
+                    nds_wfc_arc.submit_outbound_ipv4(&ext_ip);
                 }
             }
             let flush_sram = maybe_collect_live_sram(&last_sram_flush, &mut session, now);
@@ -1000,6 +1065,7 @@ async fn step_viewport_binary(
 ) -> Result<tauri::ipc::Response, String> {
     let session_arc = Arc::clone(&state.session);
     let relay_arc = Arc::clone(&state.relay);
+    let nds_wfc_arc = Arc::clone(&state.nds_wfc);
     let last_sram_flush = Arc::clone(&state.last_sram_flush_ms);
     let last_playtime_flush = Arc::clone(&state.last_playtime_flush_ms);
     let speed = speed_mult.unwrap_or(1);
@@ -1023,8 +1089,16 @@ async fn step_viewport_binary(
                 for incoming in relay_arc.drain_incoming_gba_link() {
                     session.push_remote_gba_link_payload(incoming);
                 }
+                for incoming in relay_arc.drain_incoming_nds_wifi() {
+                    session.push_remote_nds_wifi_packet(incoming);
+                }
             } else if session.online_link_enabled {
                 session.set_online_link_enabled_with_role(false, 0);
+            }
+            if session.nds_wifi_mode == NdsWifiMode::WfcAccessPoint {
+                for incoming_ip in nds_wfc_arc.poll_inbound_ipv4() {
+                    session.push_nds_wfc_external_ip(incoming_ip);
+                }
             }
             let mut step_opts = zaimule_emu::session::BinaryStepOptions::default();
             if let Some(opts) = options {
@@ -1056,6 +1130,14 @@ async fn step_viewport_binary(
                 }
                 for outgoing in session.drain_outgoing_gba_link_payloads() {
                     relay_arc.send_gba_link_payload(outgoing);
+                }
+                for outgoing in session.drain_outgoing_nds_wifi_packets() {
+                    relay_arc.send_nds_wifi_packet(outgoing);
+                }
+            }
+            if session.nds_wifi_mode == NdsWifiMode::WfcAccessPoint {
+                for ext_ip in session.drain_nds_wfc_external_ip() {
+                    nds_wfc_arc.submit_outbound_ipv4(&ext_ip);
                 }
             }
             let flush_sram = maybe_collect_live_sram(&last_sram_flush, &mut session, now);
@@ -2735,6 +2817,7 @@ pub fn run() {
             relay: Arc::new(RelayClient::new()),
             switch_tunnel: Arc::new(SwitchLdnTunnel::new()),
             trade_hub: Arc::new(TradeHubManager::new()),
+            nds_wfc: Arc::new(NdsWfcGateway::new()),
             emu_worker: EmuWorker::spawn(),
             last_sram_flush_ms: Arc::new(AtomicU64::new(0)),
             last_playtime_flush_ms: Arc::new(AtomicU64::new(0)),
@@ -2826,6 +2909,7 @@ pub fn run() {
                 if let Some(state) = app.try_state::<AppState>() {
                     let _ = state.switch_tunnel.stop(&state.relay);
                     state.trade_hub.reset();
+                    state.nds_wfc.reset();
                     let _ = state.relay.leave_room();
                     if let Ok(mut guard) = state.session.lock() {
                         flush_sram_best_effort(app, &mut guard);
@@ -2915,6 +2999,8 @@ pub fn run() {
             trade_accept_and_commit,
             trade_cancel,
             get_trade_hub_status,
+            configure_nds_wifi,
+            get_nds_wifi_status,
             save_recorded_macro,
             save_keymapper_layout,
             step_viewport,

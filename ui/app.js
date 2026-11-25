@@ -377,6 +377,7 @@ let state = {
   tradeInventory: null,
   tradeSelectedBox: 0,
   tradeHubStatus: null,
+  ndsWifiStatus: null,
   relayPollTimer: null,
   communityMods: [],
   ghostLeaderboard: [],
@@ -2074,13 +2075,17 @@ function syncRelayStatusPolling() {
     if (!state.relayPollTimer) {
       state.relayPollTimer = setInterval(async () => {
         try {
-          const [snap, tunnelSnap, tradeSnap] = await Promise.all([
+          const [snap, tunnelSnap, tradeSnap, ndsWifiSnap] = await Promise.all([
             invokeBackend("get_relay_status"),
             invokeBackend("get_switch_tunnel_status"),
-            invokeBackend("get_trade_hub_status")
+            invokeBackend("get_trade_hub_status"),
+            invokeBackend("get_nds_wifi_status")
           ]);
           if (tunnelSnap) {
             state.switchTunnelStatus = tunnelSnap;
+          }
+          if (ndsWifiSnap) {
+            state.ndsWifiStatus = ndsWifiSnap;
           }
           if (tradeSnap) {
             const prevPhase = state.tradeHubStatus?.phase;
@@ -2109,6 +2114,7 @@ function syncRelayStatusPolling() {
             if (wasConnected && !snap.connected) {
               state.switchTunnelStatus = null;
               state.tradeHubStatus = null;
+              state.ndsWifiStatus = null;
               stopRelayStatusPolling();
               if (snap.lastError) {
                 showToast(`Relais déconnecté : ${snap.lastError}`, "error", 5000);
@@ -2313,6 +2319,67 @@ function renderTradeHubBox() {
   }
 }
 
+function renderNdsWifiBox() {
+  const box = document.getElementById("relay-nds-wifi-box");
+  if (!box) return;
+  const st = state.ndsWifiStatus;
+  const mode = st?.mode || "off";
+
+  const badge = document.getElementById("relay-nds-wifi-badge");
+  if (badge) {
+    if (mode === "localNiFi") {
+      badge.textContent = `NiFi E2EE · Ch.${st?.channel || 6}`;
+      badge.classList.add("pill-green");
+    } else if (mode === "wfcAccessPoint") {
+      badge.textContent = st?.apAssociated
+        ? `Associé ${st?.apSsid || "ZaimuleAP"} ✓`
+        : `AP ${st?.apSsid || "ZaimuleAP"} prêt`;
+      badge.classList.add("pill-green");
+    } else {
+      badge.textContent = "Inactif";
+      badge.classList.remove("pill-green");
+    }
+  }
+
+  const macEl = document.getElementById("relay-nds-wifi-mac");
+  if (macEl && st?.macAddress) {
+    macEl.textContent = st.macAddress;
+  }
+
+  const statsEl = document.getElementById("relay-nds-wifi-stats");
+  if (statsEl) {
+    statsEl.textContent = `${Number(st?.txFrames) || 0} ↑ / ${Number(st?.rxFrames) || 0} ↓`;
+  }
+
+  const selectEl = document.getElementById("relay-nds-wifi-mode");
+  const dnsInput = document.getElementById("relay-nds-wifi-dns");
+  if (selectEl) {
+    if (!st?.mode) {
+      delete selectEl.dataset.syncedMode;
+    } else if (selectEl.dataset.syncedMode !== st.mode) {
+      selectEl.value = st.mode;
+      selectEl.dataset.syncedMode = st.mode;
+    }
+  }
+  const selectedMode = selectEl?.value || mode;
+  if (dnsInput) {
+    dnsInput.style.display = selectedMode === "wfcAccessPoint" ? "inline-block" : "none";
+  }
+
+  const hintEl = document.getElementById("relay-nds-wifi-hint");
+  if (hintEl) {
+    if (mode === "localNiFi") {
+      hintEl.textContent = `Sans-fil local DS (NiFi / Multi-Play) actif sur ZMR1 · MAC ${st?.macAddress || "--"} · ${Number(st?.mpCycles) || 0} cycles MP · 0 port ouvert.`;
+    } else if (mode === "wfcAccessPoint") {
+      const ipPart = st?.assignedIp ? `IP ${st.assignedIp}` : "DHCP prêt";
+      hintEl.textContent = `Point d'accès virtuel ${st?.apSsid || "ZaimuleAP"} configuré dans le firmware DS (slot 1) · ${ipPart} · DNS ${st?.wfcDns || "10.64.0.1"} · Test conntest intégré.`;
+    } else {
+      hintEl.textContent =
+        "Mode NiFi : chiffre en ZMR1 les trames 802.11b / Multi-Play (Mario Kart DS, Pokémon Salle Union). Mode WFC : auto-configure ZaimuleAP (DHCP/DNS/conntest + passerelle sortante 0 port ouvert).";
+    }
+  }
+}
+
 function renderSwitchTunnelBox(relayState) {
   const box = document.getElementById("relay-switch-tunnel-box");
   if (!box) return;
@@ -2449,6 +2516,7 @@ function renderRelayMultiplayer() {
 
   renderSwitchTunnelBox(st);
   renderTradeHubBox();
+  renderNdsWifiBox();
 
   setText("relay-active-code", st.roomCode || "------");
   setText("relay-cipher-badge", st.e2eeCipher || "ChaCha20-Poly1305 (ZMR1)");
@@ -4750,6 +4818,7 @@ function bindEvents() {
       });
       if (snap) {
         state.relayStatus = snap;
+        state.ndsWifiStatus = (await invokeBackend("get_nds_wifi_status")) || state.ndsWifiStatus;
         renderRelayMultiplayer();
         syncRelayStatusPolling();
         showToast(`Salon E2EE #${snap.roomCode} créé (ChaCha20-Poly1305).`, "ok");
@@ -4778,6 +4847,7 @@ function bindEvents() {
       });
       if (snap) {
         state.relayStatus = snap;
+        state.ndsWifiStatus = (await invokeBackend("get_nds_wifi_status")) || state.ndsWifiStatus;
         renderRelayMultiplayer();
         syncRelayStatusPolling();
         showToast(`Connecté au salon E2EE #${snap.roomCode}.`, "ok");
@@ -4820,9 +4890,40 @@ function bindEvents() {
     state.switchTunnelStatus = null;
     state.tradeInventory = null;
     state.tradeHubStatus = null;
+    state.ndsWifiStatus = null;
     stopRelayStatusPolling();
     renderRelayMultiplayer();
     showToast("Salon relais quitté.", "info");
+  });
+
+  document.getElementById("relay-nds-wifi-mode")?.addEventListener("change", () => {
+    renderNdsWifiBox();
+  });
+
+  document.getElementById("btn-nds-wifi-apply")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    const mode = document.getElementById("relay-nds-wifi-mode")?.value || "off";
+    const rawDns = document.getElementById("relay-nds-wifi-dns")?.value?.trim() || "";
+    if (btn) btn.disabled = true;
+    try {
+      const snap = await invokeBackend("configure_nds_wifi", {
+        mode,
+        wfcDns: mode === "wfcAccessPoint" && rawDns ? rawDns : null
+      });
+      if (snap) {
+        state.ndsWifiStatus = snap;
+        renderNdsWifiBox();
+        const modeLabel =
+          snap.mode === "localNiFi"
+            ? "Sans-fil local DS (NiFi E2EE)"
+            : snap.mode === "wfcAccessPoint"
+              ? `Point d'Accès WFC (${snap.apSsid} · DNS ${snap.wfcDns})`
+              : "Désactivé";
+        showToast(`Wi-Fi Nintendo DS : ${modeLabel}`, "ok");
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
   });
 
   document.getElementById("btn-trade-load-boxes")?.addEventListener("click", async (e) => {

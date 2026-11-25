@@ -16,8 +16,11 @@ mod ppu;
 mod render3d;
 mod spu;
 pub mod state;
+pub mod wifi;
 
-use bus::{Bus, Machine, MachineHandle, View, DMA_HBLANK, DMA_VBLANK, IRQ_HBLANK, IRQ_VBLANK};
+use bus::{
+    Bus, Machine, MachineHandle, View, DMA_HBLANK, DMA_VBLANK, IRQ_HBLANK, IRQ_VBLANK, IRQ_WIFI,
+};
 use cpu::Cpu;
 use ppu::Ppu;
 use std::path::Path;
@@ -25,6 +28,7 @@ use zaimule_core::keymap::{
     BTN_A, BTN_B, BTN_DOWN, BTN_L, BTN_LEFT, BTN_R, BTN_RIGHT, BTN_SELECT, BTN_START, BTN_UP,
     BTN_X, BTN_Y,
 };
+use zaimule_core::netplay::{NdsWifiMode, NdsWifiPacket, NdsWifiTelemetry};
 
 pub const NDS_WIDTH: usize = ppu::WIDTH;
 pub const NDS_HEIGHT: usize = ppu::HEIGHT * 2;
@@ -347,9 +351,13 @@ impl NdsMachine {
                 self.cpu9.run_slice(arm9_per_slice);
                 self.cpu7.run_slice(ARM7_SLICE_QUANTUM);
             }
-            self.machine
-                .borrow_mut()
-                .tick_spu_scanline(SPU_CYCLES_PER_LINE);
+            {
+                let mut mm = self.machine.borrow_mut();
+                mm.tick_spu_scanline(SPU_CYCLES_PER_LINE);
+                if mm.wifi_ctrl.tick_scanline(64) {
+                    mm.if_[1] |= IRQ_WIFI;
+                }
+            }
         }
 
         self.frame_count = self.frame_count.wrapping_add(1);
@@ -547,6 +555,50 @@ impl NdsMachine {
 
     pub fn clear_sram_dirty(&mut self) {
         self.machine.borrow_mut().save_dirty = false;
+    }
+
+    /// Configure le contrôleur Wi-Fi ARM7 (`Off` / `LocalNiFi` / `WfcAccessPoint`), attribue une
+    /// adresse MAC unique par pair dans le firmware DS et auto-provisionne le slot AP `ZaimuleAP`.
+    pub fn configure_wifi(
+        &mut self,
+        mode: NdsWifiMode,
+        peer_id: u8,
+        wfc_dns_ipv4: Option<[u8; 4]>,
+    ) {
+        let mut mm = self.machine.borrow_mut();
+        mm.wifi_ctrl.configure(mode, peer_id, wfc_dns_ipv4);
+        let mac = mm.wifi_ctrl.mac_addr;
+        let custom_fw = mm.custom_firmware;
+        wifi::patch_firmware_for_wifi(&mut mm.firmware, mac, mode, wfc_dns_ipv4, custom_fw);
+    }
+
+    pub fn drain_wifi_tx(&mut self, out: &mut Vec<NdsWifiPacket>) {
+        self.machine.borrow_mut().wifi_ctrl.drain_outbound_tx(out);
+    }
+
+    pub fn push_wifi_rx(&mut self, packet: &NdsWifiPacket) {
+        let mut mm = self.machine.borrow_mut();
+        if mm.wifi_ctrl.receive_remote_packet(packet) {
+            mm.if_[1] |= IRQ_WIFI;
+        }
+    }
+
+    pub fn drain_wfc_external_ip(&mut self, out: &mut Vec<Vec<u8>>) {
+        self.machine
+            .borrow_mut()
+            .wifi_ctrl
+            .drain_external_wfc_ip(out);
+    }
+
+    pub fn inject_wfc_external_ip(&mut self, ipv4_packet: &[u8]) {
+        let mut mm = self.machine.borrow_mut();
+        if mm.wifi_ctrl.inject_external_wfc_ip(ipv4_packet) {
+            mm.if_[1] |= IRQ_WIFI;
+        }
+    }
+
+    pub fn wifi_telemetry(&self) -> NdsWifiTelemetry {
+        self.machine.borrow().wifi_ctrl.telemetry()
     }
 
     pub fn save_state_raw_bytes(&self) -> Result<Vec<u8>, String> {

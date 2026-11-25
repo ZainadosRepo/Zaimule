@@ -942,6 +942,135 @@ impl GbaLinkPayload {
     }
 }
 
+// =============================================================================
+// PHASE 4 — WI-FI NINTENDO DS TEMPS RÉEL (NiFi 802.11b MP + WFC AP · ZMR1)
+// =============================================================================
+
+/// Mode de fonctionnement du contrôleur Wi-Fi Nintendo DS (`0x0480_0000`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NdsWifiMode {
+    /// Wi-Fi désactivé (mode hors-ligne solo classique).
+    #[default]
+    Off,
+    /// Sans-fil local DS / NiFi (trames IEEE 802.11b + Multi-Play CMD/REPLY chiffrées `ZMR1`
+    /// entre joueurs du salon : Mario Kart DS, Pokémon Salle Union / Colisée, NSMB VS).
+    LocalNiFi,
+    /// Point d'accès virtuel Nintendo WFC (`ZaimuleAP`, DHCP/ARP/DNS/ICMP + passerelle CWF).
+    WfcAccessPoint,
+}
+
+impl NdsWifiMode {
+    pub fn parse_str(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" | "disabled" | "none" | "" => Ok(Self::Off),
+            "localnifi" | "local_nifi" | "local" | "nifi" | "mp" => Ok(Self::LocalNiFi),
+            "wfcaccesspoint" | "wfc_access_point" | "wfc" | "ap" => Ok(Self::WfcAccessPoint),
+            other => Err(format!(
+                "mode Wi-Fi Nintendo DS inconnu : '{other}' (attendu : off, localNiFi ou wfcAccessPoint)"
+            )),
+        }
+    }
+}
+
+pub const NDS_WIFI_KIND_RAW_80211: u8 = 1;
+pub const NDS_WIFI_KIND_MP_CMD: u8 = 2;
+pub const NDS_WIFI_KIND_MP_REPLY: u8 = 3;
+pub const NDS_WIFI_KIND_MP_ACK: u8 = 4;
+pub const NDS_WIFI_KIND_WFC_IPV4: u8 = 5;
+pub const NDS_WIFI_MAX_FRAME_BYTES: usize = 2348;
+
+/// Trame Wi-Fi Nintendo DS chiffrée dans `ZMR1` sur `RelayChannel::NdsWifi = 6`.
+/// Format filaire compact : `[kind: u8, channel: u8, rate: u8, sender_aid: u8, seq: u32 LE, frame_bytes...]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NdsWifiPacket {
+    pub kind: u8,
+    pub channel: u8,
+    pub rate: u8,
+    pub sender_aid: u8,
+    pub seq: u32,
+    pub frame: Vec<u8>,
+}
+
+impl NdsWifiPacket {
+    pub const HEADER_LEN: usize = 8;
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        if self.frame.is_empty() {
+            return Err("trame Wi-Fi NDS vide refusée".into());
+        }
+        if self.frame.len() > NDS_WIFI_MAX_FRAME_BYTES {
+            return Err(format!(
+                "trame Wi-Fi NDS trop volumineuse ({} > {} octets)",
+                self.frame.len(),
+                NDS_WIFI_MAX_FRAME_BYTES
+            ));
+        }
+        let mut out = Vec::with_capacity(Self::HEADER_LEN + self.frame.len());
+        out.push(self.kind);
+        out.push(self.channel);
+        out.push(self.rate);
+        out.push(self.sender_aid);
+        out.extend_from_slice(&self.seq.to_le_bytes());
+        out.extend_from_slice(&self.frame);
+        Ok(out)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() <= Self::HEADER_LEN {
+            return Err("trame Wi-Fi NDS trop courte".into());
+        }
+        let frame_len = bytes.len() - Self::HEADER_LEN;
+        if frame_len > NDS_WIFI_MAX_FRAME_BYTES {
+            return Err("trame Wi-Fi NDS dépasse la taille IEEE 802.11b maximale".into());
+        }
+        let kind = bytes[0];
+        if !(NDS_WIFI_KIND_RAW_80211..=NDS_WIFI_KIND_WFC_IPV4).contains(&kind) {
+            return Err(format!("type de trame Wi-Fi NDS inconnu ({kind})"));
+        }
+        Ok(Self {
+            kind,
+            channel: bytes[1],
+            rate: bytes[2],
+            sender_aid: bytes[3],
+            seq: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            frame: bytes[Self::HEADER_LEN..].to_vec(),
+        })
+    }
+}
+
+/// Télémétrie temps réel du contrôleur Wi-Fi ARM7 Nintendo DS (`0x0480_0000`) et de l'AP virtuel `ZaimuleAP`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NdsWifiTelemetry {
+    pub mode: NdsWifiMode,
+    pub mac_address: String,
+    pub channel: u8,
+    pub ap_ssid: String,
+    pub ap_associated: bool,
+    pub assigned_ip: Option<String>,
+    pub wfc_dns: String,
+    pub tx_frames: u64,
+    pub rx_frames: u64,
+    pub mp_cycles: u64,
+    pub irq_count: u64,
+}
+
+/// Valide une adresse DNS IPv4 optionnelle pour le mode WFC (`None` ou chaîne vide -> DNS virtuel `10.64.0.1`).
+pub fn parse_optional_wfc_dns(raw: Option<&str>) -> Result<Option<[u8; 4]>, String> {
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed: std::net::Ipv4Addr = s
+        .parse()
+        .map_err(|_| format!("adresse DNS WFC IPv4 invalide : '{s}' (ex: 10.64.0.1)"))?;
+    if parsed.is_unspecified() {
+        return Ok(None);
+    }
+    Ok(Some(parsed.octets()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1203,5 +1332,63 @@ mod tests {
         assert_eq!(decoded, pkt);
         assert!(decoded.is_master_tx());
         assert!(!decoded.is_slave_reply());
+    }
+
+    #[test]
+    fn nds_wifi_packet_roundtrips_through_zmr1_e2ee_and_validates_bounds() {
+        let key = RelaySessionKey::generate().unwrap();
+        let ds_host = Zmr1Cipher::new(&key).unwrap();
+        let ds_guest = Zmr1Cipher::new(&key).unwrap();
+
+        let pkt = NdsWifiPacket {
+            kind: NDS_WIFI_KIND_MP_CMD,
+            channel: 6,
+            rate: 0x14,
+            sender_aid: 0,
+            seq: 99,
+            frame: vec![
+                0x28, 0x02, 0x00, 0x01, 0x03, 0x09, 0xBF, 0x00, 0x00, 0x00, 0xCA, 0xFE,
+            ],
+        };
+        let wire = pkt.to_bytes().unwrap();
+        let sealed = ds_host
+            .seal(RelayChannel::NdsWifi, "MKDS99", &wire)
+            .unwrap();
+        let opened = ds_guest
+            .open(RelayChannel::NdsWifi, "MKDS99", &sealed)
+            .unwrap();
+        assert_eq!(NdsWifiPacket::from_bytes(&opened).unwrap(), pkt);
+
+        // Rejet trame vide, taille > NDS_WIFI_MAX_FRAME_BYTES ou kind inconnu
+        assert!(NdsWifiPacket {
+            kind: NDS_WIFI_KIND_RAW_80211,
+            channel: 1,
+            rate: 0x14,
+            sender_aid: 1,
+            seq: 1,
+            frame: vec![],
+        }
+        .to_bytes()
+        .is_err());
+        assert!(NdsWifiPacket {
+            kind: NDS_WIFI_KIND_RAW_80211,
+            channel: 1,
+            rate: 0x14,
+            sender_aid: 1,
+            seq: 1,
+            frame: vec![0u8; NDS_WIFI_MAX_FRAME_BYTES + 1],
+        }
+        .to_bytes()
+        .is_err());
+        assert!(NdsWifiPacket::from_bytes(&[99, 6, 0x14, 0, 1, 0, 0, 0, 0xAA]).is_err());
+
+        // Validation DNS WFC optionnel
+        assert_eq!(parse_optional_wfc_dns(None).unwrap(), None);
+        assert_eq!(parse_optional_wfc_dns(Some("  ")).unwrap(), None);
+        assert_eq!(
+            parse_optional_wfc_dns(Some("167.235.229.36")).unwrap(),
+            Some([167, 235, 229, 36])
+        );
+        assert!(parse_optional_wfc_dns(Some("not-an-ip")).is_err());
     }
 }

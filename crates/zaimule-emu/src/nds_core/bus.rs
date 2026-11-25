@@ -238,6 +238,7 @@ pub const IRQ_VBLANK: u32 = 1 << 0;
 pub const IRQ_HBLANK: u32 = 1 << 1;
 pub const IRQ_IPC_SEND_EMPTY: u32 = 1 << 17;
 pub const IRQ_IPC_RECV: u32 = 1 << 18;
+pub const IRQ_WIFI: u32 = 1 << 24;
 
 /// NDS_RTC="HH:MM" or "YYYY-MM-DD HH:MM" (seconds optional: "HH:MM:SS" /
 /// "YYYY-MM-DD HH:MM:SS") sets the emulated real-time clock's starting date
@@ -547,6 +548,10 @@ pub struct Machine {
     /// Fast guard indicating whether any ARM9 DMA channel is currently armed in HBlank trigger mode.
     #[serde(skip)]
     pub dma_hblank_armed: bool,
+    /// Full Nintendo DS ARM7 Wi-Fi controller (`0x0480_0000`) & Virtual WFC Access Point (`ZaimuleAP`).
+    /// Skipped in savestates so `ZMND` v1 snapshots stay 100% compatible.
+    #[serde(skip)]
+    pub wifi_ctrl: super::wifi::NdsWifiController,
 }
 
 pub const CODE_PAGE_MAIN_BASE: usize = 0;
@@ -885,6 +890,7 @@ impl Machine {
             code_pages: default_code_pages(),
             page_gen: default_page_gen(),
             dma_hblank_armed: false,
+            wifi_ctrl: super::wifi::NdsWifiController::new(),
             wifi: vec![0; 0x1_0000],
             rtc_reg: 0,
             rtc_bit_n: 0,
@@ -3318,21 +3324,8 @@ impl<const CPU: usize> View<CPU> {
     }
 
     fn wifi_read16(&mut self, a: u32) -> u16 {
-        let m = self.m.borrow();
-        let off = (a & 0xFFFF) as usize;
-        match off {
-            0x8000 => 0x1440,     // W_ID: DS wifi chipset
-            0x815C => m.bb_read,  // W_BB_READ: last baseband register read back
-            0x815E => 0,          // W_BB_BUSY: never busy
-            0x8180 | 0x8184 => 0, // W_RF_BUSY / RF control: ready
-            // Wireless-manager transfer poll: after the driver kicks a command
-            // (0x8001 -> 0x8040) it waits for status 0x803C high byte == 2 and
-            // 0x8214 in {0,9}. With no real wireless engine, report the
-            // transfer as immediately complete so the manager proceeds.
-            0x803C => 0x0200,
-            0x8214 => 0,
-            _ => u16::from_le_bytes([m.wifi[off], m.wifi[off + 1 & 0xFFFF]]),
-        }
+        let mut m = self.m.borrow_mut();
+        m.wifi_ctrl.read16(a)
     }
 
     fn wifi_write16(&mut self, a: u32, v: u16) {
@@ -3340,22 +3333,8 @@ impl<const CPU: usize> View<CPU> {
         let off = (a & 0xFFFF) as usize;
         m.wifi[off] = v as u8;
         m.wifi[(off + 1) & 0xFFFF] = (v >> 8) as u8;
-        // W_BB_CNT (0x8158): a baseband register access. Bits 0-7 = index,
-        // bits 12-14 = direction (5 = write W_BB_WRITE into the reg, 6 = read
-        // the reg into W_BB_READ). The wireless manager writes a reg then reads
-        // it back to confirm the chip is alive, so the file must remember what
-        // was written. BB[0] is the chip version the driver checks (0x6D).
-        if off == 0x8158 {
-            if m.bb.len() < 0x100 {
-                m.bb = vec![0; 0x100];
-                m.bb[0] = 0x6D;
-            }
-            let idx = (v & 0xFF) as usize;
-            match (v >> 12) & 0xF {
-                5 => m.bb[idx] = m.wifi[0x815A], // W_BB_WRITE low byte
-                6 => m.bb_read = m.bb[idx] as u16,
-                _ => {}
-            }
+        if m.wifi_ctrl.write16(a, v) {
+            m.if_[1] |= IRQ_WIFI;
         }
     }
 }

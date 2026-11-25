@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use zaimule_core::netplay::{
     format_relay_invite, hash_room_password, parse_relay_invite, validate_relay_url, GbLinkPayload,
-    GbaLinkPayload, RelayChannel, RelayChatPayload, RelayPeerInfo, RelaySessionKey,
+    GbaLinkPayload, NdsWifiPacket, RelayChannel, RelayChatPayload, RelayPeerInfo, RelaySessionKey,
     SwitchLdnPacket, Zmr1Cipher,
 };
 use zaimule_core::pokemon_trade::TradeHubWireMessage;
@@ -187,6 +187,7 @@ enum WireServerControl {
 enum OutboundCmd {
     GbLink(GbLinkPayload),
     GbaLink(GbaLinkPayload),
+    NdsWifi(NdsWifiPacket),
     TradeHub(TradeHubWireMessage),
     Chat(RelayChatPayload),
     SwitchLdn {
@@ -201,6 +202,7 @@ struct RelayInner {
     cmd_tx: Option<mpsc::Sender<OutboundCmd>>,
     inbound_gb_link: VecDeque<GbLinkPayload>,
     inbound_gba_link: VecDeque<GbaLinkPayload>,
+    inbound_nds_wifi: VecDeque<NdsWifiPacket>,
     inbound_trade_hub: VecDeque<(u8, TradeHubWireMessage)>,
     switch_ldn_tx: Option<mpsc::Sender<(u8, SwitchLdnPacket)>>,
     session_generation: u64,
@@ -213,6 +215,7 @@ impl Default for RelayInner {
             cmd_tx: None,
             inbound_gb_link: VecDeque::with_capacity(32),
             inbound_gba_link: VecDeque::with_capacity(32),
+            inbound_nds_wifi: VecDeque::with_capacity(32),
             inbound_trade_hub: VecDeque::with_capacity(16),
             switch_ldn_tx: None,
             session_generation: 0,
@@ -346,6 +349,37 @@ impl RelayClient {
         guard.inbound_gba_link.drain(..).collect()
     }
 
+    /// Retourne l'identifiant de pair (`1..=8`) attribué par le relais dans le salon actif (`1` hors salon).
+    pub fn peer_id(&self) -> u8 {
+        self.inner
+            .lock()
+            .ok()
+            .map(|g| g.status.peer_id.max(1))
+            .unwrap_or(1)
+    }
+
+    /// Empile une trame Wi-Fi Nintendo DS (NiFi / Multi-Play / WFC LAN) pour chiffrement `ZMR1`.
+    pub fn send_nds_wifi_packet(&self, packet: NdsWifiPacket) {
+        if !self.is_in_room() {
+            return;
+        }
+        let tx = self.inner.lock().ok().and_then(|g| g.cmd_tx.clone());
+        if let Some(tx) = tx {
+            let _ = tx.try_send(OutboundCmd::NdsWifi(packet));
+        }
+    }
+
+    /// Récupère toutes les trames Wi-Fi Nintendo DS déchiffrées et authentifiées depuis le relais.
+    pub fn drain_incoming_nds_wifi(&self) -> Vec<NdsWifiPacket> {
+        if !self.is_in_room() {
+            return Vec::new();
+        }
+        let Ok(mut guard) = self.inner.lock() else {
+            return Vec::new();
+        };
+        guard.inbound_nds_wifi.drain(..).collect()
+    }
+
     /// Envoie un message Trade Hub Pokémon chiffré de bout en bout (`RelayChannel::TradeHub`).
     pub fn send_trade_hub_message(&self, msg: TradeHubWireMessage) -> Result<(), String> {
         if !self.is_in_room() {
@@ -429,6 +463,7 @@ impl RelayClient {
         }
         guard.inbound_gb_link.clear();
         guard.inbound_gba_link.clear();
+        guard.inbound_nds_wifi.clear();
         guard.inbound_trade_hub.clear();
         guard.switch_ldn_tx = None;
         guard.status = RelayStatusSnapshot::default();
@@ -657,6 +692,7 @@ impl RelayClient {
             guard.cmd_tx = Some(cmd_tx);
             guard.inbound_gb_link.clear();
             guard.inbound_gba_link.clear();
+            guard.inbound_nds_wifi.clear();
             guard.inbound_trade_hub.clear();
             guard.session_generation
         };
@@ -724,6 +760,25 @@ impl RelayClient {
                                     if let Ok(mut g) = shared_inner.lock() {
                                         if g.session_generation == generation {
                                             g.status.packets_sent = g.status.packets_sent.saturating_add(1);
+                                        }
+                                    }
+                                }
+                            }
+                            OutboundCmd::NdsWifi(wifi_pkt) => {
+                                if let Ok(plain) = wifi_pkt.to_bytes() {
+                                    if let Ok(sealed) = cipher.seal(
+                                        RelayChannel::NdsWifi,
+                                        &room_code,
+                                        &plain,
+                                    ) {
+                                        let frame = encode_client_binary(RelayChannel::NdsWifi, 0, &sealed);
+                                        if ws_tx.send(WsMessage::Binary(frame.into())).await.is_err() {
+                                            break;
+                                        }
+                                        if let Ok(mut g) = shared_inner.lock() {
+                                            if g.session_generation == generation {
+                                                g.status.packets_sent = g.status.packets_sent.saturating_add(1);
+                                            }
                                         }
                                     }
                                 }
@@ -972,7 +1027,15 @@ fn handle_inbound_binary(
                 }
             }
         }
-        _ => {}
+        RelayChannel::NdsWifi => {
+            if let Ok(pkt) = NdsWifiPacket::from_bytes(&plain) {
+                if guard.inbound_nds_wifi.len() >= MAX_INBOUND_LINK_QUEUE {
+                    let _ = guard.inbound_nds_wifi.pop_front();
+                }
+                guard.inbound_nds_wifi.push_back(pkt);
+                guard.status.packets_received = guard.status.packets_received.saturating_add(1);
+            }
+        }
     }
 }
 
@@ -1190,7 +1253,7 @@ mod tests {
         assert!(bob_status.connected);
         assert_eq!(bob_status.peer_id, 2);
 
-        // 4. Alice envoie une trame Câble Link + un message de chat chiffré
+        // 4. Alice envoie une trame Câble Link, une trame Wi-Fi NDS et un message de chat chiffré
         let link_pkt = GbLinkPayload {
             frame: 99,
             buttons_mask: 0x0010,
@@ -1199,21 +1262,33 @@ mod tests {
             flags: GB_LINK_FLAG_MASTER_TX,
             seq: 1,
         };
+        let nds_pkt = NdsWifiPacket {
+            kind: zaimule_core::netplay::NDS_WIFI_KIND_MP_CMD,
+            channel: 6,
+            rate: 0x14,
+            sender_aid: 0,
+            seq: 7,
+            frame: b"MKDS-HEARTGOLD-MP-FRAME".to_vec(),
+        };
         alice.send_gb_link_payload(link_pkt);
+        alice.send_nds_wifi_packet(nds_pkt.clone());
         alice.send_chat("Echange Ectoplasma pret !").unwrap();
 
         // Attendre la réception déchiffrée chez Bob
         let mut received_link = Vec::new();
+        let mut received_nds = Vec::new();
         let mut received_chat = Vec::new();
         for _ in 0..40 {
             received_link.extend(bob.drain_incoming_gb_link());
+            received_nds.extend(bob.drain_incoming_nds_wifi());
             received_chat = bob.status_snapshot().chat_messages;
-            if !received_link.is_empty() && !received_chat.is_empty() {
+            if !received_link.is_empty() && !received_nds.is_empty() && !received_chat.is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert_eq!(received_link, vec![link_pkt]);
+        assert_eq!(received_nds, vec![nds_pkt]);
         assert_eq!(received_chat.len(), 1);
         assert_eq!(received_chat[0].sender, "Alice");
         assert_eq!(received_chat[0].text, "Echange Ectoplasma pret !");
@@ -1221,10 +1296,11 @@ mod tests {
 
         // 5. Le serveur relais n'a vu AUCUN texte en clair (chiffrement ZMR1 vérifié)
         let raw_frames = seen_ciphertext.lock().unwrap();
-        assert!(raw_frames.len() >= 2);
+        assert!(raw_frames.len() >= 3);
         for frame in raw_frames.iter() {
             let as_lossy = String::from_utf8_lossy(frame);
             assert!(!as_lossy.contains("Ectoplasma"));
+            assert!(!as_lossy.contains("HEARTGOLD"));
             assert!(&frame[2..6] == b"ZMR1");
         }
 

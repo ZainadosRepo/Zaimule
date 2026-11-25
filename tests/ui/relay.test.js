@@ -75,7 +75,15 @@ test("Multijoueur E2EE UI elements, security attributes, and Tauri commands stay
     "chk-trade-allow-evo",
     "btn-trade-accept",
     "btn-trade-cancel",
-    "relay-trade-status-msg"
+    "relay-trade-status-msg",
+    "relay-nds-wifi-box",
+    "relay-nds-wifi-badge",
+    "relay-nds-wifi-mac",
+    "relay-nds-wifi-stats",
+    "relay-nds-wifi-mode",
+    "relay-nds-wifi-dns",
+    "btn-nds-wifi-apply",
+    "relay-nds-wifi-hint"
   ];
 
   for (const id of relayIds) {
@@ -98,7 +106,9 @@ test("Multijoueur E2EE UI elements, security attributes, and Tauri commands stay
     "trade_offer_pokemon",
     "trade_accept_and_commit",
     "trade_cancel",
-    "get_trade_hub_status"
+    "get_trade_hub_status",
+    "configure_nds_wifi",
+    "get_nds_wifi_status"
   ];
   for (const cmd of commands) {
     assert.ok(appJs.includes(`"${cmd}"`), `app.js missing invokeBackend("${cmd}")`);

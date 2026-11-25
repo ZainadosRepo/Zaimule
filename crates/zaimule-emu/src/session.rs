@@ -44,9 +44,10 @@ use zaimule_core::macros::{
 use zaimule_core::metadata::{normalize_collection_name, GameMetadataUpdate};
 use zaimule_core::netplay::{
     discover_stun_candidate, format_deep_link, parse_deep_link, validate_relay_url, GbLinkPayload,
-    GbaLinkPayload, NetplayChatMessage, NetplayRoom, NetplayWirePacket, StunDiscoveryCandidate,
-    TournamentBracket, UdpNetplayNode, GBA_LINK_FLAG_MASTER_TX, GBA_LINK_FLAG_SLAVE_REPLY,
-    GB_LINK_FLAG_MASTER_TX, GB_LINK_FLAG_SLAVE_REPLY,
+    GbaLinkPayload, NdsWifiMode, NdsWifiPacket, NdsWifiTelemetry, NetplayChatMessage, NetplayRoom,
+    NetplayWirePacket, StunDiscoveryCandidate, TournamentBracket, UdpNetplayNode,
+    GBA_LINK_FLAG_MASTER_TX, GBA_LINK_FLAG_SLAVE_REPLY, GB_LINK_FLAG_MASTER_TX,
+    GB_LINK_FLAG_SLAVE_REPLY,
 };
 use zaimule_core::overrides::{resolve_effective_config, EffectiveGameConfig, GlobalSettings};
 use zaimule_core::patch::{apply_ips_patch, diff_roms_to_ips, CommunityModPackage, ModLayerEntry};
@@ -458,6 +459,13 @@ pub struct EmulatorSession {
     online_link_tx_queue: VecDeque<GbLinkPayload>,
     online_gba_link_rx_queue: VecDeque<GbaLinkPayload>,
     online_gba_link_tx_queue: VecDeque<GbaLinkPayload>,
+    pub nds_wifi_mode: NdsWifiMode,
+    pub nds_wifi_peer_id: u8,
+    pub nds_wifi_wfc_dns: Option<[u8; 4]>,
+    online_nds_wifi_rx_queue: VecDeque<NdsWifiPacket>,
+    online_nds_wifi_tx_queue: VecDeque<NdsWifiPacket>,
+    nds_wfc_external_ip_rx: VecDeque<Vec<u8>>,
+    nds_wfc_external_ip_tx: VecDeque<Vec<u8>>,
     pub rewind_buffer: RewindBuffer,
     rewind_worker: Option<BackgroundRewindWorker>,
     rewind_generation: u64,
@@ -541,6 +549,13 @@ impl EmulatorSession {
             online_link_tx_queue: VecDeque::with_capacity(32),
             online_gba_link_rx_queue: VecDeque::with_capacity(32),
             online_gba_link_tx_queue: VecDeque::with_capacity(32),
+            nds_wifi_mode: NdsWifiMode::Off,
+            nds_wifi_peer_id: 1,
+            nds_wifi_wfc_dns: None,
+            online_nds_wifi_rx_queue: VecDeque::with_capacity(32),
+            online_nds_wifi_tx_queue: VecDeque::with_capacity(32),
+            nds_wfc_external_ip_rx: VecDeque::with_capacity(32),
+            nds_wfc_external_ip_tx: VecDeque::with_capacity(32),
             rewind_buffer: RewindBuffer::new(240),
             rewind_worker: None,
             rewind_generation: 0,
@@ -1504,7 +1519,105 @@ impl EmulatorSession {
         self.online_gba_link_tx_queue.drain(..).collect()
     }
 
+    /// Configures Nintendo DS ARM7 Wi-Fi (`Off` / `LocalNiFi` / `WfcAccessPoint`) on `core_p1`,
+    /// assigns a unique MAC derived from `peer_id`, and auto-provisions `ZaimuleAP` when in WFC mode.
+    pub fn configure_nds_wifi(
+        &mut self,
+        mode: NdsWifiMode,
+        peer_id: u8,
+        wfc_dns_ipv4: Option<[u8; 4]>,
+    ) {
+        self.nds_wifi_mode = mode;
+        self.nds_wifi_peer_id = peer_id.max(1);
+        self.nds_wifi_wfc_dns = wfc_dns_ipv4;
+        self.apply_nds_wifi_to_core();
+        if mode == NdsWifiMode::Off {
+            self.online_nds_wifi_rx_queue.clear();
+            self.online_nds_wifi_tx_queue.clear();
+            self.nds_wfc_external_ip_rx.clear();
+            self.nds_wfc_external_ip_tx.clear();
+        }
+    }
+
+    fn apply_nds_wifi_to_core(&mut self) {
+        if self.core_p1.console() == ConsoleKind::Nds {
+            self.core_p1.configure_nds_wifi(
+                self.nds_wifi_mode,
+                self.nds_wifi_peer_id,
+                self.nds_wifi_wfc_dns,
+            );
+        }
+    }
+
+    /// Queues an authenticated `NdsWifiPacket` decrypted from `ZMR1` (`RelayChannel::NdsWifi = 6`).
+    pub fn push_remote_nds_wifi_packet(&mut self, packet: NdsWifiPacket) {
+        if self.nds_wifi_mode == NdsWifiMode::Off {
+            return;
+        }
+        if self.online_nds_wifi_rx_queue.len() >= 64 {
+            let _ = self.online_nds_wifi_rx_queue.pop_front();
+        }
+        self.online_nds_wifi_rx_queue.push_back(packet);
+    }
+
+    /// Drains outgoing `NdsWifiPacket` frames ready for `ZMR1` E2EE transmission.
+    pub fn drain_outgoing_nds_wifi_packets(&mut self) -> Vec<NdsWifiPacket> {
+        self.online_nds_wifi_tx_queue.drain(..).collect()
+    }
+
+    /// Injects an IPv4 packet returning from the outbound-only WFC NAT gateway (`nds_wfc`).
+    pub fn push_nds_wfc_external_ip(&mut self, ipv4_packet: Vec<u8>) {
+        if self.nds_wifi_mode != NdsWifiMode::WfcAccessPoint {
+            return;
+        }
+        if self.nds_wfc_external_ip_rx.len() >= 64 {
+            let _ = self.nds_wfc_external_ip_rx.pop_front();
+        }
+        self.nds_wfc_external_ip_rx.push_back(ipv4_packet);
+    }
+
+    /// Drains external-bound WFC IPv4 packets from `ZaimuleAP` for the outbound-only NAT gateway.
+    pub fn drain_nds_wfc_external_ip(&mut self) -> Vec<Vec<u8>> {
+        self.nds_wfc_external_ip_tx.drain(..).collect()
+    }
+
+    /// Returns live Nintendo DS Wi-Fi hardware & `ZaimuleAP` telemetry.
+    pub fn nds_wifi_telemetry(&self) -> NdsWifiTelemetry {
+        if let Some(live) = self.core_p1.nds_wifi_telemetry() {
+            return live;
+        }
+        let mac = crate::nds_core::wifi::derive_console_mac(self.nds_wifi_peer_id);
+        let dns = self
+            .nds_wifi_wfc_dns
+            .unwrap_or(crate::nds_core::wifi::VIRTUAL_AP_IP);
+        NdsWifiTelemetry {
+            mode: self.nds_wifi_mode,
+            mac_address: crate::nds_core::wifi::format_mac(mac),
+            channel: 6,
+            ap_ssid: crate::nds_core::wifi::VIRTUAL_AP_SSID.to_string(),
+            ap_associated: false,
+            assigned_ip: None,
+            wfc_dns: crate::nds_core::wifi::format_ipv4(dns),
+            tx_frames: 0,
+            rx_frames: 0,
+            mp_cycles: 0,
+            irq_count: 0,
+        }
+    }
+
     fn pump_online_link_pre_step(&mut self, frame: u32, buttons_mask: u16) {
+        if self.core_p1.console() == ConsoleKind::Nds && self.nds_wifi_mode != NdsWifiMode::Off {
+            while let Some(pkt) = self.online_nds_wifi_rx_queue.pop_front() {
+                self.core_p1.push_nds_wifi_rx(&pkt);
+                self.link_telemetry.packets_transferred =
+                    self.link_telemetry.packets_transferred.saturating_add(1);
+                self.link_telemetry.baud_rate_bps = 2_000_000;
+            }
+            while let Some(ip) = self.nds_wfc_external_ip_rx.pop_front() {
+                self.core_p1.inject_nds_wfc_external_ip(&ip);
+            }
+        }
+
         if !self.online_link_enabled {
             return;
         }
@@ -1578,6 +1691,28 @@ impl EmulatorSession {
         buttons_mask: u16,
         serial_out: Option<u8>,
     ) {
+        if self.core_p1.console() == ConsoleKind::Nds && self.nds_wifi_mode != NdsWifiMode::Off {
+            let mut tx_batch = Vec::new();
+            self.core_p1.drain_nds_wifi_tx(&mut tx_batch);
+            for pkt in tx_batch {
+                if self.online_nds_wifi_tx_queue.len() >= 64 {
+                    let _ = self.online_nds_wifi_tx_queue.pop_front();
+                }
+                self.online_nds_wifi_tx_queue.push_back(pkt);
+                self.link_telemetry.packets_transferred =
+                    self.link_telemetry.packets_transferred.saturating_add(1);
+                self.link_telemetry.baud_rate_bps = 2_000_000;
+            }
+            let mut ext_ips = Vec::new();
+            self.core_p1.drain_nds_wfc_external_ip(&mut ext_ips);
+            for ip in ext_ips {
+                if self.nds_wfc_external_ip_tx.len() >= 64 {
+                    let _ = self.nds_wfc_external_ip_tx.pop_front();
+                }
+                self.nds_wfc_external_ip_tx.push_back(ip);
+            }
+        }
+
         if !self.online_link_enabled {
             return;
         }
@@ -1817,6 +1952,7 @@ impl EmulatorSession {
         self.active_disasm_rom = rom_bytes[..cap].to_vec();
         self.core_loaded = true;
         self.apply_effective_hardware_profile();
+        self.apply_nds_wifi_to_core();
         self.warning = None;
         self.sync_sram_baseline();
         self.sync_secondary_link_cores();
@@ -1958,6 +2094,7 @@ impl EmulatorSession {
             .insert(game.id.clone(), patched_rom.clone());
         self.core_p1 = build_core_for(game.console, &patched_rom, &self.system_dir)?;
         self.apply_effective_hardware_profile();
+        self.apply_nds_wifi_to_core();
         self.active_disasm_rom = patched_rom[..patched_rom.len().min(4 * 1024 * 1024)].to_vec();
         self.sync_secondary_link_cores();
 
@@ -4294,5 +4431,192 @@ mod tests {
         .unwrap();
         assert_eq!(sc & 0x0080, 0);
         assert!(master.drain_outgoing_gba_link_payloads().is_empty());
+    }
+
+    #[test]
+    fn online_nds_wifi_exchanges_80211_frames_between_two_arm7_cpus_over_zmr1_e2ee() {
+        use zaimule_core::netplay::{RelayChannel, RelaySessionKey, Zmr1Cipher};
+
+        fn build_arm7_wifi_nds_rom(arm7_code: &[u32], literals: &[u32]) -> Vec<u8> {
+            let mut rom = vec![0u8; 0x1000];
+            rom[0x0000..0x000C].copy_from_slice(b"ZAIMULEWIFI\0");
+            rom[0x000C..0x0010].copy_from_slice(b"ZMWF");
+            let arm9_off: u32 = 0x200;
+            let arm9_addr: u32 = 0x0200_0800;
+            let arm9_size: u32 = 0x10;
+            let arm7_off: u32 = 0x400;
+            let arm7_addr: u32 = 0x0380_0000;
+            let arm7_size: u32 = ((arm7_code.len() + literals.len()) * 4) as u32;
+            rom[0x20..0x24].copy_from_slice(&arm9_off.to_le_bytes());
+            rom[0x24..0x28].copy_from_slice(&arm9_addr.to_le_bytes());
+            rom[0x28..0x2C].copy_from_slice(&arm9_addr.to_le_bytes());
+            rom[0x2C..0x30].copy_from_slice(&arm9_size.to_le_bytes());
+            rom[0x30..0x34].copy_from_slice(&arm7_off.to_le_bytes());
+            rom[0x34..0x38].copy_from_slice(&arm7_addr.to_le_bytes());
+            rom[0x38..0x3C].copy_from_slice(&arm7_addr.to_le_bytes());
+            rom[0x3C..0x40].copy_from_slice(&arm7_size.to_le_bytes());
+            // ARM9: B .
+            rom[arm9_off as usize..arm9_off as usize + 4]
+                .copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+            // ARM7 code + literal pool
+            let mut cursor = arm7_off as usize;
+            for &w in arm7_code.iter().chain(literals.iter()) {
+                rom[cursor..cursor + 4].copy_from_slice(&w.to_le_bytes());
+                cursor += 4;
+            }
+            rom
+        }
+
+        // Helper encodant `LDR Rd, [PC, #(pool_idx * 4 - pc_plus_8)]`
+        let ldr_lit = |rd: u32, instr_idx: usize, code_len: usize, lit_idx: usize| -> u32 {
+            let off = ((code_len + lit_idx) * 4) as i32 - ((instr_idx * 4 + 8) as i32);
+            assert!((0..4096).contains(&off));
+            0xE59F_0000 | (rd << 12) | (off as u32)
+        };
+
+        // DS #1 (Hôte ARM7) : écrit une trame 802.11b broadcast dans Wi-Fi RAM 0x0480_4A00
+        // (TXHDR[8..12] = rate 0x14, len 32 octets incl. FCS ; FC=0x0008 Data, Dst=FF:FF:FF:FF:FF:FF)
+        // puis déclenche W_TXREQ_SET=1 et W_TXBUF_LOC1=0x8500.
+        let host_lits: &[u32] = &[
+            0x0480_4A00, // [0] TX buffer byte base in Wi-Fi RAM (hw 0x0500)
+            0x0020_0014, // [1] TXHDR[8..12]: rate=0x14, len_with_fcs=32 (28B MPDU)
+            0x0000_0008, // [2] 802.11 FC=0x0008 (Data), Duration=0
+            0xFFFF_FFFF, // [3] Dst MAC[0..4] = FF:FF:FF:FF
+            0x0000_FFFF, // [4] Dst MAC[4..6] = FF:FF
+            0x5344_4B4D, // [5] Payload "MKDS" at MPDU+24
+            0x0480_80AE, // [6] W_TXREQ_SET
+            0x0480_80A0, // [7] W_TXBUF_LOC1
+            0x0000_8500, // [8] Enable TX slot at hw offset 0x0500
+        ];
+        let host_code_len = 19usize;
+        let host_code: Vec<u32> = vec![
+            ldr_lit(0, 0, host_code_len, 0),  // R0 = 0x0480_4A00
+            ldr_lit(1, 1, host_code_len, 1),  // R1 = 0x0020_0014
+            0xE580_1008,                      // STR R1, [R0, #8]   (TXHDR rate+len)
+            ldr_lit(1, 3, host_code_len, 2),  // R1 = 0x0000_0008
+            0xE580_100C,                      // STR R1, [R0, #12]  (802.11 FC)
+            ldr_lit(1, 5, host_code_len, 3),  // R1 = 0xFFFF_FFFF
+            0xE580_1010,                      // STR R1, [R0, #16]  (Dst 0..4)
+            ldr_lit(1, 7, host_code_len, 4),  // R1 = 0x0000_FFFF
+            0xE580_1014,                      // STR R1, [R0, #20]  (Dst 4..6)
+            ldr_lit(1, 9, host_code_len, 5),  // R1 = "MKDS"
+            0xE580_1024,                      // STR R1, [R0, #36]  (MPDU+24)
+            ldr_lit(2, 11, host_code_len, 6), // R2 = W_TXREQ_SET
+            0xE3A0_3001,                      // MOV R3, #1
+            0xE1C2_30B0,                      // STRH R3, [R2]
+            ldr_lit(2, 14, host_code_len, 7), // R2 = W_TXBUF_LOC1
+            ldr_lit(3, 15, host_code_len, 8), // R3 = 0x8500
+            0xE1C2_30B0,                      // STRH R3, [R2]      (Kick TX!)
+            0xE1A0_0000,                      // NOP
+            0xEAFF_FFFE,                      // B .
+        ];
+        assert_eq!(host_code.len(), host_code_len);
+
+        // DS #2 (Invité ARM7) : configure RX circulaire 0x4000..0x4800 + W_IE=1, attend W_IF&1,
+        // puis écrit le marqueur 0xCAFE en Main RAM (0x0200_0100) dès réception de la trame !
+        let guest_lits: &[u32] = &[
+            0x0480_8000, // [0] Wi-Fi I/O base
+            0x0000_4000, // [1] W_RXBUF_BEGIN
+            0x0000_4800, // [2] W_RXBUF_END
+            0x0000_8001, // [3] W_RXCNT (enable RX + latch WRCSR)
+            0x0200_0100, // [4] Main RAM shared flag
+            0x0000_CAFE, // [5] Proof marker
+        ];
+        let guest_code_len = 22usize;
+        let guest_code: Vec<u32> = vec![
+            ldr_lit(0, 0, guest_code_len, 0), // 0: R0 = 0x0480_8000
+            ldr_lit(1, 1, guest_code_len, 1), // 1: R1 = 0x4000
+            0xE1C0_15B0,                      // 2: STRH R1, [R0, #0x50] (W_RXBUF_BEGIN)
+            ldr_lit(1, 3, guest_code_len, 2), // 3: R1 = 0x4800
+            0xE1C0_15B2,                      // 4: STRH R1, [R0, #0x52] (W_RXBUF_END)
+            0xE3A0_1000,                      // 5: MOV R1, #0
+            0xE1C0_15B6,                      // 6: STRH R1, [R0, #0x56] (W_RXBUF_WR_ADDR)
+            0xE1C0_15B8,                      // 7: STRH R1, [R0, #0x58] (W_RXBUF_RD_ADDR)
+            ldr_lit(1, 8, guest_code_len, 3), // 8: R1 = 0x8001
+            0xE1C0_13B0,                      // 9: STRH R1, [R0, #0x30] (W_RXCNT)
+            0xE3A0_1001,                      // 10: MOV R1, #1
+            0xE1C0_11B2,                      // 11: STRH R1, [R0, #0x12] (W_IE = RX_COMPLETE)
+            // Poll loop at idx 12:
+            0xE1D0_21B0,                       // 12: LDRH R2, [R0, #0x10] (W_IF)
+            0xE312_0001,                       // 13: TST R2, #1
+            0x0AFF_FFFC,                       // 14: BEQ -16 (back to idx 12)
+            ldr_lit(4, 15, guest_code_len, 4), // 15: R4 = 0x0200_0100
+            ldr_lit(5, 16, guest_code_len, 5), // 16: R5 = 0xCAFE
+            0xE584_5000,                       // 17: STR R5, [R4]
+            0xE1A0_0000,                       // 18: NOP
+            0xE1A0_0000,                       // 19: NOP
+            0xE1A0_0000,                       // 20: NOP
+            0xEAFF_FFFE,                       // 21: B .
+        ];
+        assert_eq!(guest_code.len(), guest_code_len);
+
+        let host_rom = build_arm7_wifi_nds_rom(&host_code, host_lits);
+        let guest_rom = build_arm7_wifi_nds_rom(&guest_code, guest_lits);
+
+        let mut host = EmulatorSession::new();
+        let mut guest = EmulatorSession::new();
+        host.configure_nds_wifi(NdsWifiMode::LocalNiFi, 1, None);
+        guest.configure_nds_wifi(NdsWifiMode::LocalNiFi, 2, None);
+
+        host.import_custom_rom("MKDS_H.nds", &host_rom).unwrap();
+        guest.import_custom_rom("MKDS_G.nds", &guest_rom).unwrap();
+
+        // MAC uniques par pair vérifiées
+        assert_eq!(host.nds_wifi_telemetry().mac_address, "00:09:BF:5A:4D:01");
+        assert_eq!(guest.nds_wifi_telemetry().mac_address, "00:09:BF:5A:4D:02");
+
+        // Frame 1 : l'ARM7 de l'hôte émet la trame 802.11b et l'invité configure RX
+        let _ = host.step_viewport_binary_bytes_with_options(
+            0,
+            0,
+            false,
+            1,
+            BinaryStepOptions::default(),
+        );
+        let _ = guest.step_viewport_binary_bytes_with_options(
+            0,
+            0,
+            false,
+            1,
+            BinaryStepOptions::default(),
+        );
+
+        let tx_pkts = host.drain_outgoing_nds_wifi_packets();
+        assert_eq!(tx_pkts.len(), 1);
+        assert_eq!(&tx_pkts[0].frame[24..28], b"MKDS");
+
+        // Chiffrement bout en bout ZMR1 sur RelayChannel::NdsWifi = 6
+        let key = RelaySessionKey::generate().unwrap();
+        let c_host = Zmr1Cipher::new(&key).unwrap();
+        let c_guest = Zmr1Cipher::new(&key).unwrap();
+        let sealed = c_host
+            .seal(
+                RelayChannel::NdsWifi,
+                "MKDS42",
+                &tx_pkts[0].to_bytes().unwrap(),
+            )
+            .unwrap();
+        let opened = c_guest
+            .open(RelayChannel::NdsWifi, "MKDS42", &sealed)
+            .unwrap();
+        let decoded = NdsWifiPacket::from_bytes(&opened).unwrap();
+
+        // Injecter la trame dans DS #2 et avancer d'1 frame : l'ARM7 détecte W_IF&1 et écrit 0xCAFE !
+        guest.push_remote_nds_wifi_packet(decoded);
+        let _ = guest.step_viewport_binary_bytes_with_options(
+            0,
+            0,
+            false,
+            1,
+            BinaryStepOptions::default(),
+        );
+
+        guest.core_p1.sync_debug_caches();
+        let ram = guest.core_p1.read_ram_slice();
+        let marker = u32::from_le_bytes([ram[0x100], ram[0x101], ram[0x102], ram[0x103]]);
+        assert_eq!(marker, 0x0000_CAFE);
+        let tel = guest.nds_wifi_telemetry();
+        assert_eq!(tel.rx_frames, 1);
+        assert!(tel.irq_count >= 1);
     }
 }

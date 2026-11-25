@@ -1100,6 +1100,41 @@
                   </div>
                 </div>
 
+                <!-- PHASE 4 : WI-FI NINTENDO DS TEMPS RÉEL (NiFi 802.11b MP & POINT D'ACCÈS WFC) -->
+                <div class="relay-switch-box" id="relay-nds-wifi-box">
+                  <div class="relay-switch-head">
+                    <div class="relay-switch-title-row">
+                      <span>Wi-Fi Nintendo DS Temps Réel (NiFi · WFC · E2EE)</span>
+                      <span class="pill-badge mono" id="relay-nds-wifi-badge">Inactif</span>
+                      <span class="pill-badge mono" id="relay-nds-wifi-mac">00:09:BF:5A:4D:01</span>
+                      <span class="pill-badge mono" id="relay-nds-wifi-stats">0 ↑ / 0 ↓</span>
+                    </div>
+                    <div class="relay-switch-controls">
+                      <select
+                        id="relay-nds-wifi-mode"
+                        class="field-inline mono"
+                        aria-label="Mode Wi-Fi Nintendo DS"
+                      >
+                        <option value="localNiFi">Sans-fil local DS (NiFi / Multi-Play)</option>
+                        <option value="wfcAccessPoint">Point d'Accès WFC (ZaimuleAP)</option>
+                        <option value="off">Désactivé</option>
+                      </select>
+                      <input
+                        type="text"
+                        id="relay-nds-wifi-dns"
+                        class="field-inline mono"
+                        placeholder="DNS WFC (auto 10.64.0.1)"
+                        autocomplete="off"
+                        style="width: 175px; display: none;"
+                      />
+                      <button class="btn" id="btn-nds-wifi-apply" type="button">Appliquer</button>
+                    </div>
+                  </div>
+                  <div class="relay-switch-hint" id="relay-nds-wifi-hint">
+                    Mode NiFi : chiffre en ZMR1 les trames 802.11b / Multi-Play (Mario Kart DS, Pokémon Salle Union). Mode WFC : auto-configure ZaimuleAP (DHCP/DNS/conntest + passerelle sortante 0 port ouvert).
+                  </div>
+                </div>
+
                 <div class="relay-live-split">
                   <div class="relay-peers-box">
                     <div class="section-title">
