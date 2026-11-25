@@ -1,0 +1,30 @@
+[package]
+name = "zaimule-relay"
+version = "0.1.0"
+edition = "2021"
+description = "Relais WebSocket E2EE autonome et léger (Axum + Tokio) à auto-héberger pour le multijoueur Zaimule"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "sync", "time"] }
+tower-http = { version = "0.7", features = ["trace", "timeout"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+anyhow = "1.0"
+futures-util = "0.3"
+ring = "0.17"
+subtle = "2.6"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = "0.29"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

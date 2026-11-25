@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use zaimule_core::netplay::{
     format_relay_invite, hash_room_password, parse_relay_invite, validate_relay_url, GbLinkPayload,
-    RelayChannel, RelayChatPayload, RelayPeerInfo, RelaySessionKey, Zmr1Cipher,
+    RelayChannel, RelayChatPayload, RelayPeerInfo, RelaySessionKey, SwitchLdnPacket, Zmr1Cipher,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -185,6 +185,10 @@ enum WireServerControl {
 enum OutboundCmd {
     GbLink(GbLinkPayload),
     Chat(RelayChatPayload),
+    SwitchLdn {
+        target_peer_id: u8,
+        packet: SwitchLdnPacket,
+    },
     Leave,
 }
 
@@ -192,6 +196,7 @@ struct RelayInner {
     status: RelayStatusSnapshot,
     cmd_tx: Option<mpsc::Sender<OutboundCmd>>,
     inbound_gb_link: VecDeque<GbLinkPayload>,
+    switch_ldn_tx: Option<mpsc::Sender<(u8, SwitchLdnPacket)>>,
     session_generation: u64,
 }
 
@@ -201,6 +206,7 @@ impl Default for RelayInner {
             status: RelayStatusSnapshot::default(),
             cmd_tx: None,
             inbound_gb_link: VecDeque::with_capacity(32),
+            switch_ldn_tx: None,
             session_generation: 0,
         }
     }
@@ -227,6 +233,53 @@ impl RelayClient {
             .lock()
             .map(|g| g.status.clone())
             .unwrap_or_default()
+    }
+
+    /// Retourne l'identifiant du pair Hôte actif dans le salon (pour le routage Switch LDN).
+    pub fn host_peer_id(&self) -> Option<u8> {
+        let guard = self.inner.lock().ok()?;
+        if !guard.status.connected {
+            return None;
+        }
+        guard
+            .status
+            .peers
+            .iter()
+            .find(|p| p.is_host)
+            .map(|p| p.peer_id)
+            .or(Some(1))
+    }
+
+    /// Envoie un datagramme Switch LDN chiffré `ZMR1` en unicast (`target_peer_id`).
+    pub fn send_switch_ldn_packet(&self, target_peer_id: u8, packet: SwitchLdnPacket) -> bool {
+        if !self.is_in_room() {
+            return false;
+        }
+        let tx = self.inner.lock().ok().and_then(|g| g.cmd_tx.clone());
+        match tx {
+            Some(tx) => tx
+                .try_send(OutboundCmd::SwitchLdn {
+                    target_peer_id,
+                    packet,
+                })
+                .is_ok(),
+            None => false,
+        }
+    }
+
+    /// Attache un récepteur asynchrone pour le canal `RelayChannel::SwitchLdn`.
+    pub fn attach_switch_ldn_receiver(&self) -> mpsc::Receiver<(u8, SwitchLdnPacket)> {
+        let (tx, rx) = mpsc::channel(256);
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.switch_ldn_tx = Some(tx);
+        }
+        rx
+    }
+
+    pub fn detach_switch_ldn_receiver(&self) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.switch_ldn_tx = None;
+        }
     }
 
     /// Empile un paquet Câble Link GB/GBC pour chiffrement `ZMR1` et envoi asynchrone.
@@ -307,6 +360,7 @@ impl RelayClient {
             let _ = tx.try_send(OutboundCmd::Leave);
         }
         guard.inbound_gb_link.clear();
+        guard.switch_ldn_tx = None;
         guard.status = RelayStatusSnapshot::default();
         guard.status.clone()
     }
@@ -599,6 +653,33 @@ impl RelayClient {
                                     }
                                 }
                             }
+                            OutboundCmd::SwitchLdn {
+                                target_peer_id,
+                                packet,
+                            } => {
+                                if let Ok(plain) = packet.to_bytes() {
+                                    if let Ok(sealed) = cipher.seal(
+                                        RelayChannel::SwitchLdn,
+                                        &room_code,
+                                        &plain,
+                                    ) {
+                                        let frame = encode_client_binary(
+                                            RelayChannel::SwitchLdn,
+                                            target_peer_id,
+                                            &sealed,
+                                        );
+                                        if ws_tx.send(WsMessage::Binary(frame.into())).await.is_err() {
+                                            break;
+                                        }
+                                        if let Ok(mut g) = shared_inner.lock() {
+                                            if g.session_generation == generation {
+                                                g.status.packets_sent =
+                                                    g.status.packets_sent.saturating_add(1);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     maybe_msg = ws_rx.next() => {
@@ -629,6 +710,7 @@ impl RelayClient {
                 if g.session_generation == generation {
                     shared_flag.store(false, Ordering::Relaxed);
                     g.cmd_tx = None;
+                    g.switch_ldn_tx = None;
                     g.status.connected = false;
                 }
             }
@@ -718,7 +800,7 @@ fn handle_inbound_binary(
     let Some(channel) = RelayChannel::from_byte(raw[0]) else {
         return;
     };
-    let _sender_peer_id = raw[1];
+    let sender_peer_id = raw[1];
     let opaque = &raw[2..];
 
     let Ok(plain) = cipher.open(channel, room_code, opaque) else {
@@ -754,6 +836,14 @@ fn handle_inbound_binary(
                         is_self: false,
                     },
                 );
+            }
+        }
+        RelayChannel::SwitchLdn => {
+            if let Ok(pkt) = SwitchLdnPacket::from_bytes(&plain) {
+                guard.status.packets_received = guard.status.packets_received.saturating_add(1);
+                if let Some(ref tx) = guard.switch_ldn_tx {
+                    let _ = tx.try_send((sender_peer_id, pkt));
+                }
             }
         }
         _ => {}

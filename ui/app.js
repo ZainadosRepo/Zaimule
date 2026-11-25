@@ -373,6 +373,7 @@ let state = {
   relayKeyConfigured: false,
   relayPlayerName: "",
   relayStatus: null,
+  switchTunnelStatus: null,
   relayPollTimer: null,
   communityMods: [],
   ghostLeaderboard: [],
@@ -2070,12 +2071,19 @@ function syncRelayStatusPolling() {
     if (!state.relayPollTimer) {
       state.relayPollTimer = setInterval(async () => {
         try {
-          const snap = await invokeBackend("get_relay_status");
+          const [snap, tunnelSnap] = await Promise.all([
+            invokeBackend("get_relay_status"),
+            invokeBackend("get_switch_tunnel_status")
+          ]);
+          if (tunnelSnap) {
+            state.switchTunnelStatus = tunnelSnap;
+          }
           if (snap) {
             const wasConnected = Boolean(state.relayStatus?.connected);
             state.relayStatus = snap;
             renderRelayMultiplayer();
             if (wasConnected && !snap.connected) {
+              state.switchTunnelStatus = null;
               stopRelayStatusPolling();
               if (snap.lastError) {
                 showToast(`Relais déconnecté : ${snap.lastError}`, "error", 5000);
@@ -2089,6 +2097,73 @@ function syncRelayStatusPolling() {
     }
   } else {
     stopRelayStatusPolling();
+  }
+}
+
+function renderSwitchTunnelBox(relayState) {
+  const box = document.getElementById("relay-switch-tunnel-box");
+  if (!box) return;
+  const tun = state.switchTunnelStatus;
+  const active = Boolean(tun?.active);
+  const isHost = Boolean(relayState?.isHost);
+
+  const badge = document.getElementById("relay-switch-tunnel-badge");
+  if (badge) {
+    if (active) {
+      badge.textContent = tun.role === "host" ? "Actif · Mode Hôte" : "Actif · Mode Invité";
+      badge.classList.add("pill-green");
+    } else {
+      badge.textContent = "Inactif";
+      badge.classList.remove("pill-green");
+    }
+  }
+
+  const pkts = document.getElementById("relay-switch-tunnel-packets");
+  if (pkts) {
+    if (active) {
+      pkts.textContent = `${Number(tun.packetsOut) || 0} ↑ / ${Number(tun.packetsIn) || 0} ↓`;
+      pkts.style.display = "inline-flex";
+    } else {
+      pkts.style.display = "none";
+    }
+  }
+
+  const hostPortWrap = document.getElementById("relay-switch-host-port-wrap");
+  if (hostPortWrap) {
+    hostPortWrap.style.display = isHost && !active ? "inline-flex" : "none";
+  }
+
+  const endpoint = document.getElementById("relay-switch-tunnel-endpoint");
+  const copyBtn = document.getElementById("btn-relay-copy-switch-endpoint");
+  if (endpoint) {
+    if (active && tun.localEndpoint) {
+      endpoint.textContent = tun.localEndpoint;
+      endpoint.style.display = "inline-flex";
+    } else {
+      endpoint.style.display = "none";
+    }
+  }
+  if (copyBtn) {
+    copyBtn.style.display = active && tun.localEndpoint ? "inline-flex" : "none";
+  }
+
+  const toggleBtn = document.getElementById("btn-relay-toggle-switch-tunnel");
+  if (toggleBtn) {
+    toggleBtn.textContent = active ? "Arrêter le tunnel" : "Activer tunnel Switch";
+    toggleBtn.classList.toggle("btn-primary", !active);
+    toggleBtn.classList.toggle("btn-ghost", active);
+  }
+
+  const hint = document.getElementById("relay-switch-tunnel-hint");
+  if (hint) {
+    if (active && tun.role === "host") {
+      hint.innerHTML = `Mode <strong>Hôte</strong> actif : créez votre salle locale dans Torzu / Fritchii sur le port <span class="mono">${tun.hostRoomPort}</span> (${tun.activeClients || 0} invité(s) routé(s) via 127.0.0.1, 0 port ouvert sur votre box).`;
+    } else if (active && tun.localEndpoint) {
+      hint.innerHTML = `Mode <strong>Invité</strong> actif : connectez Torzu / Fritchii en connexion directe sur <span class="mono" style="color:var(--status-ok);">${escapeHtml(tun.localEndpoint)}</span> (pré-configuré automatiquement au lancement du jeu).`;
+    } else {
+      hint.textContent =
+        "Lancer un jeu Switch depuis Zaimule active automatiquement ce tunnel loopback 127.0.0.1 et pré-configure Torzu / Fritchii sans ouvrir aucun port.";
+    }
   }
 }
 
@@ -2158,6 +2233,8 @@ function renderRelayMultiplayer() {
   if (!connected) {
     return;
   }
+
+  renderSwitchTunnelBox(st);
 
   setText("relay-active-code", st.roomCode || "------");
   setText("relay-cipher-badge", st.e2eeCipher || "ChaCha20-Poly1305 (ZMR1)");
@@ -4526,9 +4603,54 @@ function bindEvents() {
   document.getElementById("btn-relay-leave-room")?.addEventListener("click", async () => {
     const snap = await invokeBackend("relay_leave_room");
     state.relayStatus = snap || { connected: false };
+    state.switchTunnelStatus = null;
     stopRelayStatusPolling();
     renderRelayMultiplayer();
     showToast("Salon relais quitté.", "info");
+  });
+
+  document.getElementById("btn-relay-toggle-switch-tunnel")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    const isActive = Boolean(state.switchTunnelStatus?.active);
+    if (btn) btn.disabled = true;
+    try {
+      if (isActive) {
+        const snap = await invokeBackend("relay_stop_switch_tunnel");
+        state.switchTunnelStatus = snap || { active: false };
+        renderRelayMultiplayer();
+        showToast("Tunnel Switch loopback arrêté.", "info");
+      } else {
+        const portVal = Number(document.getElementById("relay-switch-host-port")?.value) || 24872;
+        const snap = await invokeBackend("relay_start_switch_tunnel", {
+          hostRoomPort: portVal
+        });
+        if (snap) {
+          state.switchTunnelStatus = snap;
+          renderRelayMultiplayer();
+          showToast(
+            snap.role === "host"
+              ? `Tunnel Switch Hôte actif → 127.0.0.1:${snap.hostRoomPort}`
+              : `Tunnel Switch Invité actif → ${snap.localEndpoint}`,
+            "ok"
+          );
+        }
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
+
+  document.getElementById("btn-relay-copy-switch-endpoint")?.addEventListener("click", async () => {
+    const endpoint = state.switchTunnelStatus?.localEndpoint || "";
+    if (!endpoint) return;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(endpoint);
+      }
+      showToast(`Adresse loopback copiée : ${endpoint}`, "ok");
+    } catch {
+      showToast(`Adresse loopback : ${endpoint}`, "info");
+    }
   });
 
   const sendRelayChatMessage = async () => {

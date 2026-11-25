@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/zaimule-core", "crates/zaimule-emu", "src-tauri"]
+exclude = ["server/zaimule-relay"]
 
 # Profiles are only honoured at the workspace root.
 [profile.release]

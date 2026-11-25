@@ -1016,6 +1016,37 @@
                   />
                 </div>
 
+                <!-- PHASE 2 : TUNNEL LOOPBACK NINTENDO SWITCH (Torzu / Fritchii · 0 port ouvert) -->
+                <div class="relay-switch-box" id="relay-switch-tunnel-box">
+                  <div class="relay-switch-head">
+                    <div class="relay-switch-title-row">
+                      <span>Tunnel Nintendo Switch (Torzu / Fritchii)</span>
+                      <span class="pill-badge mono" id="relay-switch-tunnel-badge">Inactif</span>
+                      <span class="pill-badge mono" id="relay-switch-tunnel-packets" style="display: none;">0 ↑ / 0 ↓</span>
+                    </div>
+                    <div class="relay-switch-controls">
+                      <label class="relay-port-label mono" id="relay-switch-host-port-wrap" for="relay-switch-host-port">
+                        Port salle locale
+                        <input
+                          type="number"
+                          id="relay-switch-host-port"
+                          class="field-inline mono"
+                          min="1024"
+                          max="65535"
+                          value="24872"
+                          style="width: 82px;"
+                        />
+                      </label>
+                      <span class="pill-badge mono" id="relay-switch-tunnel-endpoint" style="display: none;">127.0.0.1:24872</span>
+                      <button class="btn btn-ghost" id="btn-relay-copy-switch-endpoint" type="button" style="display: none;">Copier 127.0.0.1</button>
+                      <button class="btn" id="btn-relay-toggle-switch-tunnel" type="button">Activer tunnel Switch</button>
+                    </div>
+                  </div>
+                  <div class="relay-switch-hint" id="relay-switch-tunnel-hint">
+                    Lancer un jeu Switch depuis Zaimule active automatiquement ce tunnel loopback 127.0.0.1 et pré-configure Torzu / Fritchii sans ouvrir aucun port.
+                  </div>
+                </div>
+
                 <div class="relay-live-split">
                   <div class="relay-peers-box">
                     <div class="section-title">
@@ -1045,6 +1076,16 @@
                   </div>
                 </div>
               </div>
+
+              <details class="advanced-section-box" style="margin-top: 14px;">
+                <summary class="advanced-section-summary">
+                  <span>Auto-héberger votre propre relais privé (VPS / Docker)</span>
+                  <span class="mono" style="font-size:11px; color:var(--text-muted);">server/zaimule-relay</span>
+                </summary>
+                <div class="advanced-section-body" style="font-size: 12.5px; color: var(--text-secondary); line-height: 1.55;">
+                  Chaque joueur possédant son propre VPS, NAS ou Raspberry Pi peut héberger son propre serveur relais privé avec sa propre clé <span class="mono">ZAIMULE_RELAY_ACCESS_KEY</span> grâce au dossier <span class="mono">server/zaimule-relay/</span> fourni dans le dépôt Zaimule (Docker + Caddy TLS automatique, ~15 Mo RAM).
+                </div>
+              </details>
             </div>
 
             <!-- SOUS-VUE 5 : RÉGLAGES AVANCÉS -->

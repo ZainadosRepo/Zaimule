@@ -780,6 +780,107 @@ fn ensure_ws_path(mut url: String) -> String {
     url
 }
 
+// =============================================================================
+// PHASE 2 — TUNNEL SWITCH LDN / ROOM (Torzu · Fritchii · 0 port ouvert)
+// =============================================================================
+
+/// Port UDP local standard des salles multijoueur Yuzu / Torzu / Fritchii (`ENet`).
+pub const DEFAULT_SWITCH_LDN_PORT: u16 = 24_872;
+pub const SWITCH_LDN_PROTO_UDP: u8 = 1;
+pub const SWITCH_LDN_DIR_CLIENT_TO_HOST: u8 = 1;
+pub const SWITCH_LDN_DIR_HOST_TO_CLIENT: u8 = 2;
+/// Taille maximale d'un datagramme UDP Switch encapsulé dans une trame `ZMR1` (< 64 Kio).
+pub const SWITCH_LDN_MAX_PAYLOAD_BYTES: usize = 60_000;
+const SWITCH_LDN_HEADER_LEN: usize = 6;
+
+/// Datagramme Switch LDN / Room encapsulé dans `ZMR1` (`RelayChannel::SwitchLdn`).
+/// Transporte de manière transparente les paquets UDP ENet de `Torzu` / `Fritchii`
+/// entre la boucle locale `127.0.0.1` des joueurs sans ouvrir aucun port réseau.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchLdnPacket {
+    pub proto: u8,
+    pub direction: u8,
+    pub client_port: u16,
+    pub target_port: u16,
+    pub payload: Vec<u8>,
+}
+
+impl SwitchLdnPacket {
+    pub fn udp_client_to_host(client_port: u16, target_port: u16, payload: Vec<u8>) -> Self {
+        Self {
+            proto: SWITCH_LDN_PROTO_UDP,
+            direction: SWITCH_LDN_DIR_CLIENT_TO_HOST,
+            client_port,
+            target_port,
+            payload,
+        }
+    }
+
+    pub fn udp_host_to_client(client_port: u16, target_port: u16, payload: Vec<u8>) -> Self {
+        Self {
+            proto: SWITCH_LDN_PROTO_UDP,
+            direction: SWITCH_LDN_DIR_HOST_TO_CLIENT,
+            client_port,
+            target_port,
+            payload,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        if self.payload.is_empty() {
+            return Err("datagramme Switch LDN vide".into());
+        }
+        if self.payload.len() > SWITCH_LDN_MAX_PAYLOAD_BYTES {
+            return Err(format!(
+                "datagramme Switch LDN trop volumineux ({} > {} octets)",
+                self.payload.len(),
+                SWITCH_LDN_MAX_PAYLOAD_BYTES
+            ));
+        }
+        if self.client_port == 0 {
+            return Err("port client Switch LDN invalide (0)".into());
+        }
+        let mut out = Vec::with_capacity(SWITCH_LDN_HEADER_LEN + self.payload.len());
+        out.push(self.proto);
+        out.push(self.direction);
+        out.extend_from_slice(&self.client_port.to_le_bytes());
+        out.extend_from_slice(&self.target_port.to_le_bytes());
+        out.extend_from_slice(&self.payload);
+        Ok(out)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() <= SWITCH_LDN_HEADER_LEN {
+            return Err("trame Switch LDN trop courte".into());
+        }
+        let proto = bytes[0];
+        let direction = bytes[1];
+        if proto != SWITCH_LDN_PROTO_UDP {
+            return Err(format!("protocole Switch LDN non pris en charge ({proto})"));
+        }
+        if direction != SWITCH_LDN_DIR_CLIENT_TO_HOST && direction != SWITCH_LDN_DIR_HOST_TO_CLIENT
+        {
+            return Err(format!("direction Switch LDN invalide ({direction})"));
+        }
+        let client_port = u16::from_le_bytes([bytes[2], bytes[3]]);
+        let target_port = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if client_port == 0 {
+            return Err("port client Switch LDN invalide (0)".into());
+        }
+        let payload = bytes[SWITCH_LDN_HEADER_LEN..].to_vec();
+        if payload.len() > SWITCH_LDN_MAX_PAYLOAD_BYTES {
+            return Err("charge utile Switch LDN dépasse la taille maximale".into());
+        }
+        Ok(Self {
+            proto,
+            direction,
+            client_port,
+            target_port,
+            payload,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -980,5 +1081,41 @@ mod tests {
         let h = hash_room_password("pikachu").unwrap();
         assert_eq!(h.len(), 64);
         assert_ne!(h, "pikachu");
+    }
+
+    #[test]
+    fn switch_ldn_packet_roundtrips_through_zmr1_e2ee_and_rejects_oversize() {
+        let key = RelaySessionKey::generate().unwrap();
+        let host_cipher = Zmr1Cipher::new(&key).unwrap();
+        let guest_cipher = Zmr1Cipher::new(&key).unwrap();
+
+        let pkt = SwitchLdnPacket::udp_client_to_host(
+            51_234,
+            DEFAULT_SWITCH_LDN_PORT,
+            b"ENET-MK8D-JOIN".to_vec(),
+        );
+        let raw = pkt.to_bytes().unwrap();
+        let sealed = guest_cipher
+            .seal(RelayChannel::SwitchLdn, "MK8D42", &raw)
+            .unwrap();
+        let opened = host_cipher
+            .open(RelayChannel::SwitchLdn, "MK8D42", &sealed)
+            .unwrap();
+        assert_eq!(SwitchLdnPacket::from_bytes(&opened).unwrap(), pkt);
+
+        // Rejet des paquets vides, port 0 ou > SWITCH_LDN_MAX_PAYLOAD_BYTES
+        assert!(SwitchLdnPacket::udp_client_to_host(51_234, 24872, vec![])
+            .to_bytes()
+            .is_err());
+        assert!(SwitchLdnPacket::udp_client_to_host(0, 24872, vec![1])
+            .to_bytes()
+            .is_err());
+        assert!(SwitchLdnPacket::udp_client_to_host(
+            51_234,
+            24872,
+            vec![0u8; SWITCH_LDN_MAX_PAYLOAD_BYTES + 1]
+        )
+        .to_bytes()
+        .is_err());
     }
 }

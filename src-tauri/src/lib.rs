@@ -1,5 +1,6 @@
 mod metadata_fetcher;
 mod relay_client;
+mod switch_tunnel;
 mod update;
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -11,11 +12,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use switch_tunnel::{SwitchLdnTunnel, SwitchTunnelStatus};
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
 use zaimule_core::bios::{looks_like_bios_path, BiosImportReport};
 use zaimule_core::catalog::SwitchEngineOverride;
-use zaimule_core::external::{spawn_switch_process, SwitchEngineTarget};
+use zaimule_core::external::{
+    apply_switch_multiplayer_config, spawn_switch_process, SwitchEngineTarget,
+    SwitchMultiplayerPatch,
+};
 use zaimule_core::keymap::KeymapWidget;
 use zaimule_core::metadata::{sync_sram_directories, CloudSyncReport, GameMetadataUpdate};
 use zaimule_core::overrides::{GlobalSettings, ShaderPreset};
@@ -116,6 +121,7 @@ impl EmuWorker {
 struct AppState {
     session: Arc<Mutex<EmulatorSession>>,
     relay: Arc<RelayClient>,
+    switch_tunnel: Arc<SwitchLdnTunnel>,
     emu_worker: EmuWorker,
     last_sram_flush_ms: Arc<AtomicU64>,
     last_playtime_flush_ms: Arc<AtomicU64>,
@@ -727,6 +733,7 @@ async fn relay_join_room(
 
 #[tauri::command]
 fn relay_leave_room(state: tauri::State<AppState>) -> RelayStatusSnapshot {
+    let _ = state.switch_tunnel.stop(&state.relay);
     if let Ok(mut session) = state.session.lock() {
         session.set_online_link_enabled(false);
     }
@@ -744,6 +751,27 @@ fn relay_send_chat(
 #[tauri::command]
 fn get_relay_status(state: tauri::State<AppState>) -> RelayStatusSnapshot {
     state.relay.status_snapshot()
+}
+
+#[tauri::command]
+async fn relay_start_switch_tunnel(
+    state: tauri::State<'_, AppState>,
+    host_room_port: Option<u16>,
+) -> Result<SwitchTunnelStatus, String> {
+    state
+        .switch_tunnel
+        .start(Arc::clone(&state.relay), host_room_port)
+        .await
+}
+
+#[tauri::command]
+fn relay_stop_switch_tunnel(state: tauri::State<AppState>) -> SwitchTunnelStatus {
+    state.switch_tunnel.stop(&state.relay)
+}
+
+#[tauri::command]
+fn get_switch_tunnel_status(state: tauri::State<AppState>) -> SwitchTunnelStatus {
+    state.switch_tunnel.status_snapshot()
 }
 
 #[tauri::command]
@@ -2447,29 +2475,80 @@ fn clear_switch_shader_cache(
 }
 
 #[tauri::command]
-fn launch_switch_game(
+async fn launch_switch_game(
     app: AppHandle,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
     game_id: Option<String>,
 ) -> Result<String, String> {
-    let (resolved_game_id, plan) = {
+    let (resolved_game_id, plan, default_player_name) = {
         let mut session = state
             .session
             .lock()
             .map_err(|_| "verrou session indisponible".to_string())?;
         flush_sram_best_effort(&app, &mut session);
-        session.prepare_switch_launch(game_id.as_deref())?
+        let name = session
+            .settings
+            .relay_player_name
+            .clone()
+            .unwrap_or_else(|| "Joueur".into());
+        let (gid, plan) = session.prepare_switch_launch(game_id.as_deref())?;
+        (gid, plan, name)
     };
+
+    // Si connecté à un salon Multijoueur E2EE, active automatiquement le tunnel loopback 127.0.0.1
+    // et pré-remplit `[Multiplayer]` dans le `qt-config.ini` portable de Torzu / Fritchii.
+    let mut auto_started_tunnel = false;
+    let mut tunnel_note = String::new();
+    if state.relay.is_in_room() {
+        let tunnel_status = if state.switch_tunnel.is_active() {
+            state.switch_tunnel.status_snapshot()
+        } else {
+            let st = state
+                .switch_tunnel
+                .start(Arc::clone(&state.relay), None)
+                .await?;
+            auto_started_tunnel = true;
+            st
+        };
+        let relay_snap = state.relay.status_snapshot();
+        let nickname = if relay_snap.player_name.is_empty() {
+            default_player_name
+        } else {
+            relay_snap.player_name
+        };
+        let room_label = relay_snap
+            .room_code
+            .as_deref()
+            .map(|c| format!("Zaimule #{c}"));
+        if tunnel_status.local_port > 0 {
+            let _ = apply_switch_multiplayer_config(
+                &plan.engine_dir,
+                Some(&plan.executable_path),
+                &SwitchMultiplayerPatch {
+                    nickname,
+                    ip: "127.0.0.1".into(),
+                    port: tunnel_status.local_port,
+                    room_name: room_label,
+                },
+            );
+            tunnel_note = format!(" · Tunnel E2EE 127.0.0.1:{}", tunnel_status.local_port);
+        }
+    }
 
     let mut child = spawn_switch_process(&plan.executable_path, &plan.rom_path, plan.target)?;
     let started_at = Instant::now();
     let session_arc = Arc::clone(&state.session);
+    let tunnel_arc = Arc::clone(&state.switch_tunnel);
+    let relay_arc = Arc::clone(&state.relay);
     let app_handle = app.clone();
     let game_id_for_wait = resolved_game_id;
     let target = plan.target;
 
     std::thread::spawn(move || {
         let exit_code = child.wait().ok().and_then(|s| s.code());
+        if auto_started_tunnel {
+            let _ = tunnel_arc.stop(&relay_arc);
+        }
         let elapsed_seconds = started_at.elapsed().as_secs();
         if let Ok(mut guard) = session_arc.lock() {
             guard.record_switch_playtime(&game_id_for_wait, elapsed_seconds);
@@ -2487,7 +2566,7 @@ fn launch_switch_game(
     });
 
     Ok(format!(
-        "{} lancé : {} ({})",
+        "{} lancé : {} ({}){}",
         plan.target.label(),
         plan.rom_path
             .file_name()
@@ -2496,7 +2575,8 @@ fn launch_switch_game(
         plan.executable_path
             .file_name()
             .unwrap_or_default()
-            .to_string_lossy()
+            .to_string_lossy(),
+        tunnel_note
     ))
 }
 
@@ -2512,6 +2592,7 @@ pub fn run() {
         .manage(AppState {
             session,
             relay: Arc::new(RelayClient::new()),
+            switch_tunnel: Arc::new(SwitchLdnTunnel::new()),
             emu_worker: EmuWorker::spawn(),
             last_sram_flush_ms: Arc::new(AtomicU64::new(0)),
             last_playtime_flush_ms: Arc::new(AtomicU64::new(0)),
@@ -2601,6 +2682,7 @@ pub fn run() {
             if let WindowEvent::CloseRequested { .. } = event {
                 let app = window.app_handle();
                 if let Some(state) = app.try_state::<AppState>() {
+                    let _ = state.switch_tunnel.stop(&state.relay);
                     let _ = state.relay.leave_room();
                     if let Ok(mut guard) = state.session.lock() {
                         flush_sram_best_effort(app, &mut guard);
@@ -2682,6 +2764,9 @@ pub fn run() {
             relay_leave_room,
             relay_send_chat,
             get_relay_status,
+            relay_start_switch_tunnel,
+            relay_stop_switch_tunnel,
+            get_switch_tunnel_status,
             save_recorded_macro,
             save_keymapper_layout,
             step_viewport,

@@ -1273,6 +1273,149 @@ pub fn clear_switch_shader_cache(
     Ok(cleared)
 }
 
+/// Paramètres multijoueur locaux injectés dans `user/config/qt-config.ini` de `Torzu` / `Fritchii`
+/// pour pointer automatiquement vers le tunnel loopback `127.0.0.1:<port>` (0 port exposé).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchMultiplayerPatch {
+    pub nickname: String,
+    pub ip: String,
+    pub port: u16,
+    pub room_name: Option<String>,
+}
+
+/// Met à jour de manière non destructive la section `[Multiplayer]` du fichier
+/// `user/config/qt-config.ini` dans tous les dossiers `user/` portables du moteur Switch,
+/// en conservant intactes toutes les autres sections (`[Controls]`, `[Renderer]`, `[System]`, ...).
+pub fn apply_switch_multiplayer_config(
+    engine_dir: &Path,
+    exe_path: Option<&Path>,
+    patch: &SwitchMultiplayerPatch,
+) -> Result<Vec<PathBuf>, String> {
+    if patch.port == 0 {
+        return Err("port multijoueur Switch invalide (0)".into());
+    }
+    let ip = patch.ip.trim();
+    if ip != "127.0.0.1" && ip != "localhost" {
+        return Err(format!(
+            "adresse multijoueur non loopback refusée ('{ip}') : le tunnel Switch doit rester lié à 127.0.0.1"
+        ));
+    }
+    let nickname: String = patch
+        .nickname
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control() && *c != '=' && *c != '[' && *c != ']')
+        .take(32)
+        .collect();
+    let nickname = if nickname.is_empty() {
+        "Joueur".to_string()
+    } else {
+        nickname
+    };
+    let room_name = patch.room_name.as_deref().map(|raw| {
+        raw.trim()
+            .chars()
+            .filter(|c| !c.is_control() && *c != '[' && *c != ']')
+            .take(64)
+            .collect::<String>()
+    });
+
+    let mut pairs: Vec<(&str, String)> = vec![
+        ("nickname", nickname),
+        ("nickname\\default", "false".to_string()),
+        ("ip", ip.to_string()),
+        ("ip\\default", "false".to_string()),
+        ("port", patch.port.to_string()),
+        ("port\\default", "false".to_string()),
+        ("room_port", patch.port.to_string()),
+        ("room_port\\default", "false".to_string()),
+    ];
+    if let Some(rn) = room_name.filter(|s| !s.is_empty()) {
+        pairs.push(("room_name", rn));
+        pairs.push(("room_name\\default", "false".to_string()));
+    }
+
+    let mut written = Vec::new();
+    for user_dir in resolve_engine_user_dirs(engine_dir, exe_path) {
+        let config_dir = user_dir.join("config");
+        fs::create_dir_all(&config_dir).map_err(|e| format!("{}: {e}", config_dir.display()))?;
+        let ini_path = config_dir.join("qt-config.ini");
+        let existing = fs::read_to_string(&ini_path).unwrap_or_default();
+        let updated = patch_ini_section(&existing, "Multiplayer", &pairs);
+
+        let tmp_path = config_dir.join("qt-config.ini.tmp");
+        fs::write(&tmp_path, updated.as_bytes())
+            .map_err(|e| format!("{}: {e}", tmp_path.display()))?;
+        fs::rename(&tmp_path, &ini_path).map_err(|e| format!("{}: {e}", ini_path.display()))?;
+        written.push(ini_path);
+    }
+    Ok(written)
+}
+
+fn patch_ini_section(existing: &str, section_name: &str, updates: &[(&str, String)]) -> String {
+    let header_tag = format!("[{section_name}]");
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut in_target = false;
+    let mut saw_section = false;
+    let mut applied = vec![false; updates.len()];
+
+    for raw_line in existing.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_target {
+                for (idx, (k, v)) in updates.iter().enumerate() {
+                    if !applied[idx] {
+                        out_lines.push(format!("{k}={v}"));
+                        applied[idx] = true;
+                    }
+                }
+            }
+            in_target = trimmed.eq_ignore_ascii_case(&header_tag);
+            if in_target {
+                saw_section = true;
+            }
+            out_lines.push(raw_line.to_string());
+            continue;
+        }
+
+        if in_target {
+            if let Some((key_raw, _)) = raw_line.split_once('=') {
+                let key = key_raw.trim();
+                if let Some(pos) = updates.iter().position(|(k, _)| *k == key) {
+                    out_lines.push(format!("{}={}", updates[pos].0, updates[pos].1));
+                    applied[pos] = true;
+                    continue;
+                }
+            }
+        }
+        out_lines.push(raw_line.to_string());
+    }
+
+    if in_target {
+        for (idx, (k, v)) in updates.iter().enumerate() {
+            if !applied[idx] {
+                out_lines.push(format!("{k}={v}"));
+                applied[idx] = true;
+            }
+        }
+    } else if !saw_section {
+        if !out_lines.is_empty() && !out_lines.last().is_some_and(|l| l.is_empty()) {
+            out_lines.push(String::new());
+        }
+        out_lines.push(header_tag);
+        for (k, v) in updates {
+            out_lines.push(format!("{k}={v}"));
+        }
+    }
+
+    let mut result = out_lines.join("\n");
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1440,6 +1583,64 @@ mod tests {
         // Guard against copying a directory into its own descendant
         let nested_dst = mix.join("sub/nested");
         assert!(copy_dir_recursive(&mix, &nested_dst).is_err());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn switch_multiplayer_config_patches_ini_non_destructively_and_enforces_loopback() {
+        let root =
+            std::env::temp_dir().join(format!("zaimule-switch-mp-ini-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let engine_dir = root.join("engines/torzu");
+        let cfg_dir = engine_dir.join("user/config");
+        fs::create_dir_all(&cfg_dir).unwrap();
+
+        let ini_path = cfg_dir.join("qt-config.ini");
+        fs::write(
+            &ini_path,
+            "[Renderer]\nbackend=1\n\n[Multiplayer]\nnickname=OldName\nip=192.168.1.99\nban_list_server=default\n\n[Controls]\nplayer_0_connected=true\n",
+        )
+        .unwrap();
+
+        // Refus des IP non-loopback (0 exposition réseau)
+        assert!(apply_switch_multiplayer_config(
+            &engine_dir,
+            None,
+            &SwitchMultiplayerPatch {
+                nickname: "Mario".into(),
+                ip: "0.0.0.0".into(),
+                port: 24872,
+                room_name: None,
+            }
+        )
+        .is_err());
+
+        // Patch non destructif vers 127.0.0.1:<port>
+        let updated_paths = apply_switch_multiplayer_config(
+            &engine_dir,
+            None,
+            &SwitchMultiplayerPatch {
+                nickname: "Mario".into(),
+                ip: "127.0.0.1".into(),
+                port: 54321,
+                room_name: Some("Zaimule #MK8D".into()),
+            },
+        )
+        .unwrap();
+        assert!(!updated_paths.is_empty());
+
+        let text = fs::read_to_string(&ini_path).unwrap();
+        assert!(text.contains("[Renderer]\nbackend=1"));
+        assert!(text.contains("[Controls]\nplayer_0_connected=true"));
+        assert!(text.contains("ban_list_server=default"));
+        assert!(text.contains("nickname=Mario"));
+        assert!(text.contains("ip=127.0.0.1"));
+        assert!(text.contains("port=54321"));
+        assert!(text.contains("room_port=54321"));
+        assert!(text.contains("room_name=Zaimule #MK8D"));
+        assert!(!text.contains("192.168.1.99"));
+        assert!(!text.contains("OldName"));
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -54,7 +54,16 @@ test("Multijoueur E2EE UI elements, security attributes, and Tauri commands stay
     "relay-peers-list",
     "relay-chat-list",
     "relay-chat-input",
-    "btn-relay-send-chat"
+    "btn-relay-send-chat",
+    "relay-switch-tunnel-box",
+    "relay-switch-tunnel-badge",
+    "relay-switch-tunnel-packets",
+    "relay-switch-host-port-wrap",
+    "relay-switch-host-port",
+    "relay-switch-tunnel-endpoint",
+    "btn-relay-copy-switch-endpoint",
+    "btn-relay-toggle-switch-tunnel",
+    "relay-switch-tunnel-hint"
   ];
 
   for (const id of relayIds) {
@@ -69,7 +78,10 @@ test("Multijoueur E2EE UI elements, security attributes, and Tauri commands stay
     "relay_join_room",
     "relay_leave_room",
     "relay_send_chat",
-    "get_relay_status"
+    "get_relay_status",
+    "relay_start_switch_tunnel",
+    "relay_stop_switch_tunnel",
+    "get_switch_tunnel_status"
   ];
   for (const cmd of commands) {
     assert.ok(appJs.includes(`"${cmd}"`), `app.js missing invokeBackend("${cmd}")`);

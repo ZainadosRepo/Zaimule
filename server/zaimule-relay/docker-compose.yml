@@ -1,0 +1,87 @@
+# ==============================================================================
+# ZAIMULE RELAY — AUTO-HÉBERGEMENT DOCKER (VPS / NAS / RASPBERRY PI)
+# ==============================================================================
+# Mode 1 (derrière votre propre reverse proxy Caddy / Nginx / Traefik) :
+#   docker compose up -d --build
+#   → écoute sur 127.0.0.1:3000 uniquement (jamais exposé en clair sur 0.0.0.0).
+#
+# Mode 2 (clé en main avec Caddy TLS automatique sur les ports 80/443) :
+#   RELAY_DOMAIN=relay.votre-domaine.fr ACME_EMAIL=vous@exemple.fr \
+#     docker compose --profile tls up -d --build
+
+services:
+  zaimule-relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: zaimule-relay:latest
+    container_name: zaimule-relay
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - PORT=3000
+      - RUST_LOG=info
+      - ZAIMULE_RELAY_ACCESS_KEY=${ZAIMULE_RELAY_ACCESS_KEY:?Générez une clé dans .env (voir README.md)}
+      - ZAIMULE_MAX_ROOMS=${ZAIMULE_MAX_ROOMS:-64}
+      - ZAIMULE_MAX_PEERS_PER_ROOM=${ZAIMULE_MAX_PEERS_PER_ROOM:-8}
+      - ZAIMULE_MAX_CONNECTIONS=${ZAIMULE_MAX_CONNECTIONS:-128}
+      - ZAIMULE_MAX_CONN_PER_IP=${ZAIMULE_MAX_CONN_PER_IP:-6}
+      - ZAIMULE_MAX_FRAMES_PER_SEC=${ZAIMULE_MAX_FRAMES_PER_SEC:-600}
+      - ZAIMULE_MAX_FRAME_BYTES=${ZAIMULE_MAX_FRAME_BYTES:-65536}
+      - ZAIMULE_ROOM_IDLE_SECS=${ZAIMULE_ROOM_IDLE_SECS:-900}
+      - ZAIMULE_WS_IDLE_SECS=${ZAIMULE_WS_IDLE_SECS:-120}
+    networks:
+      - relay-net
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/zaimule-relay", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 64M
+
+  caddy:
+    profiles: ["tls"]
+    image: caddy:2.11-alpine
+    container_name: zaimule-relay-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      - RELAY_DOMAIN=${RELAY_DOMAIN:?Définissez RELAY_DOMAIN dans .env pour le profil tls}
+      - ACME_EMAIL=${ACME_EMAIL:-admin@example.com}
+    volumes:
+      - ./Caddyfile.example:/etc/caddy/Caddyfile:ro
+      - zaimule_caddy_data:/data
+      - zaimule_caddy_config:/config
+    networks:
+      - relay-net
+    depends_on:
+      - zaimule-relay
+
+networks:
+  relay-net:
+    driver: bridge
+
+volumes:
+  zaimule_caddy_data:
+  zaimule_caddy_config:
