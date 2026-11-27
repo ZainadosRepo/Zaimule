@@ -31,7 +31,7 @@ Au lancement, l'appli regarde sur GitHub si une version plus récente est publi�
 
 ---
 
-## ✨ Architecture & Fonctionnalités (`v1.9.0`)
+## ✨ Architecture & Fonctionnalités (`v1.9.1`)
 
 - **🌐 Multijoueur E2EE sans port ouvert (`ZMR1` ChaCha20-Poly1305) & Relais auto-hébergeable (`server/zaimule-relay`)**
   - **Zéro port ouvert côté joueur & chiffrement bout-en-bout (`ZMR1`)** : connexions sortantes `wss://` uniquement ; clé de session dérivée par salon (`HKDF-SHA256`) pour que le serveur relais ne voie jamais les trames en clair, avec déploiement Docker autonome (`server/zaimule-relay/`) permettant à chacun d'héberger son propre relais privé avec sa propre clé d'accès.
