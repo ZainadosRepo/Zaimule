@@ -610,42 +610,42 @@ async fn relay_create_room(
     password: Option<String>,
     max_players: Option<u8>,
 ) -> Result<RelayStatusSnapshot, String> {
-    let (relay_url, access_key, default_name, console_str, game_title, rom_crc32) = {
-        let session = state
-            .session
-            .lock()
-            .map_err(|_| "verrou session indisponible".to_string())?;
-        let url = session.settings.relay_url.clone().ok_or_else(|| {
-            "configurez d'abord l'URL du relais VPS (wss://relay.<domaine>/ws)".to_string()
-        })?;
-        let key =
-            session.settings.relay_access_key.clone().ok_or_else(|| {
+    let (relay_url, access_key, default_name, console_str, game_title, rom_crc32) =
+        {
+            let session = state
+                .session
+                .lock()
+                .map_err(|_| "verrou session indisponible".to_string())?;
+            let url = session.settings.relay_url.clone().ok_or_else(|| {
+                "configurez d'abord l'adresse du serveur relais (wss://)".to_string()
+            })?;
+            let key = session.settings.relay_access_key.clone().ok_or_else(|| {
                 "configurez d'abord votre clé d'accès privée du relais".to_string()
             })?;
-        let default_name = session
-            .settings
-            .relay_player_name
-            .clone()
-            .unwrap_or_else(|| "Joueur 1".into());
-        let game = session.active_game();
-        let console_str = game.console.label().to_string();
-        let is_switch = matches!(
-            game.console,
-            zaimule_core::catalog::ConsoleKind::Switch
-                | zaimule_core::catalog::ConsoleKind::Switch2
-        );
-        let crc = if is_switch || game.crc32_hex.trim().is_empty() || game.id.is_empty() {
-            None
-        } else {
-            Some(game.crc32_hex.clone())
+            let default_name = session
+                .settings
+                .relay_player_name
+                .clone()
+                .unwrap_or_else(|| "Joueur 1".into());
+            let game = session.active_game();
+            let console_str = game.console.label().to_string();
+            let is_switch = matches!(
+                game.console,
+                zaimule_core::catalog::ConsoleKind::Switch
+                    | zaimule_core::catalog::ConsoleKind::Switch2
+            );
+            let crc = if is_switch || game.crc32_hex.trim().is_empty() || game.id.is_empty() {
+                None
+            } else {
+                Some(game.crc32_hex.clone())
+            };
+            let title = if game.title.trim().is_empty() {
+                "Salon Zaimule".to_string()
+            } else {
+                game.title.clone()
+            };
+            (url, key, default_name, console_str, title, crc)
         };
-        let title = if game.title.trim().is_empty() {
-            "Salon Zaimule".to_string()
-        } else {
-            game.title.clone()
-        };
-        (url, key, default_name, console_str, title, crc)
-    };
 
     let chosen_name = player_name
         .as_deref()
@@ -689,36 +689,36 @@ async fn relay_join_room(
     player_name: Option<String>,
     password: Option<String>,
 ) -> Result<RelayStatusSnapshot, String> {
-    let (relay_url, access_key, default_name, local_crc) = {
-        let session = state
-            .session
-            .lock()
-            .map_err(|_| "verrou session indisponible".to_string())?;
-        let url = session.settings.relay_url.clone().ok_or_else(|| {
-            "configurez d'abord l'URL du relais VPS (wss://relay.<domaine>/ws)".to_string()
-        })?;
-        let key =
-            session.settings.relay_access_key.clone().ok_or_else(|| {
+    let (relay_url, access_key, default_name, local_crc) =
+        {
+            let session = state
+                .session
+                .lock()
+                .map_err(|_| "verrou session indisponible".to_string())?;
+            let url = session.settings.relay_url.clone().ok_or_else(|| {
+                "configurez d'abord l'adresse du serveur relais (wss://)".to_string()
+            })?;
+            let key = session.settings.relay_access_key.clone().ok_or_else(|| {
                 "configurez d'abord votre clé d'accès privée du relais".to_string()
             })?;
-        let default_name = session
-            .settings
-            .relay_player_name
-            .clone()
-            .unwrap_or_else(|| "Joueur 2".into());
-        let game = session.active_game();
-        let is_switch = matches!(
-            game.console,
-            zaimule_core::catalog::ConsoleKind::Switch
-                | zaimule_core::catalog::ConsoleKind::Switch2
-        );
-        let crc = if is_switch || game.crc32_hex.trim().is_empty() || game.id.is_empty() {
-            None
-        } else {
-            Some(game.crc32_hex.clone())
+            let default_name = session
+                .settings
+                .relay_player_name
+                .clone()
+                .unwrap_or_else(|| "Joueur 2".into());
+            let game = session.active_game();
+            let is_switch = matches!(
+                game.console,
+                zaimule_core::catalog::ConsoleKind::Switch
+                    | zaimule_core::catalog::ConsoleKind::Switch2
+            );
+            let crc = if is_switch || game.crc32_hex.trim().is_empty() || game.id.is_empty() {
+                None
+            } else {
+                Some(game.crc32_hex.clone())
+            };
+            (url, key, default_name, crc)
         };
-        (url, key, default_name, crc)
-    };
 
     let chosen_name = player_name
         .as_deref()
@@ -1638,7 +1638,12 @@ fn toggle_tas_timeline_button(
 
 #[tauri::command]
 fn load_settings(app: AppHandle) -> Result<LoadedJson, String> {
-    load_json_atomic(&settings_path(&app)?)
+    let mut loaded = load_json_atomic(&settings_path(&app)?)?;
+    if let Some(obj) = loaded.value.as_object_mut() {
+        obj.remove("relayUrl");
+        obj.remove("relayAccessKey");
+    }
+    Ok(loaded)
 }
 
 #[tauri::command]

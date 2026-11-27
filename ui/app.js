@@ -369,7 +369,7 @@ let state = {
   udpPacketsReceived: 0,
   stunCandidate: null,
   netplayChat: [],
-  relayUrl: "",
+  relayUrlConfigured: false,
   relayKeyConfigured: false,
   relayPlayerName: "",
   relayStatus: null,
@@ -2451,13 +2451,19 @@ function renderRelayMultiplayer() {
   const st = state.relayStatus;
   const connected = Boolean(st?.connected);
 
-  const urlInp = document.getElementById("relay-url-input");
-  if (urlInp && document.activeElement !== urlInp) {
-    urlInp.value = state.relayUrl || "";
-  }
   const playerInp = document.getElementById("relay-player-input");
   if (playerInp && document.activeElement !== playerInp) {
     playerInp.value = state.relayPlayerName || "";
+  }
+
+  const urlStatus = document.getElementById("relay-url-status");
+  if (urlStatus) {
+    urlStatus.textContent = state.relayUrlConfigured ? "Adresse enregistrée" : "Non définie";
+    urlStatus.classList.toggle("pill-green", Boolean(state.relayUrlConfigured));
+  }
+  const clearUrlBtn = document.getElementById("btn-relay-clear-url");
+  if (clearUrlBtn) {
+    clearUrlBtn.style.display = state.relayUrlConfigured ? "inline-flex" : "none";
   }
 
   const keyStatus = document.getElementById("relay-key-status");
@@ -2477,7 +2483,8 @@ function renderRelayMultiplayer() {
       headerBadge.textContent = `Connecté · #${st.roomCode || "------"}${rttTxt}`;
       headerBadge.classList.add("pill-green");
     } else {
-      headerBadge.textContent = state.relayUrl && state.relayKeyConfigured ? "Prêt" : "Hors ligne";
+      headerBadge.textContent =
+        state.relayUrlConfigured && state.relayKeyConfigured ? "Prêt" : "Hors ligne";
       headerBadge.classList.remove("pill-green");
     }
   }
@@ -3317,8 +3324,8 @@ function applyBootstrap(boot, options = {}) {
   if (boot.rewindEnabled !== undefined) {
     state.rewindEnabled = Boolean(boot.rewindEnabled);
   }
-  if (boot.relayUrl !== undefined) {
-    state.relayUrl = boot.relayUrl || "";
+  if (boot.relayUrlConfigured !== undefined) {
+    state.relayUrlConfigured = Boolean(boot.relayUrlConfigured);
   }
   if (boot.relayKeyConfigured !== undefined) {
     state.relayKeyConfigured = Boolean(boot.relayKeyConfigured);
@@ -4690,7 +4697,7 @@ function bindEvents() {
     const inp = document.getElementById("netplay-peer-input");
     const peerAddr = inp?.value?.trim();
     if (!peerAddr) {
-      showToast("Saisissez une adresse LAN IP:PORT (ex: 192.168.1.20:54920).", "info");
+      showToast("Saisissez une adresse locale au format IP:PORT.", "info");
       return;
     }
     if (tauriInvoke) {
@@ -4757,9 +4764,10 @@ function bindEvents() {
     launchSelectedGame();
   });
 
-  // --- Multijoueur E2EE (Relais VPS privé · 0 port ouvert) ---
+  // --- Multijoueur E2EE (Relais privé · 0 port ouvert) ---
   document.getElementById("btn-relay-save-config")?.addEventListener("click", async () => {
-    const relayUrl = document.getElementById("relay-url-input")?.value?.trim() ?? "";
+    const urlInp = document.getElementById("relay-url-input");
+    const relayUrl = urlInp?.value?.trim() || null;
     const keyInp = document.getElementById("relay-key-input");
     const accessKey = keyInp?.value?.trim() || null;
     const playerName = document.getElementById("relay-player-input")?.value?.trim() ?? "";
@@ -4772,18 +4780,38 @@ function bindEvents() {
         playerName
       });
       if (boot) {
+        if (urlInp) urlInp.value = "";
         if (keyInp) keyInp.value = "";
         applyBootstrap(boot);
-        showToast("Configuration du relais VPS enregistrée.", "ok");
+        showToast("Configuration du relais enregistrée.", "ok");
       }
     } else {
-      state.relayUrl = relayUrl;
+      if (relayUrl) state.relayUrlConfigured = true;
       if (accessKey) state.relayKeyConfigured = true;
       state.relayPlayerName = playerName;
+      if (urlInp) urlInp.value = "";
       if (keyInp) keyInp.value = "";
       renderRelayMultiplayer();
       showToast("Configuration du relais enregistrée.", "ok");
     }
+  });
+
+  document.getElementById("btn-relay-clear-url")?.addEventListener("click", async () => {
+    const urlInp = document.getElementById("relay-url-input");
+    if (urlInp) urlInp.value = "";
+    if (tauriInvoke) {
+      const boot = await invokeBackend("configure_relay_server", {
+        relayUrl: "",
+        accessKey: null,
+        clearAccessKey: false,
+        playerName: null
+      });
+      if (boot) applyBootstrap(boot);
+    } else {
+      state.relayUrlConfigured = false;
+      renderRelayMultiplayer();
+    }
+    showToast("Adresse du relais effacée.", "info");
   });
 
   document.getElementById("btn-relay-clear-key")?.addEventListener("click", async () => {
