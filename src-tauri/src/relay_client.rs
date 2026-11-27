@@ -41,7 +41,6 @@ pub struct RelayChatEntry {
 #[serde(rename_all = "camelCase")]
 pub struct RelayStatusSnapshot {
     pub connected: bool,
-    pub relay_url: Option<String>,
     pub room_code: Option<String>,
     pub invite_uri: Option<String>,
     pub peer_id: u8,
@@ -64,7 +63,6 @@ impl Default for RelayStatusSnapshot {
     fn default() -> Self {
         Self {
             connected: false,
-            relay_url: None,
             room_code: None,
             invite_uri: None,
             peer_id: 0,
@@ -470,7 +468,7 @@ impl RelayClient {
         guard.status.clone()
     }
 
-    /// Crée un nouveau salon privé sur le relais VPS et génère sa clé E2EE 256 bits locale.
+    /// Crée un nouveau salon privé sur le serveur relais et génère sa clé E2EE 256 bits locale.
     pub async fn create_room(
         &self,
         params: RelayCreateParams,
@@ -564,7 +562,7 @@ impl RelayClient {
 
         let mut req = url
             .into_client_request()
-            .map_err(|e| format!("URL relais invalide : {e}"))?;
+            .map_err(|_| "adresse du serveur relais invalide".to_string())?;
         let header_val = HeaderValue::from_str(access_key)
             .map_err(|_| "clé d'accès relais contient des caractères invalides".to_string())?;
         req.headers_mut().insert("x-zaimule-key", header_val);
@@ -663,7 +661,6 @@ impl RelayClient {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<OutboundCmd>(OUTBOUND_CMD_CAPACITY);
         let snapshot = RelayStatusSnapshot {
             connected: true,
-            relay_url: Some(url.to_string()),
             room_code: Some(room_code.clone()),
             invite_uri: Some(invite_uri),
             peer_id,
@@ -891,17 +888,27 @@ fn ensure_rustls_ring_provider() {
 
 fn format_ws_connect_error(err: tokio_tungstenite::tungstenite::Error) -> String {
     let text = err.to_string();
+    let lower = text.to_ascii_lowercase();
     if text.contains("401") {
-        return "accès refusé (401) : clé privée ZAIMULE_RELAY_ACCESS_KEY invalide".into();
+        return "accès refusé (401) : clé d'accès privée invalide".into();
     }
     if text.contains("503") {
-        return "serveur relais non configuré (503) : vérifiez ZAIMULE_RELAY_ACCESS_KEY sur le VPS"
+        return "serveur relais indisponible (503) : clé d'accès non configurée côté serveur"
             .into();
     }
     if text.contains("429") {
         return "trop de connexions simultanées sur ce relais (429)".into();
     }
-    format!("impossible de joindre le relais : {text}")
+    if lower.contains("tls") || lower.contains("certificate") || lower.contains("ssl") {
+        return "échec de vérification TLS lors de la connexion au serveur relais".into();
+    }
+    if lower.contains("dns") || lower.contains("lookup") || lower.contains("resolve") {
+        return "serveur relais introuvable (vérifiez l'adresse et votre connexion)".into();
+    }
+    if lower.contains("refused") || lower.contains("timed out") || lower.contains("reset") {
+        return "serveur relais injoignable (connexion refusée ou expirée)".into();
+    }
+    "impossible de joindre le serveur relais (vérifiez l'adresse et votre connexion)".into()
 }
 
 fn encode_client_binary(

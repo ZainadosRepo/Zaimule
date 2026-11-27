@@ -16,17 +16,36 @@ test("Multijoueur E2EE UI elements, security attributes, and Tauri commands stay
   assert.match(html, /data-settings-tab="settings-pane-multiplayer"/);
   assert.match(html, /id="settings-pane-multiplayer"/);
 
-  // La clé d'accès privée du relais doit rester masquée (type="password")
+  // L'adresse du serveur relais et la clé d'accès privée doivent rester masquées (type="password")
+  assert.match(
+    html,
+    /<input[^>]*type="password"[^>]*id="relay-url-input"|<input[^>]*id="relay-url-input"[^>]*type="password"/
+  );
   assert.match(
     html,
     /<input[^>]*type="password"[^>]*id="relay-key-input"|<input[^>]*id="relay-key-input"[^>]*type="password"/
   );
 
+  // Aucune info de VPS, de domaine exemple ni d'adresse IP personnelle ne doit figurer dans l'interface
+  for (const forbidden of [
+    /\bvps\b/i,
+    /votre-domaine/i,
+    /sslip\.io/i,
+    /51\.91\./,
+    /192\.168\./,
+    /\bzainados\b/i
+  ]) {
+    assert.doesNotMatch(html, forbidden, `ui/index.html ne doit pas contenir ${forbidden}`);
+    assert.doesNotMatch(appJs, forbidden, `ui/app.js ne doit pas contenir ${forbidden}`);
+  }
+
   // Chaque ID relay référencé dans app.js existe dans index.html
   const relayIds = [
     "relay-status-pill",
     "relay-header-badge",
+    "relay-url-status",
     "relay-url-input",
+    "btn-relay-clear-url",
     "relay-key-status",
     "relay-key-input",
     "btn-relay-clear-key",

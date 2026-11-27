@@ -137,7 +137,7 @@ pub struct StationBootstrap {
     #[serde(default)]
     pub rewind_enabled: bool,
     #[serde(default)]
-    pub relay_url: Option<String>,
+    pub relay_url_configured: bool,
     #[serde(default)]
     pub relay_key_configured: bool,
     #[serde(default)]
@@ -902,7 +902,12 @@ impl EmulatorSession {
             nds_3d_scale: self.settings.nds_3d_scale.clamp(1, 2),
             viewport_integer_scale: self.settings.viewport_integer_scale,
             rewind_enabled: self.settings.rewind_enabled,
-            relay_url: self.settings.relay_url.clone(),
+            relay_url_configured: self
+                .settings
+                .relay_url
+                .as_deref()
+                .map(|u| !u.trim().is_empty())
+                .unwrap_or(false),
             relay_key_configured: self
                 .settings
                 .relay_access_key
@@ -1399,7 +1404,7 @@ impl EmulatorSession {
         self.bootstrap_snapshot()
     }
 
-    /// Configures the private VPS E2EE multiplayer relay (`wss://relay.<domain>/ws` + private key).
+    /// Configures the private E2EE multiplayer relay (`wss://` + private access key).
     pub fn set_relay_config(
         &mut self,
         relay_url: Option<String>,
@@ -2212,7 +2217,7 @@ impl EmulatorSession {
                 console: game.console.label().into(),
                 rom_crc32_hex: game.crc32_hex,
                 host_name: if host_name.trim().is_empty() {
-                    "Zainados".into()
+                    "Hôte".into()
                 } else {
                     host_name.trim().to_string()
                 },
@@ -3187,7 +3192,7 @@ impl EmulatorSession {
                 id: format!("chat-{}", self.netplay_chat.len() + 1),
                 room_code,
                 sender: if sender.trim().is_empty() {
-                    "Zainados".into()
+                    "Joueur".into()
                 } else {
                     sender.trim().to_string()
                 },
@@ -3228,7 +3233,7 @@ impl EmulatorSession {
         }
         let game = self.active_game().clone();
         let clean_player = if player_name.trim().is_empty() {
-            "Zainados".into()
+            "Joueur".into()
         } else {
             player_name.trim().to_string()
         };
@@ -4302,14 +4307,18 @@ mod tests {
                 Some("Sacha".into()),
             )
             .unwrap();
+        assert!(boot.relay_url_configured);
         assert_eq!(
-            boot.relay_url.as_deref(),
+            session.settings.relay_url.as_deref(),
             Some("wss://relay.example.org/ws")
         );
         assert!(boot.relay_key_configured);
         assert_eq!(boot.relay_player_name.as_deref(), Some("Sacha"));
 
-        let cleared = session.set_relay_config(None, None, true, None).unwrap();
+        let cleared = session
+            .set_relay_config(Some(String::new()), None, true, None)
+            .unwrap();
+        assert!(!cleared.relay_url_configured);
         assert!(!cleared.relay_key_configured);
     }
 

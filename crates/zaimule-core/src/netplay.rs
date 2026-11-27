@@ -143,9 +143,9 @@ impl UdpNetplayNode {
         if trimmed.is_empty() {
             return Err("adresse du pair UDP vide (attendu : IP:PORT)".into());
         }
-        let parsed: std::net::SocketAddr = trimmed.parse().map_err(|_| {
-            format!("adresse UDP invalide '{trimmed}' (format attendu : 192.168.1.20:54920)")
-        })?;
+        let parsed: std::net::SocketAddr = trimmed
+            .parse()
+            .map_err(|_| format!("adresse UDP invalide '{trimmed}' (format attendu : IP:PORT)"))?;
         if parsed.port() == 0 {
             return Err("le port UDP du pair doit être supérieur à 0".into());
         }
@@ -767,7 +767,7 @@ pub fn validate_relay_url(raw: &str) -> Result<String, String> {
         return Ok(ensure_ws_path(normalized));
     }
 
-    Err("l'URL du relais doit commencer par wss:// (ex: wss://relay.votre-domaine/ws)".into())
+    Err("l'URL du relais doit commencer par wss://".into())
 }
 
 fn ensure_ws_path(mut url: String) -> String {
