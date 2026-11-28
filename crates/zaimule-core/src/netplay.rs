@@ -756,10 +756,7 @@ pub fn validate_relay_url(raw: &str) -> Result<String, String> {
     }
 
     if let Some(rest) = normalized.strip_prefix("ws://") {
-        let is_local = rest.starts_with("127.0.0.1")
-            || rest.starts_with("localhost")
-            || rest.starts_with("[::1]");
-        if !is_local {
+        if !is_loopback_authority(rest) {
             return Err(
                 "protocole non chiffré ws:// refusé hors localhost (utilisez wss://)".into(),
             );
@@ -768,6 +765,20 @@ pub fn validate_relay_url(raw: &str) -> Result<String, String> {
     }
 
     Err("l'URL du relais doit commencer par wss://".into())
+}
+
+/// Compare l'hôte exact : un préfixe laisserait `localhost.evil.com` ou
+/// `127.0.0.1@evil.com` recevoir la clé d'accès en clair.
+fn is_loopback_authority(rest: &str) -> bool {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    ["127.0.0.1", "localhost", "[::1]"].iter().any(|host| {
+        authority.strip_prefix(host).is_some_and(|tail| {
+            tail.is_empty()
+                || tail
+                    .strip_prefix(':')
+                    .is_some_and(|port| port.parse::<u16>().is_ok())
+        })
+    })
 }
 
 fn ensure_ws_path(mut url: String) -> String {
@@ -1264,6 +1275,24 @@ mod tests {
             "ws://127.0.0.1:3000/ws"
         );
         assert!(validate_relay_url("ws://relay.example.org/ws").is_err());
+        for local in [
+            "ws://localhost",
+            "ws://localhost:3000/ws",
+            "ws://[::1]:3000",
+        ] {
+            assert!(validate_relay_url(local).is_ok(), "{local}");
+        }
+        for spoofed in [
+            "ws://localhost.evil.com",
+            "ws://127.0.0.1.nip.io/ws",
+            "ws://127.0.0.1@evil.com",
+            "ws://localhost:80@evil.com/ws",
+            "ws://[::1].evil.com",
+            r"ws://localhost\@evil.com",
+            "ws://localhost:port",
+        ] {
+            assert!(validate_relay_url(spoofed).is_err(), "{spoofed}");
+        }
         assert!(validate_relay_url("http://relay.example.org").is_err());
 
         // Mot de passe haché de manière déterministe
