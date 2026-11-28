@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "forge-board": {
+      "type": "http",
+      "url": "http://10.13.13.1:3005/mcp",
+      "headers": {
+        "Authorization": "${FORGEBOARD_AUTH}"
+      }
+    }
+  }
+}
